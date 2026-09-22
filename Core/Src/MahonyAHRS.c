@@ -1,7 +1,10 @@
 #include "MahonyAHRS.h"
 #include <math.h>
 
-#define sampleFreq      1000.0f
+/* 采样频率：必须与实际调用频率一致，否则姿态积分量会等比缩放导致滞后。
+ * 由调用方（yuntai_init）按 1000.0f/IMU_PERIOD 设定。 */
+volatile float mahonySampleFreq = 500.0f;
+#define sampleFreq      (mahonySampleFreq)
 #define twoKpDef        (2.0f * 0.5f)
 #define twoKiDef        (2.0f * 0.0f)
 

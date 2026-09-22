@@ -39,14 +39,12 @@ void PID_Reset(PID_Controller* pid)
 // PID更新计算
 void PID_Update(PID_Controller* pid, float setpoint, float measurement, float dt)
 {
-    uint32_t current_time = HAL_GetTick();
-    float actual_dt = (current_time - pid->last_time) / 1000.0f;
-    pid->last_time = current_time;
-
-    if (actual_dt > dt * 1.5f || actual_dt < dt * 0.5f) {
-        actual_dt = dt;
-    }
-
+    /* 直接用调用方给的固定控制周期，不用 HAL_GetTick() 去实测。
+     * 1ms 分辨率的 tick 测出来的 dt 会在 2ms/3ms 之间跳：
+     *   积分项跟着跳 ±50%；
+     *   微分项是 (e-e_prev)/dt，被除以一个抖动的分母，
+     *   微分增益稍大就变成高频抖动甚至自激振荡。
+     * 调用方是按固定周期分频进来的，它最清楚 dt，直接用即可。 */
     float error = setpoint - measurement;
 
     if (fabsf(error) < pid->dead_zone) {
@@ -56,8 +54,8 @@ void PID_Update(PID_Controller* pid, float setpoint, float measurement, float dt
     // 比例项
     float p_term = pid->kp * error;
 
-    // 积分项（带抗饱和）
-    pid->integral += error * actual_dt;
+    // 积分项（带限幅）
+    pid->integral += error * dt;
     if (pid->integral > pid->integral_limit) {
         pid->integral = pid->integral_limit;
     } else if (pid->integral < -pid->integral_limit) {
@@ -66,7 +64,7 @@ void PID_Update(PID_Controller* pid, float setpoint, float measurement, float dt
     float i_term = pid->ki * pid->integral;
 
     // 微分项
-    float derivative = (error - pid->prev_error) / actual_dt;
+    float derivative = (error - pid->prev_error) / dt;
     float d_term = pid->kd * derivative;
 
     pid->prev_error = error;

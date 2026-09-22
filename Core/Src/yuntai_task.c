@@ -1,4 +1,24 @@
-﻿#include "yuntai_task.h"
+﻿/**
+ * 云台双轴稳定控制
+ *
+ * 架构（简化自 speed_control 工程）：
+ *   两个电机都跑【速度模式】，位置环全部在 MCU 里做，驱动器只当执行器。
+ *
+ *   Yaw   : IMU 角度闭环
+ *             err = 目标偏航角 - IMU 偏航角  -> PID -> 速度指令
+ *
+ *   Pitch : 编码器位置环（IMU 只给目标角）
+ *             目标电机角 = 上电电机角 - (IMU俯仰角 - 上电IMU俯仰角)
+ *             err = 目标电机角 - 编码器角度 -> PID -> 速度指令
+ *           再叠加陀螺角速度前馈。
+ *
+ * 为什么俯仰的反馈用编码器而不是 IMU：
+ *   IMU 装在偏航轴上，看不到俯仰电机的转动；编码器能看到电机本体。
+ *   IMU 只给目标角，闭环反馈用编码器 —— 标准级联结构。
+ *   （把位置环交给驱动器去做的那套方案已实测行不通，不要再回头试。）
+ */
+
+#include "yuntai_task.h"
 #include "can_bsp.h"
 #include "jc4310.h"
 #include "fdcan.h"
@@ -10,63 +30,139 @@
 #include <math.h>
 #include <stdio.h>
 
-static float gyro[3] = {0.0f};
-static float acc[3] = {0.0f};
-static float temp = 0.0f;
-static float imuQuat[4] = {0.0f};
-static float imuAngle[3] = {0.0f};
+#define RAD2DEG        57.29578f
+#define IMU_PERIOD     2    /* ms -> 500Hz */
+#define CTRL_PERIOD    5    /* ms -> 200Hz（与原版一致，不要改） */
 
-typedef enum {
-    YUNTAI_STATE_INIT = 0,
-    YUNTAI_STATE_BMI088_INIT,
-    YUNTAI_STATE_MOTOR_CALIBRATE,
-    YUNTAI_STATE_MOTOR_CLOSED_LOOP,
-    YUNTAI_STATE_MOTOR_SET_MODE,
-    YUNTAI_STATE_LOCK_ATTITUDE,
-    YUNTAI_STATE_RUNNING,
-} YuntaiState;
+/* ---------- 陀螺零偏校准 ---------- */
+#define GYRO_BIAS_N         600      /* 采样次数，x2ms = 1.2s */
+#define GYRO_STILL_MAX      0.06f    /* rad/s(约3.4度/s)，任一轴超过即认为在动 */
+#define GYRO_BIAS_MAX       0.05f    /* rad/s(约2.9度/s)，偏置超过即判定采样被污染 */
+#define GYRO_CALIB_WAIT_MS  12000    /* 总超时，静不下来时限幅放行 */
 
-static YuntaiState g_state = YUNTAI_STATE_INIT;
-static uint32_t g_state_timestamp = 0;
-static uint32_t g_last_imu_timestamp = 0;
-static uint32_t g_last_control_timestamp = 0;
-static uint32_t g_last_debug_timestamp = 0;
-static uint8_t  g_state_cmd_sent = 0;
+/* ---------- Yaw 轴 ----------
+ * ❗kp/ki/out/ILIM 是原工程【实测调好】的，不要再按理论去"修正"。
+ *   我曾按量纲换算改成 ki=1432 / kd=0.012 / ILIM=0.021 / 输出限幅=100，
+ *   结果偏航直接不工作了。已恢复原值。
+ *
+ * ❗kd 从原版的 10 改成 5，原因在 MahonyAHRS.c：
+ *   原版 `sampleFreq` 硬编码 1000，而 IMU 实际按 IMU_PERIOD=2ms(500Hz) 采，
+ *   积分步长只有真实时间的 1/2 ⟹ 姿态角只报一半。
+ *   修正后姿态报量变为原来的 2 倍，微分项也涱 2 倍，原 kd=10 相当于 20，
+ *   会把高频噪声放大成振荡（历史上"剧烈左右摇摆"就是这个）。
+ *   取 5 正好复原原版实测过的等效阻尼。 */
+#define YAW_KP          200.0f   /* rpm/rad */
+#define YAW_KI           30.0f   /* rpm/(rad*s) */
+#define YAW_KD            5.0f   /* rpm/(rad/s)，见上方说明 */
+#define YAW_OUT          50.0f   /* rpm */
+#define YAW_ILIM         10.0f
 
-static float yaw_target = 0.0f;
-static float pitch_target = 0.0f;
+/* ⚠⚠ 这是与原版相比唯一的【新增】项，也是偏航"看起来不工作"的根源。
+ *
+ * 原版偏航唯一的输出就是 `yaw_pid.out`，量级：
+ *   P 项 kp=200rpm/rad → 1° 误差只有 3.5rpm
+ *   I 项 ki=30 → 1° 误差下每秒只抬 0.52rpm（要 19s 才能到 10rpm）
+ * 而直驱云台的静摩擦脱困速度在 10rpm 量级
+ * ⟹ 手慢慢扭底盘时指令永远低于脱困速度，**电机根本不动**，看起来就是"不调节"。
+ *
+ * 俯仰之所以"能调"，是因为它有一个很大的角速度前馈 `gyro[1]*1500`
+ * （1rad/s = 143rpm），手一转就远超脱困速度。
+ * 参考工程 speed_control 的偏航也有同样的前馈：
+ *   ff = -gyro_z(deg/s) * (1/6) * 7.0  = 理论抵消量的 1.167 倍
+ * 本工程缺的就是这一项。折算成 rpm*100：
+ *   1rad/s → 57.3deg/s → 57.3/6*7.0 = 66.85rpm → *100 = 6685
+ *
+ * ❗符号若反了，偏航会顺着转动方向越跑越快（助纣为虐）。
+ *   首次上电若发现偏航单向飞转，把 YAW_FF_SIGN 改成 (+1.0f) 即可。
+ *   想临时关掉前馈单独调 PID，把 YAW_FF_GAIN 置 0。 */
+#define YAW_FF_GAIN   6685.0f
+#define YAW_FF_SIGN  (-1.0f)
 
-static PID_Controller yaw_pid;
-static PID_Controller pitch_pid;
-static uint8_t  g_imu_ok = 0;
-static uint8_t  g_bmi088_retry = 0;
+/* ---------- 开环自检开关 ----------
+ * 置 1 时忽略 PID，直接给偏航（水平）电机一个固定转速指令。
+ * 用来把问题一刀切开：
+ *   电机转起来 -> CAN+速度模式这条通路是好的，问题在控制环/IMU
+ *   电机不转   -> 问题在驱动/接线/ID/模式，跟 PID 参数无关      */
+#define YAW_OPENLOOP_TEST   0
+#define YAW_OPENLOOP_RPM    30.0f
 
-#define BMI088_TIMEOUT_MS      5000
-#define CALIBRATE_DELAY        2000
-#define CLOSED_LOOP_DELAY      500
-#define SET_MODE_DELAY         500
-#define LOCK_ATTITUDE_DELAY    500
-#define IMU_PERIOD             2
-#define CONTROL_PERIOD         5
-#define DEBUG_PERIOD           500
+/* ---------- Pitch 轴 ----------
+ * 参数换算（speed_control 用"每周期累加"形式，本工程 PID_Update 乘 dt）：
+ *   kp_本 = kp_彼     ki_本 = ki_彼/dt     kd_本 = kd_彼*dt
+ *   彼方取值 2.8 / 0.02 / 0.10 @500Hz  ->  2.8 / 10 / 0.0002            */
+#define PITCH_KP          2.8f   /* rpm/deg */
+#define PITCH_KI         10.0f   /* rpm/(deg*s) */
+#define PITCH_KD       0.0002f
+#define PITCH_OUT        50.0f   /* rpm */
+#define PITCH_ILIM        0.6f   /* 最大积分贡献 = 10*0.6 = 6rpm */
+#define PITCH_FF_GAIN  1500.0f   /* = 原版 gyro[1]*1500，实测值，勿改 */
+#define PITCH_FF_SIGN  (-1.0f)
+#define PITCH_LIMIT_DEG  80.0f   /* 相对上电位置的行程软限位 */
+
+#define PITCH_FB_TIMEOUT_MS   50
+#define LOCK_MS              200
+
+/* ---------- 启动时序（严格对齐原版，不要随意压缩）----------
+ * 原版：BMI 初始化 -> 空等 2000ms -> 发 0x00A2 进闭环 -> 等 500ms
+ *       -> 发速度模式(0x0060=1) -> 等 500ms -> 锁定姿态 -> RUN
+ *
+ * ❗驱动器上电自检需要时间，指令发太早会被忽略；
+ * ❗更关键的是【运行期绝对不能反复重发 0x0060/0x00A2】 —— 那会不断把
+ *   驱动器内部的运动状态复位。旧代码每 500ms 重发一次，偏航指令本来
+ *   就只有 3.5rpm（抬不过静摩擦），一复位就更起不来 —— 水平电机"不动"
+ *   就是这么来的。现在控制模式只在启动期发，进 RUN 后一律不再碰。   */
+#define STARTUP_DELAY_MS    2000   /* = 原版 CALIBRATE_DELAY */
+#define CMD_STAGE_MS         500   /* = 原版 CLOSED_LOOP_DELAY / SET_MODE_DELAY */
+#define CMD_RESEND_MS        100   /* 阶段内重发间隔：防丢帧，且不会打满 TxFifo */
+
+#define ENABLE_RUNTIME_DEBUG   0
+#define DEBUG_PERIOD        1000
 
 #define INS_YAW_ADDRESS_OFFSET   0
 #define INS_PITCH_ADDRESS_OFFSET 1
 #define INS_ROLL_ADDRESS_OFFSET  2
 
-static float angle_diff_rad(float target, float current)
-{
-    return normalize_angle_rad(target - current);
-}
+/* ===================== 状态 ===================== */
+typedef enum {
+    ST_BMI_INIT = 0,
+    ST_GYRO_CALIB,          /* 零偏采样 + 等驱动器上电就绪 */
+    ST_ENTER_CLOSED_LOOP,
+    ST_SET_SPEED_MODE,
+    ST_LOCK,
+    ST_RUN,
+} State;
 
-static void AHRS_init(float quat[4])
-{
-    quat[0] = 1.0f; quat[1] = 0.0f; quat[2] = 0.0f; quat[3] = 0.0f;
-}
+static State    s_state = ST_BMI_INIT;
+static uint32_t s_state_ms;
+static uint32_t s_imu_ms;
+static uint32_t s_ctrl_ms;
+static uint32_t s_debug_ms;
 
-static void AHRS_update(float quat[4], float g[3], float a[3])
+static float gyro[3], acc[3], temp;
+static float imuQuat[4], imuAngle[3];
+
+/* 陀螺零偏 */
+static float    s_gyro_bias[3];
+static float    s_bias_sum[3];
+static uint16_t s_bias_n;
+static uint8_t  s_calib_done;
+
+/* Yaw */
+static PID_Controller yaw_pid;
+static float          yaw_target;
+
+/* Pitch */
+static PID_Controller pitch_pid;
+static JcFeedback_t   pitch_fb;
+static uint32_t       pitch_fb_ms;
+static uint8_t        pitch_base_ok;
+static float          pitch_plat_locked;   /* 上电时的 IMU 俯仰角(rad) */
+static float          pitch_motor_locked;  /* 上电时的电机角度(deg) */
+
+/* ===================== 姿态解算 ===================== */
+static void AHRS_init(float q[4])
 {
-    MahonyAHRSupdateIMU(quat, g[0], g[1], g[2], a[0], a[1], a[2]);
+    q[0] = 1.0f; q[1] = 0.0f; q[2] = 0.0f; q[3] = 0.0f;
 }
 
 static void GetAngle(float q[4], float *yaw, float *pitch, float *roll)
@@ -76,181 +172,359 @@ static void GetAngle(float q[4], float *yaw, float *pitch, float *roll)
     *roll  = atan2f(2.0f*(q[0]*q[1]+q[2]*q[3]), 2.0f*(q[0]*q[0]+q[3]*q[3])-1.0f);
 }
 
+static void imu_read(void)
+{
+    BMI088_read(gyro, acc, &temp);
+    gyro[0] -= s_gyro_bias[0];
+    gyro[1] -= s_gyro_bias[1];
+    gyro[2] -= s_gyro_bias[2];
+}
+
+static void ahrs_update(void)
+{
+    MahonyAHRSupdateIMU(imuQuat, gyro[0], gyro[1], gyro[2], acc[0], acc[1], acc[2]);
+    GetAngle(imuQuat,
+             imuAngle + INS_YAW_ADDRESS_OFFSET,
+             imuAngle + INS_PITCH_ADDRESS_OFFSET,
+             imuAngle + INS_ROLL_ADDRESS_OFFSET);
+}
+
+static float angle_diff_rad(float target, float current)
+{
+    return normalize_angle_rad(target - current);
+}
+
+/* ===================== 俯仰编码器反馈 =====================
+ * 在 CAN 中断里直接解析并保存。轮询方式下"读到的不一定是对的帧"，
+ * 判据一旦不成立位置环就会静默退化成开环，而且很难察觉。      */
+void can_pitch_rx_hook(const uint8_t *data, uint8_t len)
+{
+    float pos_deg;
+
+    if (jc_parse_position_reply(data, len, &pos_deg))
+    {
+        pitch_fb.pos_deg = pos_deg;
+        pitch_fb.valid   = 1;
+        pitch_fb_ms      = HAL_GetTick();
+    }
+    else
+    {
+        JcFeedback_t f;
+        if (jc_parse_feedback(data, len, &f))
+        {
+            pitch_fb.pos_deg = f.pos_deg;
+            pitch_fb.valid   = 1;
+            pitch_fb_ms      = HAL_GetTick();
+        }
+    }
+}
+
+/* ===================== 启动期电机配置 =====================
+ * 只在进入 RUN 之前发，运行期一律不再动控制模式寄存器。
+ * FDCAN 关掉了自动重传，单帧丢了就永久丢了，所以每个阶段内
+ * 按 CMD_RESEND_MS 重发几次 —— 同时最多只有 2 帧，不会打满 3 深的 TxFifo。 */
+static void motor_enter_closed_loop(void)
+{
+    jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+    jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+}
+
+static void motor_set_speed_mode(void)
+{
+    jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
+    jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_SPEED);
+}
+
 void yuntai_init(void)
 {
+    int i;
+
     can_bsp_init();
+    mahonySampleFreq = 1000.0f / (float)IMU_PERIOD;
+
+    for (i = 0; i < 3; i++) { s_gyro_bias[i] = 0.0f; s_bias_sum[i] = 0.0f; }
+    s_bias_n      = 0;
+    s_calib_done  = 0;
+    pitch_base_ok = 0;
+    pitch_fb_ms   = 0;
+    pitch_fb.pos_deg = 0.0f;
+
     debug_println("=== YunTai Start ===");
-    g_state = YUNTAI_STATE_BMI088_INIT;
-    g_state_timestamp = HAL_GetTick();
-    g_state_cmd_sent = 0;
+    s_state    = ST_BMI_INIT;
+    s_state_ms = HAL_GetTick();
 }
 
 void yuntai_control_loop(void)
 {
     uint32_t now = HAL_GetTick();
 
-    switch (g_state)
+    switch (s_state)
     {
-    case YUNTAI_STATE_INIT:
+    /* ---- 1. BMI088 初始化 ---- */
+    case ST_BMI_INIT:
+        if ((now - s_state_ms) < 200) break;    /* 每 200ms 重试一次 */
+        if (BMI088_init() == BMI088_NO_ERROR)
+        {
+            AHRS_init(imuQuat);
+            debug_println("BMI088 OK");
+            s_state    = ST_GYRO_CALIB;
+            s_state_ms = now;
+            s_imu_ms   = 0;
+        }
+        else
+        {
+            s_state_ms = now;
+        }
         break;
 
-    // ---- 1. BMI088初始化 ----
-    case YUNTAI_STATE_BMI088_INIT:
-        if ((now - g_state_timestamp) < 500) break;  // 每500ms重试一次
+    /* ---- 2. 陀螺零偏校准 ----
+     * 必须在云台完全静止时做。采样期间发现转动就整批作废重来，
+     * 否则偏置里混进真实转动会让姿态缓慢漂移。 */
+    case ST_GYRO_CALIB:
+        if ((now - s_imu_ms) < IMU_PERIOD) break;
+        s_imu_ms = now;
+        BMI088_read(gyro, acc, &temp);          /* 要原始值，不能减零偏 */
 
-        g_bmi088_retry++;
+        if ((fabsf(gyro[0]) > GYRO_STILL_MAX) ||
+            (fabsf(gyro[1]) > GYRO_STILL_MAX) ||
+            (fabsf(gyro[2]) > GYRO_STILL_MAX))
         {
-            char buf[40];
-            int len = snprintf(buf, sizeof(buf), "BMI088: Try #%d...\r\n", (int)g_bmi088_retry);
-            if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
+            /* 在动 -> 整批作废 */
+            s_bias_sum[0] = 0.0f;
+            s_bias_sum[1] = 0.0f;
+            s_bias_sum[2] = 0.0f;
+            s_bias_n = 0;
+            break;
         }
+
+        s_bias_sum[0] += gyro[0];
+        s_bias_sum[1] += gyro[1];
+        s_bias_sum[2] += gyro[2];
+        s_bias_n++;
+
+        if (s_bias_n >= GYRO_BIAS_N)
         {
-            uint8_t result = BMI088_init();
-            char buf[40];
-            int len = snprintf(buf, sizeof(buf), "BMI088: result=%d\r\n", (int)result);
-            if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
-            if (result == BMI088_NO_ERROR)
+            float n  = (float)s_bias_n;
+            float b0 = s_bias_sum[0] / n;
+            float b1 = s_bias_sum[1] / n;
+            float b2 = s_bias_sum[2] / n;
+
+            if ((fabsf(b0) > GYRO_BIAS_MAX) ||
+                (fabsf(b1) > GYRO_BIAS_MAX) ||
+                (fabsf(b2) > GYRO_BIAS_MAX))
             {
-                g_imu_ok = 1;
-                AHRS_init(imuQuat);
-                debug_println("BMI088: OK -> Motor Calibrate");
-                g_state = YUNTAI_STATE_MOTOR_CALIBRATE;
-                g_state_timestamp = now;
-                g_state_cmd_sent = 0;
+                /* 偏置大到不可能是真零偏 -> 这轮采样被污染，重来 */
+                s_bias_sum[0] = 0.0f;
+                s_bias_sum[1] = 0.0f;
+                s_bias_sum[2] = 0.0f;
+                s_bias_n = 0;
             }
             else
             {
-                g_state_timestamp = now;
+                s_gyro_bias[0] = b0;
+                s_gyro_bias[1] = b1;
+                s_gyro_bias[2] = b2;
+                s_calib_done = 1;
             }
         }
-        break;
-
-    // ---- 2. 上电稳定延时（不校准，电机已出厂校准） ----
-    case YUNTAI_STATE_MOTOR_CALIBRATE:
-        if ((now - g_state_timestamp) > CALIBRATE_DELAY)
+        else if ((now - s_state_ms) > GYRO_CALIB_WAIT_MS)
         {
-            g_state = YUNTAI_STATE_MOTOR_CLOSED_LOOP;
-            g_state_timestamp = now;
-            g_state_cmd_sent = 0;
-        }
-        break;
-
-    // ---- 3. 进入闭环 ----
-    case YUNTAI_STATE_MOTOR_CLOSED_LOOP:
-        if (!g_state_cmd_sent)
-        {
-            g_state_cmd_sent = 1;
-            debug_println("Motor: Closed Loop...");
-            jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
-            jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
-        }
-        if ((now - g_state_timestamp) > CLOSED_LOOP_DELAY)
-        {
-            g_state = YUNTAI_STATE_MOTOR_SET_MODE;
-            g_state_timestamp = now;
-            g_state_cmd_sent = 0;
-        }
-        break;
-
-    // ---- 4. 速度模式 ----
-    case YUNTAI_STATE_MOTOR_SET_MODE:
-        if (!g_state_cmd_sent)
-        {
-            g_state_cmd_sent = 1;
-            debug_println("Motor: Speed Mode...");
-            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
-            jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_SPEED);
-        }
-        if ((now - g_state_timestamp) > SET_MODE_DELAY)
-        {
-            g_state = YUNTAI_STATE_LOCK_ATTITUDE;
-            g_state_timestamp = now;
-            g_state_cmd_sent = 0;
-            g_last_imu_timestamp = 0;
-            debug_println("IMU: Locking attitude...");
-        }
-        break;
-
-    // ---- 5. 锁定初始姿态 ----
-    case YUNTAI_STATE_LOCK_ATTITUDE:
-        if ((now - g_last_imu_timestamp) >= IMU_PERIOD)
-        {
-            g_last_imu_timestamp = now;
-            BMI088_read(gyro, acc, &temp);
-            AHRS_update(imuQuat, gyro, acc);
-            GetAngle(imuQuat,
-                imuAngle + INS_YAW_ADDRESS_OFFSET,
-                imuAngle + INS_PITCH_ADDRESS_OFFSET,
-                imuAngle + INS_ROLL_ADDRESS_OFFSET);
-        }
-        if ((now - g_state_timestamp) > LOCK_ATTITUDE_DELAY)
-        {
-            yaw_target   = imuAngle[INS_YAW_ADDRESS_OFFSET];
-            pitch_target = imuAngle[INS_PITCH_ADDRESS_OFFSET];
-            // PID: kp小、输出限制30rpm
-            PID_Init(&yaw_pid, 200.0f, 30.0f, 10.0f, 50.0f);
-            yaw_pid.integral_limit = 10.0f;
-            PID_Init(&pitch_pid, 80.0f, 10.0f, 5.0f, 30.0f);
-            pitch_pid.integral_limit = 5.0f;
+            /* 超时兜底：限幅后放行，避免卡死 */
+            float n = (s_bias_n > 0) ? (float)s_bias_n : 1.0f;
+            int k;
+            for (k = 0; k < 3; k++)
             {
-                char buf[80];
-                int yt = (int)(yaw_target * 5730.0f);
-                int pt = (int)(pitch_target * 5730.0f);
-                int len = snprintf(buf, sizeof(buf), "TARGET: Y=%d P=%d (deg*100)\r\n", yt, pt);
-                if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
+                float b = s_bias_sum[k] / n;
+                if (b >  GYRO_BIAS_MAX) b =  GYRO_BIAS_MAX;
+                if (b < -GYRO_BIAS_MAX) b = -GYRO_BIAS_MAX;
+                s_gyro_bias[k] = b;
             }
-            g_state = YUNTAI_STATE_RUNNING;
-            g_state_timestamp = now;
-            g_last_control_timestamp = now;
-            g_last_debug_timestamp = now;
+            s_calib_done = 1;
+        }
+
+        /* 采样完成【且】上电已满 STARTUP_DELAY_MS 才往下走：
+         * 后半段就是原版的"空等 2000ms"，用来等驱动器上电自检完成。 */
+        if (s_calib_done && ((now - s_state_ms) >= STARTUP_DELAY_MS))
+        {
+            debug_println("gyro bias done");
+            s_state    = ST_ENTER_CLOSED_LOOP;
+            s_state_ms = now;
+            s_imu_ms   = now;
+        }
+        break;
+
+    /* ---- 3. 进入闭环 0x00A2（阶段内重发防丢帧）---- */
+    case ST_ENTER_CLOSED_LOOP:
+        if ((now - s_imu_ms) >= CMD_RESEND_MS)
+        {
+            s_imu_ms = now;
+            motor_enter_closed_loop();
+        }
+        if ((now - s_state_ms) >= CMD_STAGE_MS)
+        {
+            debug_println("motor closed loop");
+            s_state    = ST_SET_SPEED_MODE;
+            s_state_ms = now;
+            s_imu_ms   = now;
+        }
+        break;
+
+    /* ---- 4. 切速度模式 0x0060=1（阶段内重发防丢帧）---- */
+    case ST_SET_SPEED_MODE:
+        if ((now - s_imu_ms) >= CMD_RESEND_MS)
+        {
+            s_imu_ms = now;
+            motor_set_speed_mode();
+        }
+        if ((now - s_state_ms) >= CMD_STAGE_MS)
+        {
+            debug_println("motor speed mode");
+            s_state    = ST_LOCK;
+            s_state_ms = now;
+            s_imu_ms   = 0;      /* ST_LOCK 要用 s_imu_ms 做 IMU 采样计时 */
+        }
+        break;
+
+    /* ---- 5. 锁定姿态基准 ---- */
+    case ST_LOCK:
+        if ((now - s_imu_ms) >= IMU_PERIOD)
+        {
+            s_imu_ms = now;
+            imu_read();
+            ahrs_update();
+        }
+
+        if ((now - s_state_ms) > LOCK_MS)
+        {
+            PID_Init(&yaw_pid,   YAW_KP,   YAW_KI,   YAW_KD,   YAW_OUT);
+            yaw_pid.integral_limit = YAW_ILIM;
+            PID_Init(&pitch_pid, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_OUT);
+            pitch_pid.integral_limit = PITCH_ILIM;
+
+            pitch_plat_locked  = imuAngle[INS_PITCH_ADDRESS_OFFSET];
+            pitch_motor_locked = 0.0f;
+            pitch_base_ok      = 0;
+            yaw_target         = imuAngle[INS_YAW_ADDRESS_OFFSET];
+
+            s_ctrl_ms  = now;
+            s_debug_ms = now;
+            s_state    = ST_RUN;
             debug_println("=== STABILIZATION ACTIVE ===");
         }
         break;
 
-    // ---- 6. 双轴稳定闭环 ----
-    case YUNTAI_STATE_RUNNING:
-        if ((now - g_last_imu_timestamp) >= IMU_PERIOD)
+    /* ---- 6. 双轴闭环 ---- */
+    case ST_RUN:
+        if ((now - s_imu_ms) >= IMU_PERIOD)
         {
-            g_last_imu_timestamp = now;
-            BMI088_read(gyro, acc, &temp);
-            AHRS_update(imuQuat, gyro, acc);
-            GetAngle(imuQuat,
-                imuAngle + INS_YAW_ADDRESS_OFFSET,
-                imuAngle + INS_PITCH_ADDRESS_OFFSET,
-                imuAngle + INS_ROLL_ADDRESS_OFFSET);
+            s_imu_ms = now;
+            imu_read();
+            ahrs_update();
         }
-        if ((now - g_last_control_timestamp) >= CONTROL_PERIOD)
-        {
-            g_last_control_timestamp = now;
-            float dt = (float)CONTROL_PERIOD / 1000.0f;
-            // Yaw: PID闭环（水平电机旋转会反馈到IMU）
-            float yaw_err = angle_diff_rad(yaw_target, imuAngle[INS_YAW_ADDRESS_OFFSET]);
-            PID_Update(&yaw_pid, yaw_err, 0.0f, dt);
-            jc_set_speed_rpm_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, (int32_t)(yaw_pid.out * 100.0f));
 
-            // Pitch: 直接用陀螺仪角速度驱动（俯仰电机不影响底板IMU，不能用角度PID）
-            // gyro单位为rad/s，转为rpm*100后取反（补偿方向）
-            int32_t pitch_speed = -(int32_t)(gyro[1] * 1500.0f);  // rad/s → rpm*100
-            jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, pitch_speed);
-        }
-        // 每200ms输出一次IMU数据
-        if ((now - g_last_debug_timestamp) >= DEBUG_PERIOD)
+        if ((now - s_ctrl_ms) < CTRL_PERIOD) break;
+        s_ctrl_ms = now;
         {
-            g_last_debug_timestamp = now;
-            float yaw_err = angle_diff_rad(yaw_target, imuAngle[INS_YAW_ADDRESS_OFFSET]);
-            int ye = (int)(yaw_err * 5730.0f);
-            int yo = (int)(yaw_pid.out * 100.0f);
-            int pg = (int)(gyro[1] * 5730.0f);  // pitch陀螺角速度 deg/s*100
-            int ps = -(int)(gyro[1] * 600.0f);  // pitch电机指令 rpm*100
-            char buf[80];
-            int len = snprintf(buf, sizeof(buf), "PID: Ye=%d Yo=%d | Gy=%d Ps=%d\r\n", ye, yo, pg, ps);
-            if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
-            debug_print_imu(imuAngle[INS_YAW_ADDRESS_OFFSET],
-                           imuAngle[INS_PITCH_ADDRESS_OFFSET],
-                           imuAngle[INS_ROLL_ADDRESS_OFFSET],
-                           gyro[0], gyro[1], gyro[2],
-                           acc[0], acc[1], acc[2]);
+            float dt = (float)CTRL_PERIOD / 1000.0f;
+
+            /* ---------- Yaw：角度闭环 + 角速度前馈（与原版同构 + 补上缺失的 FF）----------
+             * 慢速修正靠 PID（把上电时的朝向保持住），
+             * 快速响应靠 gyro[2] 前馈（否则指令抬不过静摩擦，看起来"不工作"）。 */
+            {
+                float yaw_err = angle_diff_rad(yaw_target, imuAngle[INS_YAW_ADDRESS_OFFSET]);
+                float yaw_cmd;
+
+                PID_Update(&yaw_pid, yaw_err, 0.0f, dt);
+
+                yaw_cmd = yaw_pid.out
+                        + YAW_FF_SIGN * gyro[2] * (YAW_FF_GAIN / 100.0f);
+
+                if (yaw_cmd >  YAW_OUT) yaw_cmd =  YAW_OUT;
+                if (yaw_cmd < -YAW_OUT) yaw_cmd = -YAW_OUT;
+
+#if YAW_OPENLOOP_TEST
+                /* 开环自检：忽略 PID，直接给水平电机固定转速 */
+                (void)yaw_cmd;
+                jc_set_speed_rpm_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                      (int32_t)(YAW_OPENLOOP_RPM * 100.0f));
+#else
+                jc_set_speed_rpm_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                      (int32_t)(yaw_cmd * 100.0f));
+#endif
+            }
+
+            /* ---------- Pitch ---------- */
+            {
+                uint8_t fb_ok = ((now - pitch_fb_ms) < PITCH_FB_TIMEOUT_MS) ? 1 : 0;
+
+                /* 首次拿到有效反馈时建立基准；只建一次，绝不重建 */
+                if (fb_ok && !pitch_base_ok)
+                {
+                    pitch_plat_locked  = imuAngle[INS_PITCH_ADDRESS_OFFSET];
+                    pitch_motor_locked = pitch_fb.pos_deg;
+                    PID_Reset(&pitch_pid);
+                    pitch_base_ok = 1;
+                    debug_println("pitch encoder online");
+                }
+
+                if (pitch_base_ok && fb_ok)
+                {
+                    /* 目标电机角 = 上电电机角 - 平台俯仰变化量
+                     * 变化量直接取 IMU 绝对俯仰角差值（重力修正，不会漂移） */
+                    float dplat  = imuAngle[INS_PITCH_ADDRESS_OFFSET] - pitch_plat_locked;
+                    float target = pitch_motor_locked - dplat * RAD2DEG;
+                    float err, cmd;
+
+                    if (target > (pitch_motor_locked + PITCH_LIMIT_DEG))
+                        target = pitch_motor_locked + PITCH_LIMIT_DEG;
+                    if (target < (pitch_motor_locked - PITCH_LIMIT_DEG))
+                        target = pitch_motor_locked - PITCH_LIMIT_DEG;
+
+                    err = target - pitch_fb.pos_deg;
+
+                    PID_Update(&pitch_pid, err, 0.0f, dt);
+
+                    cmd = pitch_pid.out
+                        + PITCH_FF_SIGN * gyro[1] * (PITCH_FF_GAIN / 100.0f);
+
+                    if (cmd >  PITCH_OUT) cmd =  PITCH_OUT;
+                    if (cmd < -PITCH_OUT) cmd = -PITCH_OUT;
+
+#if ENABLE_RUNTIME_DEBUG
+                    if ((now - s_debug_ms) >= DEBUG_PERIOD)
+                    {
+                        char buf[128];
+                        int  n;
+                        s_debug_ms = now;
+                        n = snprintf(buf, sizeof(buf),
+                            "yaw=%d pIMU=%d pTgt=%d pEnc=%d pErr=%d cmd=%d gy=%d a=%d\r\n",
+                            (int)(imuAngle[INS_YAW_ADDRESS_OFFSET] * 5730.0f),
+                            (int)(imuAngle[INS_PITCH_ADDRESS_OFFSET] * 5730.0f),
+                            (int)(target * 100.0f),
+                            (int)(pitch_fb.pos_deg * 100.0f),
+                            (int)(err * 100.0f),
+                            (int)(cmd * 100.0f),
+                            (int)(gyro[1] * 10000.0f),
+                            (int)(sqrtf(acc[0]*acc[0] + acc[1]*acc[1] + acc[2]*acc[2]) * 100.0f));
+                        if (n > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, n, 100);
+                    }
+#endif
+                    jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                                          (int32_t)(cmd * 100.0f));
+                }
+                else
+                {
+                    /* 反馈未就绪的降级：只给角速度前馈，保证不会完全失控 */
+                    PID_Reset(&pitch_pid);
+                    jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                        (int32_t)(PITCH_FF_SIGN * gyro[1]
+                                  * (PITCH_FF_GAIN / 100.0f) * 100.0f));
+                }
+            }
         }
+        break;
+
+    default:
         break;
     }
 }
