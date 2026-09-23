@@ -1,4 +1,5 @@
 #include "can_bsp.h"
+#include "debug_uart.h"
 
 /**
  * @brief:     CAN总线初始化
@@ -8,10 +9,52 @@
 void can_bsp_init(void)
 {
 	can_filter_init();
-	HAL_FDCAN_Start(&hfdcan1);
-	HAL_FDCAN_Start(&hfdcan2);
+
+	/* ❗检查返回值。若 HAL_FDCAN_Init 没成功或没进初始化态，
+	 *   HAL_FDCAN_Start 会静默失败 —— 这条总线就永远是死的，
+	 *   而且跟控制代码毫无关系。 */
+	if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) debug_println("FDCAN1 START FAIL");
+	if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK) debug_println("FDCAN2 START FAIL");
+
 	HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 	HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+}
+
+/* ===================== bus-off 自动恢复 =====================
+ * 见 can_bsp.h 里的说明。每 50ms 查一次协议状态，
+ * 发现 BusOff 就 Stop(置 INIT) + Start(清 INIT) 让它重新上线。
+ * 滤波器在 message RAM 里，Stop/Start 不会动它，不用重配。 */
+static uint16_t s_busoff_cnt[2];        /* [0]=FDCAN1, [1]=FDCAN2 */
+
+static void can_bus_recover(FDCAN_HandleTypeDef *hfdcan, uint8_t idx)
+{
+	FDCAN_ProtocolStatusTypeDef st;
+
+	if (HAL_FDCAN_GetProtocolStatus(hfdcan, &st) != HAL_OK) return;
+	if (st.BusOff == 0u) return;
+
+	HAL_FDCAN_Stop(hfdcan);
+	HAL_FDCAN_Start(hfdcan);
+
+	if (s_busoff_cnt[idx] < 0xFFFFu) s_busoff_cnt[idx]++;
+}
+
+void can_bsp_service(void)
+{
+	static uint32_t t_ms = 0;
+	uint32_t now = HAL_GetTick();
+
+	if ((now - t_ms) < 50) return;
+	t_ms = now;
+
+	can_bus_recover(&hfdcan1, 0);
+	can_bus_recover(&hfdcan2, 1);
+}
+
+/* bus-off 发生次数（累计）。辅助判断总线对面到底有没有节点在应答 */
+uint16_t can_bsp_get_busoff_count(FDCAN_HandleTypeDef *hfdcan)
+{
+	return s_busoff_cnt[(hfdcan == &hfdcan1) ? 0 : 1];
 }
 
 /**

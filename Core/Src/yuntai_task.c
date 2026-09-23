@@ -16,6 +16,39 @@
  *   IMU 装在偏航轴上，看不到俯仰电机的转动；编码器能看到电机本体。
  *   IMU 只给目标角，闭环反馈用编码器 —— 标准级联结构。
  *   （把位置环交给驱动器去做的那套方案已实测行不通，不要再回头试。）
+ *
+ * ============================ 启动状态机 ============================
+ * 上电到开始正常控制约 3.4s，依次经过：
+ *
+ *  0) 上电自由态  yuntai_init(): 只初始化 CAN，不发任何电机指令。
+ *                 驱动器停在上电默认态(未使能) -> 此时电机可被手掰动。
+ *  1) ST_BMI_INIT          ~0.2s 每 200ms 试一次 BMI088_init()
+ *  2) ST_WAIT_MOTOR_BOOT    2.0s 纯延时，等驱动器上电自检完成
+ *                                (= 原版 CALIBRATE_DELAY，无条件推进)
+ *  3) ST_ENTER_CLOSED_LOOP 0.5s  发 0x00A2(进入闭环)到两条总线，每 100ms 重发
+ *  4) ST_SET_SPEED_MODE    0.5s  发 0x0060=1(速度模式)，每 100ms 重发
+ *  5) ST_LOCK              0.2s  不发指令；锁定 yaw_target / 俯仰基准，PID_Init
+ *  6) ST_RUN               永久   每 2ms 读 IMU，每 5ms 发一次速度指令
+ *
+ *  ❗【启动路径上不允许有任何会阻塞的判据】。
+ *    凡是"要满足某条件才能往下走"的逻辑，一旦条件因噪声/环境永远不满足，
+ *    整个状态机就停在原地 —— 而表现是"云台一直是软的"，极难定位。
+ *    启动阶段只允许纯延时推进；带条件的逻辑只能放在 ST_RUN 里做后台降级。
+ *
+ *  ❗0x0060(控制模式) 和 0x00A2(闭环使能) 只在 3/4 阶段发，进 ST_RUN 后一律不再碰。
+ *    运行期反复写这两个寄存器会不断复位驱动器内部运动状态 —— 踩过：
+ *    表现是水平电机完全不动。
+ *
+ *  ❗俯仰进入 ST_RUN 后还要再等第一帧编码器反馈才算真闭环：
+ *    50ms 内收不到 -> PID_Reset，退化成纯角速度前馈(只响应转动、不响应慢漂)；
+ *    首次收到 -> 锁 pitch_motor_locked，打印 "pitch encoder online"。
+ *    该基准只锁一次、永不重建。
+ *
+ *  状态切换打印(缺哪条就说明卡在哪一步)：
+ *    === YunTai Start === -> BMI088 OK -> startup delay done
+ *    -> motor closed loop -> motor speed mode
+ *    -> === STABILIZATION ACTIVE === -> pitch encoder online
+ * ===================================================================
  */
 
 #include "yuntai_task.h"
@@ -34,11 +67,18 @@
 #define IMU_PERIOD     2    /* ms -> 500Hz */
 #define CTRL_PERIOD    5    /* ms -> 200Hz（与原版一致，不要改） */
 
-/* ---------- 陀螺零偏校准 ---------- */
-#define GYRO_BIAS_N         600      /* 采样次数，x2ms = 1.2s */
-#define GYRO_STILL_MAX      0.06f    /* rad/s(约3.4度/s)，任一轴超过即认为在动 */
-#define GYRO_BIAS_MAX       0.05f    /* rad/s(约2.9度/s)，偏置超过即判定采样被污染 */
-#define GYRO_CALIB_WAIT_MS  12000    /* 总超时，静不下来时限幅放行 */
+/* ---------- 陀螺零偏校准：已删除 ----------
+ * 原版第一次提交的代码根本没有这一步，直接拿原始陀螺值用，照样能跑。
+ * 我后加的"静止采样求平均"引入了一个会【卡死启动流程】的故障：
+ *   它要求连续采满 600 个"没在动"的样本，任一样本超过阈值就把
+ *   已采样本【整批清零重来】。而如果这颗 BMI088 的陀螺零偏本身就
+ *   超过静置阈值(0.06 rad/s ≈ 3.4°/s)，就永远采不满，只能干等到 12s 超时。
+ *   ⟹ 表现就是"迟迟进入不了状态"、云台一直是软的、能被手掰动。
+ *
+ * 代价权衡：不做零偏补偿，偏航角会因零偏残留而缓慢漂移。
+ *   但这个漂移是可接受的，而"卡死启动"是不可接受的 —— 宁可漂，不能卡。
+ * 若以后确实需要补零偏：只能在 ST_RUN 里【后台】慢慢估、慢慢用，
+ *   绝不能让任何估计逻辑参与启动流程的放行条件。                     */
 
 /* ---------- Yaw 轴 ----------
  * ❗kp/ki/out/ILIM 是原工程【实测调好】的，不要再按理论去"修正"。
@@ -48,7 +88,7 @@
  * ❗kd 从原版的 10 改成 5，原因在 MahonyAHRS.c：
  *   原版 `sampleFreq` 硬编码 1000，而 IMU 实际按 IMU_PERIOD=2ms(500Hz) 采，
  *   积分步长只有真实时间的 1/2 ⟹ 姿态角只报一半。
- *   修正后姿态报量变为原来的 2 倍，微分项也涱 2 倍，原 kd=10 相当于 20，
+ *   修正后姿态报量变为原来的 2 倍，微分项也涨 2 倍，原 kd=10 相当于 20，
  *   会把高频噪声放大成振荡（历史上"剧烈左右摇摆"就是这个）。
  *   取 5 正好复原原版实测过的等效阻尼。 */
 #define YAW_KP          200.0f   /* rpm/rad */
@@ -82,9 +122,35 @@
  * 置 1 时忽略 PID，直接给偏航（水平）电机一个固定转速指令。
  * 用来把问题一刀切开：
  *   电机转起来 -> CAN+速度模式这条通路是好的，问题在控制环/IMU
- *   电机不转   -> 问题在驱动/接线/ID/模式，跟 PID 参数无关      */
+ *   电机不转   -> 问题在驱动/接线/ID/模式，跟 PID 参数无关
+ * ⚠ 已被下面的 YAW_BRINGUP_TEST 取代（后者信息量更大），保留作为备选。 */
 #define YAW_OPENLOOP_TEST   0
 #define YAW_OPENLOOP_RPM    30.0f
+
+/* ---------- 偏航电机独立自检（不需要电脑，看电机动作就行）----------
+ * 置 1 时：整个状态机、IMU、PID、前馈、俯仰轴全部跳过，
+ * 只对偏航总线 FDCAN1 做一件事 —— 轮流试各个驱动器 ID：
+ *
+ *     给 ID=1 发使能+速度模式+30rpm，持续 1.5s → 停 0.7s →
+ *     给 ID=2 发同样的东西          → 停 0.7s →
+ *     ... 一直到 YAW_BRINGUP_ID_MAX，然后循环
+ *
+ * 【怎么读结果】
+ *   1) 在某一轮里电机转起来了 —— 记下是第几轮，那就是真正的 ID，
+ *      改 YUNTAI_MOTOR_YAW_ID 即可解决问题。
+ *   2) 自始至终电机一直是软的、不转 ——
+ *      ⟹ FDCAN1 硬件侧问题，与控制代码无关：
+ *        · 偏航驱动器有没有上电（看驱动器指示灯）
+ *        · CAN1-H / CAN1-L 接线、是否插反
+ *        · 总线上有没有 120Ω 终端电阻（两端各一个）
+ *        · 偏航驱动器的波特率设置是否与俯仰那只一致
+ *        · 前一次跑飞/振荡后驱动器是否锁在故障态 —— 断整机电源重上电
+ * ⚠ 这一轮只发 FDCAN1，不会动俯仰轴，安全。                      */
+#define YAW_BRINGUP_TEST     0
+#define YAW_BRINGUP_ID_MAX   6
+#define YAW_BRINGUP_RPM      30.0f
+#define YAW_BRINGUP_ON_MS    1500   /* 每个 ID 通电时长 */
+#define YAW_BRINGUP_OFF_MS    700   /* 每个 ID 之间的停顿 */
 
 /* ---------- Pitch 轴 ----------
  * 参数换算（speed_control 用"每周期累加"形式，本工程 PID_Update 乘 dt）：
@@ -125,7 +191,7 @@
 /* ===================== 状态 ===================== */
 typedef enum {
     ST_BMI_INIT = 0,
-    ST_GYRO_CALIB,          /* 零偏采样 + 等驱动器上电就绪 */
+    ST_WAIT_MOTOR_BOOT,     /* 纯延时，等驱动器上电自检完成 */
     ST_ENTER_CLOSED_LOOP,
     ST_SET_SPEED_MODE,
     ST_LOCK,
@@ -140,12 +206,6 @@ static uint32_t s_debug_ms;
 
 static float gyro[3], acc[3], temp;
 static float imuQuat[4], imuAngle[3];
-
-/* 陀螺零偏 */
-static float    s_gyro_bias[3];
-static float    s_bias_sum[3];
-static uint16_t s_bias_n;
-static uint8_t  s_calib_done;
 
 /* Yaw */
 static PID_Controller yaw_pid;
@@ -174,10 +234,8 @@ static void GetAngle(float q[4], float *yaw, float *pitch, float *roll)
 
 static void imu_read(void)
 {
+    /* 直接用原始值，不做零偏补偿。原因见文件上方的"陀螺零偏校准：已删除"。 */
     BMI088_read(gyro, acc, &temp);
-    gyro[0] -= s_gyro_bias[0];
-    gyro[1] -= s_gyro_bias[1];
-    gyro[2] -= s_gyro_bias[2];
 }
 
 static void ahrs_update(void)
@@ -235,16 +293,57 @@ static void motor_set_speed_mode(void)
     jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_SPEED);
 }
 
+/* ===================== 偏航电机独立自检 =====================
+ * 见文件上方 YAW_BRINGUP_TEST 的说明。
+ * 逐个 ID 试：发使能+速度模式(只在本 ID 的第一帧发一次) + 30rpm，
+ * 每个 ID 持续 ON_MS 后停 OFF_MS，然后换下一个 ID。
+ * 用电机动作本身把"真正的 ID 是几号"报出来。 */
+static void yaw_bringup(void)
+{
+    static uint32_t t_ms    = 0;      /* 本阶段开始时刻 */
+    static uint8_t  id      = 1;      /* 当前在试的 ID */
+    static uint8_t  enabled = 0;      /* 本 ID 的使能指令发过没有 */
+    uint32_t now = HAL_GetTick();
+
+    if ((now - t_ms) < CTRL_PERIOD) return;
+    t_ms = now;
+
+    /* 阶段结束 -> 换下一个 ID */
+    if ((now - s_state_ms) >= (YAW_BRINGUP_ON_MS + YAW_BRINGUP_OFF_MS))
+    {
+        s_state_ms = now;
+        id++;
+        if (id > YAW_BRINGUP_ID_MAX) id = 1;
+        enabled = 0;
+    }
+
+    /* 先算一下是不是在这一轮的"通电"段里 */
+    if ((now - s_state_ms) < YAW_BRINGUP_ON_MS)
+    {
+        if (!enabled)
+        {
+            /* ❗使能+控制模式只在每个 ID 的第一帧发，之后不再重复发，
+             *   否则会不断复位驱动器内部运动状态、反而看不到动作 */
+            jc_enter_closed_loop(&hfdcan1, id);
+            jc_set_control_mode(&hfdcan1, id, JC_MODE_SPEED);
+            enabled = 1;
+        }
+        jc_set_speed_rpm_x100(&hfdcan1, id, (int32_t)(YAW_BRINGUP_RPM * 100.0f));
+    }
+    else
+    {
+        /* 停顿段：把当前 ID 停住。
+         * 这样上电后电机一定是"动 1.5s、停 0.7s"一阵一阵地转，
+         * 而且循环总是从 ID=1 开始 ⟹ 上电后第几次动，对应的 ID 就是几。 */
+        jc_set_speed_rpm_x100(&hfdcan1, id, 0);
+    }
+}
+
 void yuntai_init(void)
 {
-    int i;
-
     can_bsp_init();
     mahonySampleFreq = 1000.0f / (float)IMU_PERIOD;
 
-    for (i = 0; i < 3; i++) { s_gyro_bias[i] = 0.0f; s_bias_sum[i] = 0.0f; }
-    s_bias_n      = 0;
-    s_calib_done  = 0;
     pitch_base_ok = 0;
     pitch_fb_ms   = 0;
     pitch_fb.pos_deg = 0.0f;
@@ -258,6 +357,16 @@ void yuntai_control_loop(void)
 {
     uint32_t now = HAL_GetTick();
 
+    /* 总线维护：bus-off 自动恢复。必须放在最前面，
+     * 自检模式下也要跑，否则一旦 bus-off 连自检都发不出去。 */
+    can_bsp_service();
+
+#if YAW_BRINGUP_TEST
+    /* 独立自检模式：整个状态机/IMU/PID/俯仰轴全部跳过 */
+    yaw_bringup();
+    return;
+#endif
+
     switch (s_state)
     {
     /* ---- 1. BMI088 初始化 ---- */
@@ -267,7 +376,7 @@ void yuntai_control_loop(void)
         {
             AHRS_init(imuQuat);
             debug_println("BMI088 OK");
-            s_state    = ST_GYRO_CALIB;
+            s_state    = ST_WAIT_MOTOR_BOOT;
             s_state_ms = now;
             s_imu_ms   = 0;
         }
@@ -277,80 +386,25 @@ void yuntai_control_loop(void)
         }
         break;
 
-    /* ---- 2. 陀螺零偏校准 ----
-     * 必须在云台完全静止时做。采样期间发现转动就整批作废重来，
-     * 否则偏置里混进真实转动会让姿态缓慢漂移。 */
-    case ST_GYRO_CALIB:
-        if ((now - s_imu_ms) < IMU_PERIOD) break;
-        s_imu_ms = now;
-        BMI088_read(gyro, acc, &temp);          /* 要原始值，不能减零偏 */
+    /* ---- 2. 等驱动器上电自检完成（纯延时，与原版 CALIBRATE_DELAY 相同）----
+     * ❗这里【绝不能】再放"要满足某条件才放行"的逻辑。
+     *   曾经在这里放陀螺零偏采样（静止求平均），它把启动流程卡死了：
+     *     1) 它要求连续 600 个样本都满足"没在动"，任何一个样本超阈值就把
+     *        已采样本整批清零重来。若这颗 BMI088 的陀螺零偏本身就超过
+     *        静置阈值(0.06 rad/s)，那永远采不满，只能干等到 12s 超时；
+     *     2) 更致命的是走不到这一步，后面 ST_ENTER_CLOSED_LOOP 就永远不执行,
+     *        电机停在"未使能"状态 —— 表现就是云台一直是软的、能被手掰动。
+     *   原版第一次提交的代码没有这一步，直接拿原始陀螺值用，照样能跑。
+     *   现在改成和原版一样的纯延时：状态机【无条件推进】，不可能卡住。
+     *
+     *   这 2 秒是给驱动器上电自检用的，不能省（发太早会收不到指令）。 */
+    case ST_WAIT_MOTOR_BOOT:
+        if ((now - s_state_ms) < STARTUP_DELAY_MS) break;
 
-        if ((fabsf(gyro[0]) > GYRO_STILL_MAX) ||
-            (fabsf(gyro[1]) > GYRO_STILL_MAX) ||
-            (fabsf(gyro[2]) > GYRO_STILL_MAX))
-        {
-            /* 在动 -> 整批作废 */
-            s_bias_sum[0] = 0.0f;
-            s_bias_sum[1] = 0.0f;
-            s_bias_sum[2] = 0.0f;
-            s_bias_n = 0;
-            break;
-        }
-
-        s_bias_sum[0] += gyro[0];
-        s_bias_sum[1] += gyro[1];
-        s_bias_sum[2] += gyro[2];
-        s_bias_n++;
-
-        if (s_bias_n >= GYRO_BIAS_N)
-        {
-            float n  = (float)s_bias_n;
-            float b0 = s_bias_sum[0] / n;
-            float b1 = s_bias_sum[1] / n;
-            float b2 = s_bias_sum[2] / n;
-
-            if ((fabsf(b0) > GYRO_BIAS_MAX) ||
-                (fabsf(b1) > GYRO_BIAS_MAX) ||
-                (fabsf(b2) > GYRO_BIAS_MAX))
-            {
-                /* 偏置大到不可能是真零偏 -> 这轮采样被污染，重来 */
-                s_bias_sum[0] = 0.0f;
-                s_bias_sum[1] = 0.0f;
-                s_bias_sum[2] = 0.0f;
-                s_bias_n = 0;
-            }
-            else
-            {
-                s_gyro_bias[0] = b0;
-                s_gyro_bias[1] = b1;
-                s_gyro_bias[2] = b2;
-                s_calib_done = 1;
-            }
-        }
-        else if ((now - s_state_ms) > GYRO_CALIB_WAIT_MS)
-        {
-            /* 超时兜底：限幅后放行，避免卡死 */
-            float n = (s_bias_n > 0) ? (float)s_bias_n : 1.0f;
-            int k;
-            for (k = 0; k < 3; k++)
-            {
-                float b = s_bias_sum[k] / n;
-                if (b >  GYRO_BIAS_MAX) b =  GYRO_BIAS_MAX;
-                if (b < -GYRO_BIAS_MAX) b = -GYRO_BIAS_MAX;
-                s_gyro_bias[k] = b;
-            }
-            s_calib_done = 1;
-        }
-
-        /* 采样完成【且】上电已满 STARTUP_DELAY_MS 才往下走：
-         * 后半段就是原版的"空等 2000ms"，用来等驱动器上电自检完成。 */
-        if (s_calib_done && ((now - s_state_ms) >= STARTUP_DELAY_MS))
-        {
-            debug_println("gyro bias done");
-            s_state    = ST_ENTER_CLOSED_LOOP;
-            s_state_ms = now;
-            s_imu_ms   = now;
-        }
+        debug_println("startup delay done");
+        s_state    = ST_ENTER_CLOSED_LOOP;
+        s_state_ms = now;
+        s_imu_ms   = now;
         break;
 
     /* ---- 3. 进入闭环 0x00A2（阶段内重发防丢帧）---- */

@@ -14,6 +14,20 @@ typedef struct
 
 void can_bsp_init(void);
 void can_filter_init(void);
+
+/* 周期维护：检测到 bus-off 就自动恢复。
+ * ❗为什么必须有：总线上一旦没有节点应答我们的帧（驱动器没上电/波特率不对/
+ *   接线断/CAN ID 不匹配），发送错误计数 TEC 每帧 +8，约 32 帧后就进入
+ *   **bus-off**。进入 bus-off 后硬件【彻底不再发送】，而且自己不会出来 ——
+ *   必须手动清 CCCR.INIT 才能重新上线。
+ *   以 5ms 一帧算，不到 200ms 就 bus-off 且永不自救 ⟹ 之后无论固件怎么改、
+ *   就算把驱动器修好了，这条总线也永远是死的。
+ *   这同时也解释了历史上"上电偶尔完全失去控制"。                     */
+void can_bsp_service(void);
+
+/* bus-off 累计发生次数。可用来判断总线对面到底有没有节点在应答：
+ * 一直为 0 = 有节点应答（正常）；不停增长 = 对面没东西/波特率不对/接线断 */
+uint16_t can_bsp_get_busoff_count(FDCAN_HandleTypeDef *hfdcan);
 uint8_t fdcanx_send_data(FDCAN_HandleTypeDef *hfdcan, uint16_t id, uint8_t *data, uint32_t len);
 uint8_t fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint32_t *id, uint8_t *buf);
 
