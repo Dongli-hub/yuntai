@@ -9,3 +9,6 @@ Debug/
 
 # 备份或临时文件
 *.bak
+
+# PC 端自测（tools/host_test）的编译产物：本地跑出来的 exe 不进仓库
+tools/host_test/build/

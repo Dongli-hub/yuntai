@@ -22,6 +22,8 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "gimbal_link.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -256,5 +258,36 @@ void FDCAN2_IT1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief This function handles USART1 global interrupt.
+  *
+  * ⚠⚠ 这里有一个必须记住的坑（实测踩过，现象是"云台上电后两个电机完全没反应"）：
+  *
+  *   HAL_UART_Transmit_IT() 内部会打开 TXE 中断（CR1 |= TXEIE）。
+  *   而 USART 发送寄存器空闲时 TXE **一直是置位**的，
+  *   所以打开 TXEIE 会**立刻**触发中断；只有写一次 TDR 才能清掉 TXE。
+  *
+  *   如果本函数只处理接收、不把中断交给 HAL_UART_IRQHandler，
+  *   就没有任何人去写 TDR -> TXE 永远是 1 -> 中断被无限重复触发
+  *   -> 主循环被彻底饿死 -> 状态机永远走不到 RUNNING
+  *   -> 两个电机从头到尾收不到任何速度指令（表现就是"完全没反应"）。
+  *
+  *   所以顺序必须是：先自己收字节，再把中断交给 HAL 去发字节。
+  *
+  * 放在这里（而不是在 CubeMX 里勾 NVIC）的原因：
+  * 这样 .ioc 不用改，重新生成代码也不会丢。
+  *
+  * ⚠ 如果以后在 CubeMX 里给 USART1 勾了 NVIC，
+  *   CubeMX 会再生成一个同名的 USART1_IRQHandler，链接会报重定义。
+  *   到时候把下面这段删掉、改用 CubeMX 生成的即可。
+  */
+void USART1_IRQHandler(void)
+{
+  /* 1) 接收：直接读 RDR 存进环形缓冲（短、快、不解析） */
+  gimbal_link_rx_isr();
+  /* 2) 发送与错误：必须交给 HAL，否则 TXE 中断会被永久重复触发 */
+  HAL_UART_IRQHandler(&huart1);
+}
 
 /* USER CODE END 1 */

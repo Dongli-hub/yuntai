@@ -1,0 +1,203 @@
+# ============================================================================
+# rdk_aim 默认配置
+#
+# 调参顺序建议（每次只改一项，改完记录）：
+#   1) camera 曝光/分辨率       -> 让黑框和红色都看得清
+#   2) target/laser 检测阈值    -> 用 tools/view_detect.py 看着调
+#   3) control.kp               -> 从 0.20 起，加到开始抖就回退一档
+#   4) control.lead_s           -> 运动时若"总跟在后面"再加大
+# ============================================================================
+
+camera:
+  source: uvc            # uvc | mipi | file | sim
+  device: 0              # /dev/video0 -> 0
+  width: 1280
+  height: 720
+  fps: 60
+  fourcc: MJPG
+  # 曝光：0 表示自动。激光很亮时用固定短曝光可以把靶纸压暗、突出光斑
+  exposure: 0
+  autofocus: 1
+  # 驱动帧缓冲数。**保持 0（不要动）**：实测设成 1 会让 V4L2 无法流水线采集，
+  # 帧率从 50fps 掉到 17fps。防积压靠的是取帧线程持续丢旧帧，不是这个。
+  buffer_size: 0
+  # 检测缩放：地瓜派 X3 上全分辨率检测 111ms/帧(=9fps)，缩到 0.5 约 30ms(=30fps)。
+  # 精度不损失：黑框只要粗略定位，精度来自矫正图上的红圈质心。
+  # 如果板上算力富余（比如用 X5），可以改回 1.0。
+  process_scale: 0.5
+
+calib:
+  # 相机内参。跑 tools/calib_intrinsic.py 后会写进 configs/intrinsic.yaml
+  fx: 640.0
+  fy: 640.0
+  cx: 640.0
+  cy: 360.0
+  dist: [0.0, 0.0, 0.0, 0.0, 0.0]
+  # 光轴点：激光光斑在图像中的静止坐标（同轴装配的必然结果）
+  # 为 null 时用 (cx, cy)
+  boresight_uv: null
+  # 「光斑位置-距离」表：[[距离m, u, v], ...]，由 tools/calib_boresight_table.py 生成
+  #
+  # 为什么要这张表：激光装在镜头下面，两轴有平移，光斑在画面里的像素位置
+  # 随靶纸距离漂移（角度 ≈ 两轴夹角 + 平移/距离）。只标一个固定点的话，
+  # 在标定距离上准、换距离就偏几十像素。
+  #
+  # 用法：光斑能正常检到时永远优先用实测光斑，这张表只在【检不到光斑】
+  # （反光、过曝、IR-cut 滤掉激光）时兜底。表为空 = 退回单点 boresight_uv。
+  # 标定：python3 tools/calib_boresight_table.py --source 0 --port /dev/ttyS1
+  boresight_table: []
+  # 云台正方向与图像方向的对应关系。标定流程会自动判定并写回
+  sign_yaw: 1.0          # yaw 偏置增大 -> 靶心在图像里往哪边跑
+  sign_pitch: 1.0        # pitch 偏置增大 -> 靶心在图像里往哪边跑
+
+target:
+  # A4 靶纸真实尺寸（mm）——只用来判断四边形像不像 A4，不参与瞄准解算
+  paper_mm: [210.0, 297.0]
+  tape_mm: 18.0          # 黑胶带宽度，用于校验内窗口比例
+  # 归一化视角尺寸：越大越准但越慢。4 表示按 4 倍 A4 分辨率做亚像素精修
+  warp_scale: 2.0        # 矫正图分辨率倍数；4.0 太吃 CPU，2.0 精度足够
+  min_area_ratio: 0.0015 # 四边形最小面积 / 画面面积
+  max_area_ratio: 0.85
+  poly_eps_ratio: 0.02   # approxPolyDP 精度（周长比例）
+  aspect_tol: 0.22       # 长宽比与 A4 的允许相对偏差
+  # 红圈精修
+  red_enable: true
+  red_r_minus_g: 40
+  red_r_minus_b: 40
+  red_v_min: 80
+  red_min_px: 80         # 矫正图里至少要这么多红色像素才认为检测可信
+  red_center_tol_px: 25  # 红圈质心与黑框中心的允许偏差（矫正图像素）
+  # 兜底：黑框检测失败时，直接找红圈
+  fallback_red: true
+  # 二值化只用自适应阈值。**不要轻易打开 Otsu**：靶纸是"黑框"结构，
+  # 只要黑框的边界被检测到就够了（形态学闭运算会把边界连成闭环）；
+  # 而 Otsu 是全局阈值，一旦把场地背景也判成"暗"，背景就会和黑框粘成一整块，
+  # 外轮廓变成整幅图像被面积上限滤掉 —— 这个坑实测踩过。
+  # （唯一需要 Otsu 的场合：黑胶带区域远比背景亮/暗到能单峰分离，一般不会遇到）
+  adaptive_block: 61     # 必须大于黑胶带在图像里的像素宽度（近了会到 20~40px）
+  adaptive_c: 8
+  use_otsu: false
+  # 红圈是否当硬门槛。**实际相机下建议 false**：
+  # 红圈线宽 1mm，0.8m 处成像不到 1 个像素，稍一失焦就检不到，
+  # 当硬门槛会把真靶纸直接拒掉。关掉后红圈只做"加分 + 亚像素质心精修"，
+  # 硬门槛交给黑胶带厚度校验（那个抗模糊得多）。
+  require_red: false
+  min_ring_score: 0.45
+  # 综合置信度门限（低于它就当没看到，避免锁到错的四边形）
+  min_confidence: 0.45
+  # 黑胶带厚度校验（抗模糊主力判据）：量出的厚度 / 标称 18mm
+  # 场地那条 1m 巡线黑方框量出来只有 0.21，直接排除
+  tape_min_ratio: 0.40
+  tape_max_ratio: 1.80
+
+laser:
+  # 当前接法：激光直接接电源、上电常亮 -> true。
+  # 以后接了 GPIO 控制再改回 false。
+  always_on: true
+  # 405nm 蓝紫激光：B 通道远大于 R/G
+  b_min: 150
+  b_minus_others: 35
+  min_area: 8            # 真实光斑在 1280x720 下至少几十像素；太小的都是噪点
+  max_area_ratio: 0.02   # 光斑最大面积 / 画面面积（太大说明是反光/过曝）
+  # 假光斑过滤（实测踩过：图像边缘的偏蓝色度伪影被当成激光，
+  # 而且"学习光轴点"会把门控中心永久带偏）
+  max_aspect: 3.0        # 光斑近似圆形；细长条不是激光
+  border_margin: 4       # 贴画面边缘的连通域一律不要
+  # 位置门控：光斑位置刚性固定，只在已知位置附近找
+  gate_enable: true
+  gate_radius_px: 90.0
+  gate_relax_px: 260.0   # 刚上电还没标定时的放宽半径
+  subpixel: true
+
+control:
+  # 积分型视觉伺服增益。稳定性上限 kp < 2*sin(45°/D)，D = 环路总延迟（帧数）：
+  #   D=2 帧 -> 1.00 ; D=3 -> 0.52 ; D=4 -> 0.35 ; D=5 -> 0.28 ; D=6 -> 0.24
+  # D 的构成：曝光 + 处理 + 串口 + 驱动器 ≈ 2~3 帧，再加采样回路本身 1 帧。
+  # 实测（PC 仿真，约 32fps，等效 D≈4）：0.33 起振，0.18~0.25 稳。
+  # 真机 60fps 时 D 更小，可以往 0.30~0.40 调。
+  kp: 0.20
+  rate_limit_dps: 220.0  # 偏置变化率限幅 deg/s，防止重捕获瞬间猛冲
+  max_yaw_deg: 170.0
+  max_pitch_deg: 60.0
+  deadband_px: 3.0       # 误差死区，抑制像素噪声引起的抖动
+  lead_s: 0.045          # 目标像素速度超前补偿，抵消曝光+处理+执行延迟
+  lead_gain: 1.0
+  # 拐角事件期间的加强增益（RCT6 通知）。只建议取基准的 1.3~1.6 倍：
+  # 拐角是"目标像素速度方向突变"，这时候盲目加大增益同样会振。
+  kp_corner: 0.30
+  corner_boost_s: 0.45   # 拐角加强持续时间
+  # 拐角期间把超前补偿压到基准的这个倍数（速度估计此刻不可信，
+  # 硬用旧速度超前反而会把误差推大 —— 这是实测误差尖峰的主因）
+  corner_lead_scale: 0.35
+  lost_coast_s: 0.35     # 目标丢失后允许"滑行"多久（保持上次偏置）
+  lost_research_s: 1.20  # 超过这么久就开始小范围重搜
+
+acquire:
+  # 扫描策略：spiral 从当前朝向由近及远；full 全周扫描
+  mode: spiral
+  yaw_range_deg: 175.0
+  pitch_range_deg: 35.0
+  # 每步转多少度：取相机水平视场的 2/3 左右。
+  # fx=640 @ 1280 宽 => 水平视场 90 度 => 取 60 度。
+  # 步长要保证"整张靶纸都落在画面里"，所以别超视场的 3/4。
+  step_deg: 60.0
+  dwell_ms: 70           # 每步停留多久
+  settle_ms: 50          # 运动后等多久再取帧（避开运动模糊）
+  move_dps: 260.0        # 云台过点速度，仅用于估算扫描总时间
+  timeout_s: 12.0
+  coarse_max_step_deg: 45.0
+
+draw:
+  # 发挥部分(3)：激光沿靶面 r=6cm 红圈同步画圆
+  radius_mm: 60.0
+  direction: ccw         # ccw | cw，应与小车绕行方向一致
+  phase_offset: 0.0      # 0.25 = 起点沿圈挪 1/4 圈
+  phase_source: corner   # corner | car_phase | time | off
+  lap_time_s: 20.0       # time 模式用的单圈时间
+  max_speed_dps: 90.0    # 设定点在靶面上移动的最大角速度
+  # 起跑前先把光斑挪到圆的起点：误差进入 start_tol_px 就发车，
+  # 最多等 prestart_s（两者取先到者）
+  prestart_s: 0.80
+  start_tol_px: 10.0
+  # 画圆专用：起跑前全程关激光，起跑瞬间才点亮。
+  # 为什么必须这么做：裁判量的是"光斑痕迹到 r=6cm 红圈的最大距离"，
+  # 如果瞄准阶段先把激光打在靶心上，靶面中央会留下一个 6cm 外的孤立光斑，
+  # 直接判 D2 超差；而且从靶心挪到圆周的过程中还会画出一条径向拖痕。
+  # 代价是瞄准阶段只能用"标定好的光轴点"当光斑位置 ——
+  # 所以跑画圆之前一定要先做 tools/calib_boresight.py。
+  laser_gate: true
+
+link_gimbal:
+  enable: true
+  # 地瓜派 <-> H723 USART1。只接 3 根线：TX / RX / GND（交叉接、共地）。
+  # 插在地瓜派转接板的串口座上时，常见设备名：
+  #   40PIN 排针串口 -> /dev/ttyS1
+  #   USB 转串口     -> /dev/ttyUSB0
+  # 不确定就先跑：python main.py ports
+  port: /dev/ttyS1
+  baud: 115200           # 与 H723 固件里 MX_USART1_UART_Init() 的 115200 对齐
+                         # （115200 够用：AIM 11B@100Hz + 遥测 28B@50Hz ≈ 2.8KB/s）
+  tx_hz: 100             # 偏置下发频率
+  telemetry_timeout_s: 0.5
+
+link_car:
+  # RCT6 还没接（循迹那块先放一放），先关掉免得每次启动都报警告
+  enable: false
+  port: /dev/ttyUSB1     # 地瓜派 <-> RCT6
+  baud: 115200
+  tx_hz: 20
+  telemetry_timeout_s: 1.0
+
+app:
+  run_dir: out
+  log_level: INFO
+  show_window: false     # 无显示器的板子上保持 false
+  snapshot_every_s: 0.0  # >0 则周期性把标注帧存成 jpg
+  record_video: false
+  # 单次任务的计时口径：
+  #   poweron = 程序启动即计时（含 H723 的 3.4s 启动，2s 指标肯定不够）
+  #   trigger = 等外部触发后才开始计时（推荐：先上电等云台就绪，再触发）
+  # 触发方式二选一：回车键（有终端时），或出现 trigger_file 指定的文件
+  timer_start: poweron
+  trigger_file: out/trigger
+  budget_s: 4.0          # 对应基本要求(2)=2.0 / (3)=4.0

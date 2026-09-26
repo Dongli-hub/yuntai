@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "yuntai_task.h"
 #include "debug_uart.h"
+#include "gimbal_link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -99,6 +100,10 @@ int main(void)
   MX_SPI2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* 先起链路，再起云台任务。
+   * 顺序不能反：链路的 USART1 接收中断/发送通道要先就绪，
+   * 否则云台启动日志发不出去（表现为上位机一直收不到 GIMBAL_STATE）。 */
+  gimbal_link_init();
   yuntai_init();
   /* USER CODE END 2 */
 

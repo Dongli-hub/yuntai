@@ -146,3 +146,61 @@ void jc_set_abs_angle_x100(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id, int32_
 {
     jc_set_abs_position_x100(hfdcan, motor_id, angle_x100);
 }
+
+/* ==========================================================================
+ * 反馈解析
+ * ========================================================================== */
+
+void jc_read_position(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
+{
+    uint8_t can_data[8];
+    if (motor_id == 0 || motor_id > 127) return;
+
+    can_data[0] = 0x43;           /* 命令字：读参数 */
+    can_data[1] = 0x00;           /* 寄存器 0x0008 = 实时位置 */
+    can_data[2] = 0x08;
+    can_data[3] = 0x00;
+    can_data[4] = 0x00;
+    can_data[5] = 0x00;
+    can_data[6] = 0x00;
+    can_data[7] = 0x00;
+
+    fdcanx_send_data(hfdcan, 0x600 + motor_id, can_data, 8);
+}
+
+uint8_t jc_parse_position_reply(const uint8_t *data, uint8_t len, float *pos_deg)
+{
+    int32_t raw;
+    if (data == 0 || pos_deg == 0 || len < 8u) return 0;
+    if (data[0] != 0x43) return 0;
+    raw = (int32_t)(((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                    ((uint32_t)data[6] << 8)  |  (uint32_t)data[7]);
+    *pos_deg = (float)raw / 100.0f;
+    return 1;
+}
+
+uint8_t jc_parse_speed_reply(const uint8_t *data, uint8_t len, float *pos_deg,
+                             int16_t *speed_raw, int16_t *current_raw)
+{
+    int32_t raw24;
+    if (data == 0 || len < 8u) return 0;
+    if (data[0] != 0x2A) return 0;
+
+    /* 有符号 24 位：先左对齐到 32 位再算术右移 8 位，符号位才能正确延伸 */
+    raw24  = (int32_t)(((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                       ((uint32_t)data[3] << 8));
+    raw24 >>= 8;
+    if (pos_deg != 0)
+    {
+        *pos_deg = (float)raw24 / 100.0f;
+    }
+    if (speed_raw != 0)
+    {
+        *speed_raw = (int16_t)(((uint16_t)data[4] << 8) | (uint16_t)data[5]);
+    }
+    if (current_raw != 0)
+    {
+        *current_raw = (int16_t)(((uint16_t)data[6] << 8) | (uint16_t)data[7]);
+    }
+    return 1;
+}

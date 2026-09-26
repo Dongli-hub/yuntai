@@ -1,0 +1,16 @@
+# 运行产物
+out/
+*.csv
+*.mp4
+view_*.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 标定产物（按需保留：这些文件用 tools/ 生成，可以在现场重做）
+configs/intrinsic.yaml
+configs/boresight.yaml
+

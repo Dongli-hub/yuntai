@@ -1,4 +1,5 @@
-﻿#include "debug_uart.h"
+#include "debug_uart.h"
+#include "gimbal_link.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -29,9 +30,21 @@ static void ftoa(char *buf, float val, int decimals)
 
 void debug_uart_init(void) {}
 
+/*
+ * 调试输出改走协议里的 TEXT 消息（0x93），由上位机打印。
+ *
+ * 为什么必须改：USART1 现在是二进制协议流，直接 printf 会把帧冲乱，
+ * 现象是上位机 crc_err 暴涨、时好时坏 —— 很难查。
+ * 包成 TEXT 帧以后，"每一步都看得见"的调试习惯完全保留。
+ */
 void debug_print(const char *msg)
 {
+#if DEBUG_RAW_UART
+    /* 排障模式：直接打 ASCII 到串口，用串口助手就能看 */
     HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+#else
+    gimbal_link_log(msg);
+#endif
 }
 
 void debug_println(const char *msg)
@@ -56,6 +69,6 @@ void debug_print_imu(float yaw, float pitch, float roll, float gx, float gy, flo
         "Y:%s P:%s R:%s | G:%s %s %s | A:%s %s %s\r\n",
         y, p, r, gxs, gys, gzs, axs, ays, azs);
     if (len > 0) {
-        HAL_UART_Transmit(&huart1, (uint8_t *)g_tx_buf, len, 100);
+        gimbal_link_log(g_tx_buf);
     }
 }

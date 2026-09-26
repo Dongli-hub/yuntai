@@ -1,0 +1,38 @@
+# 仿真配置：不需要任何硬件，用于 PC 上验证算法与调参
+camera:
+  source: sim
+  width: 1280
+  height: 720
+  fps: 60
+
+calib:
+  fx: 700.0
+  fy: 700.0
+  cx: 640.0
+  cy: 360.0
+  boresight_uv: [632.0, 372.0]   # 故意给一个非中心的装配偏差，验证算法不依赖它
+  sign_yaw: 1.0
+  sign_pitch: -1.0               # 故意让 pitch 方向与 yaw 相反，验证符号可配
+
+sim:
+  target_center_mm: [0.0, 0.0]
+  distance_m: 0.80               # 相机到靶面距离
+  camera_offset_mm: [0.0, -60.0] # 相机相对靶心的高度偏移
+  laser_on: true
+  noise: 2.0                     # 灰度噪声
+  # 小车沿 1m x 1m 方形轨迹运动（赛题场地），用于验证运动跟踪
+  car_enable: true
+  car_lap_time_s: 20.0
+  car_start_corner: 0
+  # 云台执行器一阶模型
+  actuator_tau_s: 0.03
+  actuator_max_rate_dps: 300.0
+  actuator_delay_s: 0.02
+
+control:
+  kp: 0.22
+  deadband_px: 2.0
+
+app:
+  budget_s: 4.0
+  show_window: false

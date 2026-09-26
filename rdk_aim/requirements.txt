@@ -1,0 +1,5 @@
+numpy>=1.21
+opencv-python>=4.5
+pyserial>=3.5
+PyYAML>=5.4
+
