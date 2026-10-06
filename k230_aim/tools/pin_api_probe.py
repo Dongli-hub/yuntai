@@ -117,6 +117,42 @@ def w2():
 read_level("Pin(9, IN, PULL_UP)", w1)
 read_level("FPIOA(9,GPIO,pu=1)+Pin", w2)
 
+print("-" * 58)
+print("自检：把 IO33 当输出，先给高/给低，再当输入读回来")
+print("（这一步完全不依赖外部电路，用来证明'读引脚'这套方法本身是好的）")
+
+
+def pin_self_test(pin):
+    from machine import FPIOA, Pin
+    fp = FPIOA()
+    fn = getattr(FPIOA, "GPIO%d" % pin, None)
+    if fn is None:
+        fn = pin
+    result = []
+    for level in (1, 0):
+        fp.set_function(pin, fn, ie=0, oe=1, pu=0)
+        p = Pin(pin, Pin.OUT)
+        p.value(level)
+        time.sleep_ms(5)
+        fp.set_function(pin, fn, ie=1, oe=0, pu=0)
+        p2 = Pin(pin, Pin.IN)
+        result.append(1 if p2.value() else 0)
+    ok = (result[0] == 1 and result[1] == 0)
+    print("  IO%d 自检: 输出1->读回%d, 输出0->读回%d  %s"
+          % (pin, result[0], result[1],
+             "读引脚这套方法正常" if ok else "读回不对，方法有问题"))
+
+
+try:
+    pin_self_test(33)
+except Exception as e:
+    print("  自检失败: %s" % e)
+
+print("-" * 58)
+print("结论怎么看：")
+print("  · 如果自检通过（输出1读回1、输出0读回0），而 IO9/IO10 读回恒为 0，")
+print("    那就是对面 H723 的 IO 供电没起来（芯片没在跑），把上拉也拉死了")
+print("  · 如果自检都没通过，那是我这套读法在该固件上不对，请把输出发我")
 print("=" * 58)
 print("请把以上全部输出发回")
 print("=" * 58)
