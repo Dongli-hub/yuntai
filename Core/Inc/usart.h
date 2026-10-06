@@ -47,10 +47,8 @@ void MX_UART7_UART_Init(void);
 /* ---------------------------------------------------------------------------
  * UART7 引脚对（查过 CubeMX 芯片库：STM32H723VGT6 / LQFP100 上
  * UART7 只有这几种引脚组合，PF6/PF7 在这颗片子上根本不存在）：
- *   UART7_PAIR_PE : PE7 = UART7_RX, PE8 = UART7_TX   ← CubeMX 默认，最可能
- *   UART7_PAIR_PA : PA8 = UART7_RX, PB3 = UART7_TX   ← 备用
- * gimbal_link_init() 会先试 PE7/PE8，收不到就换 PA8/PB3，
- * 一直没通就每 1.5s 来回换（gimbal_link_poll 里）。
+ *   UART7_PAIR_PE : PE7 = UART7_RX, PE8 = UART7_TX   ← 板上丝印就是这一组，当前使用
+ *   UART7_PAIR_PA : PA8 = UART7_RX, PB3 = UART7_TX   ← 备用（换板子才可能用上）
  * ------------------------------------------------------------------------- */
 #define UART7_PAIR_PE   0u
 #define UART7_PAIR_PA   1u

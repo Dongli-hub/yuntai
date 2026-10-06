@@ -13,8 +13,8 @@
   *
   * 2026-10-06 迁移到 K230：
   *  - 链路外设从 USART1(PA9/PA10) 换到 UART7，接 K230 的 IO9(TXD)/IO10(RXD)。
- *  - UART7 的引脚对不唯一（PE7/PE8 或 PA8/PB3），init 时自动探测。
-  *  - 心跳回 ACK(0x12)，让上位机能分别确认"收"和"发"两个方向都通。
+ *  - 板子丝印已确认：UART7 接插件 = RX(PE07) / TX(PE08)，固定这一组。
+ *  - 心跳回 ACK(0x12)，让上位机能分别确认"收"和"发"两个方向都通。
   *     这是"上位机崩了/线掉了"时的唯一保护，必须在 H723 侧做。
   ******************************************************************************
   */
@@ -32,8 +32,6 @@
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
 #define GL_OFF_YAW_LIMIT     180.0f  /* 偏置安全限幅（防止上位机给飞了） */
 #define GL_OFF_PITCH_LIMIT   80.0f
-#define GL_AUTOPIN_MS        400u    /* UART7 引脚自动识别：每个候选脚等多久 */
-#define GL_AUTOPIN_RETRY_MS  1500u   /* 还没通过任何帧时，多久换一次引脚对 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
 
 /* ========================== 缓冲区 ========================== */
@@ -67,8 +65,6 @@ static uint8_t           s_have_telem;
 static uint8_t           s_seq;
 static uint8_t           s_ready;
 static uint32_t          s_last_hb_ack_ms;
-static uint8_t           s_pins_locked;      /* 1 = 已经收到过有效帧，引脚对定型 */
-static uint32_t          s_last_pin_try_ms;
 static uint32_t          s_log_dropped;
 
 /* ========================== TX 环形缓冲 ========================== */
@@ -357,55 +353,6 @@ static void gl_handle_frame(uint32_t now_ms)
 
 /* ========================== 对外接口 ========================== */
 
-/* --------------------------------------------------------------------------
- * UART7 引脚自动识别（只在 init 时跑一次，最多阻塞 2 × GL_AUTOPIN_MS）
- *
- * 板子上的 UART7 接插件有两种可能的引脚对（见 usart.c 的 UART7_BindPins）：
- *      PE7(RX)/PE8(TX)   或   PA8(RX)/PB3(TX)
- * 不猜，直接试：每个候选脚等 GL_AUTOPIN_MS，看 RXNE 有没有置位。
- * 判据只读标志、不读 RDR，所以不会把数据吃掉。
- * 上位机（K230）任何测试程序都在持续发心跳/遥测请求，所以能试出来；
- * 如果上位机根本没接，就回到默认的 PE7/PE8，功能不受影响。
- * ------------------------------------------------------------------------ */
-static uint8_t gl_uart7_probe_rx(uint32_t ms)
-{
-    uint32_t t0 = HAL_GetTick();
-    while ((HAL_GetTick() - t0) < ms)
-    {
-        if (__HAL_UART_GET_FLAG(&huart7, UART_FLAG_RXNE) != 0u)
-        {
-            return 1u;
-        }
-    }
-    return 0u;
-}
-
-static void gl_uart7_autopin(void)
-{
-    UART7_BindPins(UART7_PAIR_PE);
-    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                    UART_CLEAR_NEF | UART_CLEAR_PEF);
-    if (gl_uart7_probe_rx(GL_AUTOPIN_MS) != 0u)
-    {
-        gimbal_link_log("[LINK] UART7 = PE7(RX)/PE8(TX)");
-        return;
-    }
-
-    UART7_BindPins(UART7_PAIR_PA);
-    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                    UART_CLEAR_NEF | UART_CLEAR_PEF);
-    if (gl_uart7_probe_rx(GL_AUTOPIN_MS) != 0u)
-    {
-        gimbal_link_log("[LINK] UART7 = PA8(RX)/PB3(TX)");
-        return;
-    }
-
-    UART7_BindPins(UART7_PAIR_PE);
-    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                    UART_CLEAR_NEF | UART_CLEAR_PEF);
-    gimbal_link_log("[LINK] UART7 未探测到上位机，默认 PE7/PE8");
-}
-
 void gimbal_link_init(void)
 {
     uint16_t i;
@@ -429,15 +376,13 @@ void gimbal_link_init(void)
     s_seq = 0u;
     s_log_dropped = 0u;
     s_last_hb_ack_ms = 0u;
-    s_pins_locked = 0u;
-    s_last_pin_try_ms = HAL_GetTick();
     memset(&s_cmd, 0, sizeof(s_cmd));
     memset(&s_telem, 0, sizeof(s_telem));
     s_cmd.mode = GP_MODE_IDLE;
     gp_parser_init(&s_parser);
 
-    /* UART7 引脚自动识别：必须在打开接收中断之前做（探测只读 RXNE 标志） */
-    gl_uart7_autopin();
+    /* UART7 引脚：板子丝印已确认 RX=PE07 / TX=PE08，固定这一组 */
+    UART7_BindPins(UART7_PAIR_PE);
 
     /* 打开 UART7 的接收中断（接收只做"存字节"这一件事） */
     __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
@@ -492,32 +437,8 @@ void gimbal_link_poll(uint32_t now_ms)
         }
         if (gp_parser_feed(&s_parser, b))
         {
-            /* 能解出一帧 = 引脚对就是它了，不用再换 */
-            s_pins_locked = 1u;
             gl_handle_frame(now_ms);
         }
-    }
-
-    /* ---- 1.5 引脚对自动重试 ----
-     * 冷启动时上位机（K230）可能还没开始发心跳，一次探测猜错就会一直错下去。
-     * 所以只要还没解析出任何一帧，就每隔 GL_AUTOPIN_RETRY_MS 换一次引脚对，
-     * 直到收到第一帧为止；收到后 s_pins_locked=1，永远不再切。 */
-    if ((s_pins_locked == 0u) &&
-        ((now_ms - s_last_pin_try_ms) >= GL_AUTOPIN_RETRY_MS))
-    {
-        s_last_pin_try_ms = now_ms;
-        if (UART7_CurrentPins() == UART7_PAIR_PE)
-        {
-            UART7_BindPins(UART7_PAIR_PA);
-            gimbal_link_log("[LINK] UART7 试 PA8/PB3");
-        }
-        else
-        {
-            UART7_BindPins(UART7_PAIR_PE);
-            gimbal_link_log("[LINK] UART7 试 PE7/PE8");
-        }
-        __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                        UART_CLEAR_NEF | UART_CLEAR_PEF);
     }
 
     /* ---- 2. 看门狗：断流 -> 安全模式 ---- */
