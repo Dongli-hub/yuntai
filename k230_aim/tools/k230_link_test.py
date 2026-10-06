@@ -142,6 +142,19 @@ def _open_yb():
     return YbUart(baudrate=UART_BAUD)
 
 
+def _open_yb_swapped():
+    """IO9/IO10 反着用：IO10 当 TXD，IO9 当 RXD。
+
+    如果两根数据线接反了（K230 的 IO9 接到了对面 TX、IO10 接到对面 RX），
+    不用拆线，用这个后端就能正常通信 —— K230 的 FPIOA 允许这样重映射。
+    """
+    from machine import FPIOA, UART
+    fp = FPIOA()
+    fp.set_function(10, FPIOA.UART1_TXD, ie=0, oe=1, pu=1)
+    fp.set_function(9, FPIOA.UART1_RXD, ie=1, oe=0, pu=1)
+    return UART(1, baudrate=UART_BAUD)
+
+
 def _open_uart3_fpioa():
     """手动把 12Pin GPIO 上的 IO32/IO33 配成 UART3 再打开。
 
@@ -159,6 +172,7 @@ def _open_uart3_fpioa():
 def candidates():
     return [
         ("YbUart(亚博封装)", _open_yb),
+        ("UART1 IO9/IO10 反接", _open_yb_swapped),
         ("UART3 手配 IO32/IO33", _open_uart3_fpioa),
         ("UART(1) 不指定引脚", lambda: _open_machine(1)),
         ("UART(1) IO9/IO10", lambda: _open_machine(1, 9, 10)),

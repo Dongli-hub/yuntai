@@ -265,7 +265,17 @@ class Link(object):
             fp.set_function(33, FPIOA.UART3_RXD, ie=1, oe=0, pu=1)
             return UART(3, baudrate=UART_BAUD)
 
+        def yb_swapped():
+            # IO9/IO10 反着用（IO10=TXD, IO9=RXD）：
+            # 两根数据线如果接反了，不用拆线也能通信。
+            from machine import FPIOA, UART
+            fp = FPIOA()
+            fp.set_function(10, FPIOA.UART1_TXD, ie=0, oe=1, pu=1)
+            fp.set_function(9, FPIOA.UART1_RXD, ie=1, oe=0, pu=1)
+            return UART(1, baudrate=UART_BAUD)
+
         return [("YbUart(亚博封装, IO9/IO10)", yb),
+                ("UART1 IO9/IO10 反接", yb_swapped),
                 ("UART3 手配 IO32/IO33", uart3_fpioa),
                 ("UART(%d) 不指定引脚" % UART_UNIT, m_nopin),
                 ("UART(1) tx=IO9 rx=IO10", m_pins19),
