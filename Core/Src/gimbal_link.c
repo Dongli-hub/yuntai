@@ -33,6 +33,7 @@
 #define GL_OFF_YAW_LIMIT     180.0f  /* 偏置安全限幅（防止上位机给飞了） */
 #define GL_OFF_PITCH_LIMIT   80.0f
 #define GL_AUTOPIN_MS        400u    /* UART7 引脚自动识别：每个候选脚等多久 */
+#define GL_AUTOPIN_RETRY_MS  1500u   /* 还没通过任何帧时，多久换一次引脚对 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
 
 /* ========================== 缓冲区 ========================== */
@@ -66,6 +67,8 @@ static uint8_t           s_have_telem;
 static uint8_t           s_seq;
 static uint8_t           s_ready;
 static uint32_t          s_last_hb_ack_ms;
+static uint8_t           s_pins_locked;      /* 1 = 已经收到过有效帧，引脚对定型 */
+static uint32_t          s_last_pin_try_ms;
 static uint32_t          s_log_dropped;
 
 /* ========================== TX 环形缓冲 ========================== */
@@ -426,6 +429,8 @@ void gimbal_link_init(void)
     s_seq = 0u;
     s_log_dropped = 0u;
     s_last_hb_ack_ms = 0u;
+    s_pins_locked = 0u;
+    s_last_pin_try_ms = HAL_GetTick();
     memset(&s_cmd, 0, sizeof(s_cmd));
     memset(&s_telem, 0, sizeof(s_telem));
     s_cmd.mode = GP_MODE_IDLE;
@@ -487,8 +492,32 @@ void gimbal_link_poll(uint32_t now_ms)
         }
         if (gp_parser_feed(&s_parser, b))
         {
+            /* 能解出一帧 = 引脚对就是它了，不用再换 */
+            s_pins_locked = 1u;
             gl_handle_frame(now_ms);
         }
+    }
+
+    /* ---- 1.5 引脚对自动重试 ----
+     * 冷启动时上位机（K230）可能还没开始发心跳，一次探测猜错就会一直错下去。
+     * 所以只要还没解析出任何一帧，就每隔 GL_AUTOPIN_RETRY_MS 换一次引脚对，
+     * 直到收到第一帧为止；收到后 s_pins_locked=1，永远不再切。 */
+    if ((s_pins_locked == 0u) &&
+        ((now_ms - s_last_pin_try_ms) >= GL_AUTOPIN_RETRY_MS))
+    {
+        s_last_pin_try_ms = now_ms;
+        if (UART7_CurrentPins() == UART7_PAIR_PE)
+        {
+            UART7_BindPins(UART7_PAIR_PF);
+            gimbal_link_log("[LINK] UART7 试 PF6/PF7");
+        }
+        else
+        {
+            UART7_BindPins(UART7_PAIR_PE);
+            gimbal_link_log("[LINK] UART7 试 PE7/PE8");
+        }
+        __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                        UART_CLEAR_NEF | UART_CLEAR_PEF);
     }
 
     /* ---- 2. 看门狗：断流 -> 安全模式 ---- */

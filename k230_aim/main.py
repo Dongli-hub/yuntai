@@ -225,25 +225,54 @@ def unpack_state(payload):
 #  串口链路
 # ============================================================================
 class Link(object):
+    """串口后端自动选择。
+
+    实测（CanMV v1.4.3 / k230_canmv_yahboom 固件）：
+      · machine.UART(1, tx=Pin(9), rx=Pin(10)) 打不开 ——
+        固件启动时已经把 IO9/IO10 分配给了它自己的功能（报
+        "pin(9) is not a GPIO pin"），所以这条要放在后面当备选。
+      · ybUtils.YbUart 是可用的，它在固件里占的就是 IO9(TXD)/IO10(RXD)。
+    按顺序试，哪个先打开用哪个。
+    """
+
+    @staticmethod
+    def _candidates():
+        def yb():
+            from ybUtils.YbUart import YbUart
+            return YbUart(baudrate=UART_BAUD)
+
+        def m_nopin():
+            from machine import UART
+            return UART(UART_UNIT, baudrate=UART_BAUD, bits=8,
+                        parity=None, stop=0)
+
+        def m_pins19():
+            from machine import UART, Pin
+            return UART(1, baudrate=UART_BAUD, tx=Pin(9), rx=Pin(10),
+                        bits=8, parity=None, stop=0)
+
+        def m_pins3233():
+            from machine import UART, Pin
+            return UART(3, baudrate=UART_BAUD, tx=Pin(32), rx=Pin(33),
+                        bits=8, parity=None, stop=0)
+
+        return [("YbUart(亚博封装, IO9/IO10)", yb),
+                ("UART(%d) 不指定引脚" % UART_UNIT, m_nopin),
+                ("UART(1) tx=IO9 rx=IO10", m_pins19),
+                ("UART(3) tx=IO32 rx=IO33", m_pins3233)]
+
     def __init__(self):
         self.dev = None
         self.name = ""
-        if UART_BACKEND in ("auto", "machine"):
+        for label, opener in self._candidates():
             try:
-                from machine import UART, Pin
-                self.dev = UART(UART_UNIT, baudrate=UART_BAUD,
-                                tx=Pin(UART_TX), rx=Pin(UART_RX),
-                                bits=8, parity=None, stop=0)
-                self.name = "UART%d TX=IO%d RX=IO%d" % (UART_UNIT, UART_TX,
-                                                        UART_RX)
+                self.dev = opener()
+                self.name = label
+                break
             except Exception as e:
-                if UART_BACKEND == "machine":
-                    raise
-                print("machine.UART 失败(%s)，改用 YbUart" % e)
+                print("串口后端 %s 打不开: %s" % (label, e))
         if self.dev is None:
-            from ybUtils.YbUart import YbUart
-            self.dev = YbUart(baudrate=UART_BAUD)
-            self.name = "YbUart"
+            raise OSError("没有任何串口后端能打开")
         print("串口: %s @%d" % (self.name, UART_BAUD))
 
     def send(self, data):

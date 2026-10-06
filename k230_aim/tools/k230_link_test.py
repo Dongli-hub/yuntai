@@ -15,20 +15,27 @@
   两个都有 = 双向通信 OK。
 
 没有独立屏幕也没关系：显示初始化失败会自动跳过，只看串行终端输出即可。
+
+自动挑串口：这块亚博固件把 IO9/IO10 提前占给了它自己，所以
+machine.UART(1, tx=Pin(9)) 会失败；本程序会把下面几种后端挨个试一遍，
+哪个能收到字节就用哪个，并在最后打印一张对照表：
+    YbUart(亚博封装) / UART(1) 不指定引脚 / UART(1,IO9/IO10) / UART(3,IO32/IO33)
+
+LOOPBACK = True 时做"自环测试"：把 K230 的 IO9 和 IO10 用杜邦线短接，
+程序应该收到自己发出的心跳（证明 K230 这侧收发都好）。
 """
 import os
 import time
 
 # ============================ 参数 ============================
-# 引脚：K230 EXPORT 口 IO9 = TXD, IO10 = RXD（接 H723 的 UART7）
-UART_BACKEND = "auto"      # auto | yb | machine
-UART_UNIT = 1
-UART_TX = 9
-UART_RX = 10
 UART_BAUD = 115200
 
-# 备选：如果接的是 12Pin GPIO 上的 UART3，把上面三行换成
-#   UART_UNIT = 3 / UART_TX = 32 / UART_RX = 33
+# 自动遍历所有可能的后端，每个试 PROBE_S 秒
+AUTO_BACKEND = True
+PROBE_S = 3.0
+
+# 自环测试：先把 IO9 和 IO10 用杜邦线短接再打开这个开关
+LOOPBACK = False
 
 DISPLAY_MODE = "VIRT"      # VIRT(只用 IDE 画面) | LCD(带屏) | OFF
 DISPLAY_W = 640
@@ -121,21 +128,51 @@ class FrameParser(object):
         return out
 
 
-def open_uart():
-    """优先用 machine.UART 显式指定引脚，不行再退回亚博封装的 YbUart。"""
-    if UART_BACKEND in ("auto", "machine"):
-        try:
-            from machine import UART, Pin
-            dev = UART(UART_UNIT, baudrate=UART_BAUD, tx=Pin(UART_TX),
-                       rx=Pin(UART_RX), bits=8, parity=None, stop=0)
-            return dev, "machine.UART(%d) TX=IO%d RX=IO%d" % (
-                UART_UNIT, UART_TX, UART_RX)
-        except Exception as e:
-            if UART_BACKEND == "machine":
-                raise
-            print("machine.UART 打开失败(%s)，改用 YbUart" % e)
+def _open_machine(unit, tx=None, rx=None):
+    from machine import UART, Pin
+    if tx is None:
+        # 不指定引脚：用固件已经配好的那组（亚博固件把 IO9/IO10 提前占了）
+        return UART(unit, baudrate=UART_BAUD, bits=8, parity=None, stop=0)
+    return UART(unit, baudrate=UART_BAUD, tx=Pin(tx), rx=Pin(rx),
+                bits=8, parity=None, stop=0)
+
+
+def _open_yb():
     from ybUtils.YbUart import YbUart
-    return YbUart(baudrate=UART_BAUD), "YbUart(亚博封装)"
+    return YbUart(baudrate=UART_BAUD)
+
+
+def candidates():
+    return [
+        ("YbUart(亚博封装)", _open_yb),
+        ("UART(1) 不指定引脚", lambda: _open_machine(1)),
+        ("UART(1) IO9/IO10", lambda: _open_machine(1, 9, 10)),
+        ("UART(3) IO32/IO33", lambda: _open_machine(3, 32, 33)),
+    ]
+
+
+def probe_device(dev, seconds):
+    """给一个已打开的串口：发心跳 + 收字节，返回 (收到字节数, 解析出帧数)。"""
+    p = FrameParser()
+    n_bytes = 0
+    n_frames = 0
+    t_end = time.ticks_ms() + int(seconds * 1000)
+    t_hb = time.ticks_ms()
+    while time.ticks_diff(t_end, time.ticks_ms()) > 0:
+        os.exitpoint()
+        now = time.ticks_ms()
+        if time.ticks_diff(now, t_hb) >= HEARTBEAT_MS:
+            t_hb = now
+            try:
+                dev.write(build_frame(MSG_HEARTBEAT))
+            except Exception:
+                pass
+        data = uart_read(dev)
+        if data:
+            n_bytes += len(data)
+            n_frames += len(p.feed(data))
+        time.sleep_ms(2)
+    return n_bytes, n_frames
 
 
 def uart_read(dev, n=256):
@@ -148,10 +185,54 @@ def uart_read(dev, n=256):
 
 
 def main():
-    dev, uart_name = open_uart()
+    dev = None
+    uart_name = ""
+    table = []
+    if AUTO_BACKEND and not LOOPBACK:
+        print("自动遍历串口后端（每个 %d 秒）..." % int(PROBE_S))
+        for label, opener in candidates():
+            try:
+                d = opener()
+            except Exception as e:
+                print("  %-22s 打不开：%s" % (label, e))
+                table.append((label, "打不开", str(e), 0, 0))
+                continue
+            n_bytes, n_frames = probe_device(d, PROBE_S)
+            print("  %-22s 已打开：收到 %d 字节 / %d 帧"
+                  % (label, n_bytes, n_frames))
+            if n_bytes > 0 and dev is None:
+                dev = d
+                uart_name = label
+            else:
+                try:
+                    d.deinit()
+                except Exception:
+                    pass
+            table.append((label, "已打开", "", n_bytes, n_frames))
+        if dev is None:
+            # 谁都没数据：退回到第一个能打开的后端，继续跑，方便看实时状态
+            for label, opener in candidates():
+                try:
+                    dev = opener()
+                    uart_name = label + "（当前无数据）"
+                    break
+                except Exception:
+                    continue
+        print("-" * 56)
+    else:
+        for label, opener in candidates():
+            try:
+                dev = opener()
+                uart_name = label
+                break
+            except Exception as e:
+                print("  %s 打不开: %s" % (label, e))
+    if dev is None:
+        print("!! 没有任何串口后端能打开——先解决这个")
+        return
     print("=" * 56)
     print("K230 通信自检")
-    print("串口: %s @ %d" % (uart_name, UART_BAUD))
+    print("使用串口: %s @ %d" % (uart_name, UART_BAUD))
     print("=" * 56)
 
     parser = FrameParser()
@@ -238,7 +319,13 @@ def main():
                              last_state[2] / 100.0, last_state[3] / 100.0,
                              last_state[9], last_state[10]))
                 # ---- 结论 ----
-                if n_state > 0 and n_ack_hb > 0:
+                if LOOPBACK and parser.ok > 0:
+                    print("  >>> 自环测试 OK：K230 的收发都正常"
+                          "（说明问题在 H723 侧/接线上）")
+                elif LOOPBACK:
+                    print("  >>> 自环收不到自己的帧：IO9-IO10 短接了吗？"
+                          "或者这个后端不是 IO9/IO10")
+                elif n_state > 0 and n_ack_hb > 0:
                     print("  >>> 双向通信 OK（H723 收到心跳并回了 ACK）")
                 elif n_state > 0:
                     print("  >>> H723->K230 通了；还没收到心跳 ACK："
@@ -247,9 +334,12 @@ def main():
                     print("  >>> 收到字节但一帧都解不出来：波特率或线材问题"
                           "（两边都必须 115200 8N1，共地）")
                 else:
-                    print("  >>> 一个字节都没收到：检查接线 "
-                          "(K230 IO9->H723 UART7 RX, IO10->UART7 TX, GND 共地)"
-                          "、H723 是否已上电")
+                    print("  >>> 一个字节都没收到。按顺序查：")
+                    print("      1) H723 烧的是新固件吗？旧固件走 USART1，"
+                          "UART7 上什么都不会发")
+                    print("      2) 接线是否交叉：K230 IO9(TX)->H723 UART7 的 RX，"
+                          "IO10(RX)->UART7 的 TX，GND 必须共地")
+                    print("      3) H723 上电了吗（电机可以不供电）")
 
                 if display_ok and canvas is not None:
                     canvas.clear()
@@ -306,6 +396,12 @@ def main():
                 MediaManager.deinit()
             except Exception:
                 pass
+        if table:
+            print("-" * 56)
+            print("串口后端对照表：")
+            for label, st, err, nb, nf in table:
+                print("  %-22s %-6s 字节=%-6d 帧=%-4d %s"
+                      % (label, st, nb, nf, err))
         print("已退出。通信统计：ok=%d crc_err=%d 字节=%d"
               % (parser.ok, parser.crc_err, parser.bytes_rx))
 
