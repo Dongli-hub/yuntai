@@ -1,18 +1,18 @@
 /**
   ******************************************************************************
   * @file    gimbal_link.h
-  * @brief   H723(USART1) <-> 机载计算机（地瓜派）的链路层
+  * @brief   H723(UART7) <-> 机载计算机（K230）的链路层
   *
   * 分工：
   *   gimbal_proto.c  —— 纯协议（CRC / 组帧 / 拆帧），不含 HAL，可在 PC 上单测
-  *   gimbal_link.c   —— 本文件：USART1 中断收发、命令解释、遥测上报、看门狗
+  *   gimbal_link.c   —— 本文件：UART7 中断收发、命令解释、遥测上报、看门狗
   *
   * 三种数据方向：
   *   下行（地瓜派 -> H723）：AIM 偏置(100Hz) / MODE / SET_ZERO / UNWIND / 心跳
   *   上行（H723 -> 地瓜派）：GIMBAL_STATE 遥测(50Hz) / ACK / TEXT 调试文本
   *
   * 为什么调试文本要走协议发（而不是直接 printf 到串口）：
-  *   USART1 现在承载的是二进制协议流，直接 printf 会把帧冲乱。
+  *   UART7 现在承载的是二进制协议流，直接 printf 会把帧冲乱。
   *   把文本包成 0x93 TEXT 消息发出去，上位机照样能实时打印，
   *   既保住了"每一步都看得见"的调试习惯，又不破坏协议。
   ******************************************************************************
@@ -58,7 +58,7 @@ typedef struct
 
 void               gimbal_link_init(void);
 void               gimbal_link_poll(uint32_t now_ms);
-void               gimbal_link_rx_isr(void);          /* 在 USART1_IRQHandler 里调用 */
+void               gimbal_link_rx_isr(void);          /* 在 UART7_IRQHandler 里调用 */
 void               gimbal_link_set_telem(const GimbalTelem_t *t);
 const GimbalCmd_t *gimbal_link_cmd(void);
 uint8_t            gimbal_link_alive(void);           /* 1 = 最近 0.5s 收到过 AIM */

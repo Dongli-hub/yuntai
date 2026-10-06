@@ -1,5 +1,18 @@
 # k230_aim —— 把地瓜派上的瞄准程序迁移到 K230
 
+## 当前进度（2026-10-06）
+
+* H723 固件：链路已从 **USART1(PA9/PA10) 改到 UART7**（`Core/Src/usart.c`
+  + `Core/Src/gimbal_link.c`），并新增：
+  - UART7 引脚自动识别（先试 PE7/PE8，再试 PF6/PF7，都不通回落 PE7/PE8）
+  - 心跳回 ACK(0x12)，用来分别确认"收"和"发"两个方向
+  - ⚠ 需要在 STM32CubeIDE 里重新编译烧写（本机没有 ARM 工具链，没法替你编译）
+* K230 端：
+  - `tools/k230_link_test.py` —— **只测通信**，不依赖电机反馈（先跑这个）
+  - `main.py` —— 完整瞄准程序（引脚配置 + 检测 + 控制 + 状态机），
+    拷到 SD 卡根目录即上电自动运行
+  - `tools/pc_sim_main.py` —— 电脑上离线跑 main.py 全链路仿真（已通过）
+
 原程序在 `../rdk_aim/`（Ubuntu + OpenCV + numpy + pyserial）。
 K230 跑的是 **CanMV MicroPython**：没有 OpenCV / numpy / 多线程 / Linux，
 但自带 C 实现的 `image` 模块（OpenMV 风格 API）+ `machine.UART`，算力和延迟反而更适合做实时瞄准。
@@ -34,17 +47,19 @@ K230 跑的是 **CanMV MicroPython**：没有 OpenCV / numpy / 多线程 / Linux
 * 115200 8N1，3.3V 电平，**必须共地**
 * IO9/IO10 是模块 EXPORT 接口上的丝印（见说明书「12Pin GPIO 介绍」页右侧）
 * 备选：12Pin GPIO 的 UART3 = IO32(TXD)/IO33(RXD)，脚本里留了切换开关
+* H723 侧的 UART7 接插件有两种可能的引脚对（PE7/PE8 或 PF6/PF7），
+  固件会在启动时自动试出来；如果两个都不是，请把接插件旁的丝印告诉我
 
 ## 三、分步替换流程（每步都能单独验证）
 
 | 步骤 | 脚本 | 验证什么 | 通过标准 |
 |---|---|---|---|
 | 0 | `tools/t0_env.py` | 固件、可用模块、UART 通道 | 全部 import OK，UART 能建立 |
-| 1 | `tools/t1_link.py` | K230 ↔ H723 串口链路 | 屏幕上出现 H723 遥测（state/flags），`crc_err=0` |
+| 1 | `tools/k230_link_test.py` | K230 ↔ H723 串口链路（只看通信） | 打印 `双向通信 OK`，`crc_err=0` |
 | 2 | `tools/t2_camera.py` | 相机 + 黑框检测 | 画面上黑胶带框被框住，中心十字在靶心附近 |
 | 3 | `tools/t3_spot.py` | 激光光斑检测 | 屏幕上光斑被框住，坐标稳定（跑之前先让激光亮） |
-| 4 | `main.py`（后续生成） | 完整瞄准闭环 | 误差收敛、偏置下发、丢靶安全 |
-| 5 | 脱机运行 | 保存到板子跑 | 拔掉 IDE 也能跑 |
+| 4 | `main.py` | 完整瞄准闭环 | 误差收敛、偏置下发、丢靶安全 |
+| 5 | 脱机运行 | 拷到 SD 卡根目录 | 整体上电自动开始瞄准 |
 
 ## 四、在 CanMV IDE 里怎么跑
 
@@ -58,6 +73,18 @@ K230 跑的是 **CanMV MicroPython**：没有 OpenCV / numpy / 多线程 / Linux
 
 每个脚本顶部都有一块 `===== 参数 =====`，改完直接重新运行即可。
 等这些参数在板子上实测稳定后，再合并进最终的 `main.py`（同样单文件，方便脱机保存）。
+
+## 八、电脑上的离线仿真（不接硬件先把逻辑跑通）
+
+```powershell
+cd D:\STM32\STM32projects\yuntai2
+python k230_aim\tools\pc_sim_main.py          # cv2 方案
+python k230_aim\tools\pc_sim_main.py rects    # 原生 find_rects 方案
+```
+
+仿真会伪造 K230 环境和一台 H723（含云台一阶模型），完整跑
+「WAIT_READY → SET_ZERO → TRACK」并检查闭环是否收敛。
+当前结果：两个方案的末端残差都 < 3px。
 
 ## 六、K230 固件能力（按你电脑上的官方资料确认）
 

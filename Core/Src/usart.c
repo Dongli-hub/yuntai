@@ -25,6 +25,89 @@
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart7;
+
+/* ---------------------------------------------------------------------------
+ * UART7 引脚对管理（K230 链路用）
+ *
+ * 为什么需要这个：板子上 UART7 接插件只标了 "UART7"，
+ * 但 H723 的 UART7 有两个可选引脚对（都是 AF11）：
+ *     UART7_PAIR_PE : PE7 = RX, PE8 = TX
+ *     UART7_PAIR_PF : PF6 = RX, PF7 = TX
+ * 不可能靠猜，索性两个都试：gimbal_link_init() 里每个脚等 400ms，
+ * 哪个脚收到字节就用哪个；都没收到就回默认 PE7/PE8。
+ *
+ * 说明：这里只切 GPIO 的复用功能，不动 UART7 外设本身，
+ * 所以切换时不会丢配置，也不会触发 HAL 重初始化。
+ * RX 脚一律开内部上拉：悬空脚最怕被噪声拉出假的起始位。
+ * ------------------------------------------------------------------------- */
+static uint8_t s_uart7_pair = UART7_PAIR_PE;
+
+void UART7_BindPins(uint8_t pair)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  s_uart7_pair = pair;
+
+  /* 先把两组脚都还原成模拟态，避免两个输出同时驱动 */
+  HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7 | GPIO_PIN_8);
+  HAL_GPIO_DeInit(GPIOF, GPIO_PIN_6 | GPIO_PIN_7);
+
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull      = GPIO_PULLUP;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF11_UART7;
+
+  if (pair == UART7_PAIR_PF)
+  {
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;      /* PF6=RX, PF7=TX */
+    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+  }
+  else
+  {
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_7 | GPIO_PIN_8;      /* PE7=RX, PE8=TX */
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  }
+}
+
+uint8_t UART7_CurrentPins(void)
+{
+  return s_uart7_pair;
+}
+
+/* UART7 init function */
+
+void MX_UART7_UART_Init(void)
+{
+  huart7.Instance = UART7;
+  huart7.Init.BaudRate = 115200;
+  huart7.Init.WordLength = UART_WORDLENGTH_8B;
+  huart7.Init.StopBits = UART_STOPBITS_1;
+  huart7.Init.Parity = UART_PARITY_NONE;
+  huart7.Init.Mode = UART_MODE_TX_RX;
+  huart7.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart7.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart7.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart7.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart7.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart7, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart7, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
 
 /* USART1 init function */
 
@@ -110,6 +193,30 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   /* USER CODE END USART1_MspInit 1 */
   }
+  else if(uartHandle->Instance==UART7)
+  {
+  /* USER CODE BEGIN UART7_MspInit 0 */
+
+  /* USER CODE END UART7_MspInit 0 */
+  /** Initializes the peripherals clock
+  */
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_UART7;
+    PeriphClkInitStruct.Usart234578ClockSelection = RCC_USART234578CLKSOURCE_D2PCLK1;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* UART7 clock enable */
+    __HAL_RCC_UART7_CLK_ENABLE();
+
+    /* 引脚对由 s_uart7_pair 决定（PE7/PE8 或 PF6/PF7） */
+    UART7_BindPins(s_uart7_pair);
+
+  /* USER CODE BEGIN UART7_MspInit 1 */
+
+  /* USER CODE END UART7_MspInit 1 */
+  }
 }
 
 void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
@@ -132,6 +239,24 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
   /* USER CODE BEGIN USART1_MspDeInit 1 */
 
   /* USER CODE END USART1_MspDeInit 1 */
+  }
+  else if(uartHandle->Instance==UART7)
+  {
+  /* USER CODE BEGIN UART7_MspDeInit 0 */
+
+  /* USER CODE END UART7_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_UART7_CLK_DISABLE();
+
+    /**UART7 GPIO Configuration
+    PE7/PE8 或 PF6/PF7 ------> UART7
+    */
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7|GPIO_PIN_8);
+    HAL_GPIO_DeInit(GPIOF, GPIO_PIN_6|GPIO_PIN_7);
+
+  /* USER CODE BEGIN UART7_MspDeInit 1 */
+
+  /* USER CODE END UART7_MspDeInit 1 */
   }
 }
 

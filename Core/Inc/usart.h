@@ -33,14 +33,28 @@ extern "C" {
 /* USER CODE END Includes */
 
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart7;
 
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
 void MX_USART1_UART_Init(void);
+void MX_UART7_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
+
+/* ---------------------------------------------------------------------------
+ * UART7 引脚对：这块板子的 UART7 接插件可能是下面两种引脚的任意一种，
+ * 用 UART7_BindPins() 切换（gimbal_link_init() 会自动试一遍）：
+ *   UART7_PAIR_PE : PE7 = UART7_RX, PE8 = UART7_TX
+ *   UART7_PAIR_PF : PF6 = UART7_RX, PF7 = UART7_TX
+ * ------------------------------------------------------------------------- */
+#define UART7_PAIR_PE   0u
+#define UART7_PAIR_PF   1u
+
+void UART7_BindPins(uint8_t pair);
+uint8_t UART7_CurrentPins(void);
 
 /* USER CODE END Prototypes */
 
