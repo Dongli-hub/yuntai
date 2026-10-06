@@ -256,7 +256,17 @@ class Link(object):
             return UART(3, baudrate=UART_BAUD, tx=Pin(32), rx=Pin(33),
                         bits=8, parity=None, stop=0)
 
+        def uart3_fpioa():
+            # 备用线路：12Pin GPIO 的 IO32(TXD)/IO33(RXD) 手动配成 UART3。
+            # 和 YbUart 配 IO9/IO10 是同一套做法（先 FPIOA 再建 UART）。
+            from machine import FPIOA, UART
+            fp = FPIOA()
+            fp.set_function(32, FPIOA.UART3_TXD, ie=0, oe=1, pu=1)
+            fp.set_function(33, FPIOA.UART3_RXD, ie=1, oe=0, pu=1)
+            return UART(3, baudrate=UART_BAUD)
+
         return [("YbUart(亚博封装, IO9/IO10)", yb),
+                ("UART3 手配 IO32/IO33", uart3_fpioa),
                 ("UART(%d) 不指定引脚" % UART_UNIT, m_nopin),
                 ("UART(1) tx=IO9 rx=IO10", m_pins19),
                 ("UART(3) tx=IO32 rx=IO33", m_pins3233)]
@@ -625,6 +635,22 @@ def init_camera():
     return sensor
 
 
+def print_fpioa_state():
+    """启动时打印关键引脚功能，方便一眼确认串口引脚配对了。"""
+    try:
+        from machine import FPIOA
+        fp = FPIOA()
+        out = []
+        for pin in (9, 10, 32, 33):
+            try:
+                out.append("IO%d=%s" % (pin, fp.get_pin_func(pin)))
+            except Exception:
+                out.append("IO%d=?" % pin)
+        print("引脚功能: %s" % " ".join(out))
+    except Exception:
+        pass
+
+
 _display = None
 _media = None
 
@@ -667,6 +693,7 @@ ST_NAME = {ST_WAIT_READY: "WAIT_READY", ST_SET_ZERO: "SET_ZERO",
 def main():
     link = Link()
     parser = FrameParser()
+    print_fpioa_state()
     sensor = init_camera()
     canvas = init_display()
     from media.media import MediaManager

@@ -43,6 +43,15 @@ UART_HandleTypeDef huart7;
  * RX 脚一律开内部上拉：悬空脚最怕被噪声拉出假的起始位。
  * ------------------------------------------------------------------------- */
 static uint8_t s_uart7_pair = UART7_PAIR_PE;
+/* UART7 初始化是否出错（1 = 出错）。故意不死等 Error_Handler：
+ * 现场如果卡死在 Error_Handler，整块板子一点反应都没有，太难查；
+ * 这里只记标志，由链路层打一条 TEXT 日志出来。 */
+static uint8_t s_uart7_err;
+
+uint8_t UART7_InitError(void)
+{
+  return s_uart7_err;
+}
 
 void UART7_BindPins(uint8_t pair)
 {
@@ -98,20 +107,13 @@ void MX_UART7_UART_Init(void)
   huart7.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
   if (HAL_UART_Init(&huart7) != HAL_OK)
   {
-    Error_Handler();
+    s_uart7_err = 1u;
+    return;
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart7, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart7, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart7) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /* FIFO 这三步做成"尽力而为"：万一某个型号不支持，也不要卡死整机 */
+  (void)HAL_UARTEx_SetTxFifoThreshold(&huart7, UART_TXFIFO_THRESHOLD_1_8);
+  (void)HAL_UARTEx_SetRxFifoThreshold(&huart7, UART_RXFIFO_THRESHOLD_1_8);
+  (void)HAL_UARTEx_DisableFifoMode(&huart7);
 }
 
 /* USART1 init function */

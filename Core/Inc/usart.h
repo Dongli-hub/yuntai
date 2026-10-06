@@ -55,6 +55,7 @@ void MX_UART7_UART_Init(void);
 
 void UART7_BindPins(uint8_t pair);
 uint8_t UART7_CurrentPins(void);
+uint8_t UART7_InitError(void);
 
 /* USER CODE END Prototypes */
 

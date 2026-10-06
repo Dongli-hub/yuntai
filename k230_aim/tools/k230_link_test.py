@@ -142,9 +142,24 @@ def _open_yb():
     return YbUart(baudrate=UART_BAUD)
 
 
+def _open_uart3_fpioa():
+    """手动把 12Pin GPIO 上的 IO32/IO33 配成 UART3 再打开。
+
+    和 YbUart 配 IO9/IO10 是同一套做法：先 FPIOA 指定功能，再建 UART。
+    如果 UART1(IO9/IO10) 的接收有问题，可以改用这一路，
+    把线挪到 12Pin GPIO 第 3 脚(IO33=UART3_RXD) / 第 5 脚(IO32=UART3_TXD)。
+    """
+    from machine import FPIOA, UART
+    fp = FPIOA()
+    fp.set_function(32, FPIOA.UART3_TXD, ie=0, oe=1, pu=1)
+    fp.set_function(33, FPIOA.UART3_RXD, ie=1, oe=0, pu=1)
+    return UART(3, baudrate=UART_BAUD)
+
+
 def candidates():
     return [
         ("YbUart(亚博封装)", _open_yb),
+        ("UART3 手配 IO32/IO33", _open_uart3_fpioa),
         ("UART(1) 不指定引脚", lambda: _open_machine(1)),
         ("UART(1) IO9/IO10", lambda: _open_machine(1, 9, 10)),
         ("UART(3) IO32/IO33", lambda: _open_machine(3, 32, 33)),
@@ -182,6 +197,26 @@ def uart_read(dev, n=256):
         return dev.read(n) or b""
     except Exception:
         return b""
+
+
+def hexstr(b):
+    return " ".join("%02X" % x for x in b)
+
+
+def print_fpioa_state():
+    """打印关键引脚当前被分配成什么功能（确认真的配成串口了）。"""
+    try:
+        from machine import FPIOA
+        fp = FPIOA()
+        out = []
+        for pin in (9, 10, 32, 33):
+            try:
+                out.append("IO%d=%s" % (pin, fp.get_pin_func(pin)))
+            except Exception as e:
+                out.append("IO%d=?(%s)" % (pin, e))
+        print("引脚功能: %s" % " ".join(out))
+    except Exception as e:
+        print("FPIOA 查询失败: %s" % e)
 
 
 def main():
@@ -233,6 +268,7 @@ def main():
     print("=" * 56)
     print("K230 通信自检")
     print("使用串口: %s @ %d" % (uart_name, UART_BAUD))
+    print_fpioa_state()
     print("=" * 56)
 
     parser = FrameParser()
@@ -284,7 +320,15 @@ def main():
 
             data = uart_read(dev)
             if data:
-                for msg_id, seq, payload in parser.feed(data):
+                first_rx = (parser.bytes_rx == 0)
+                frames = parser.feed(data)
+                if first_rx:
+                    print("★ 第一次收到字节（共 %d 个）: %s"
+                          % (len(data), hexstr(data[:48])))
+                    print("  ↑ 能收到字节就说明物理链路是通的："
+                          "若里面能看到 YUNTAI-UART7 之类的字样，"
+                          "那就是 H723 新固件在发信标")
+                for msg_id, seq, payload in frames:
                     if msg_id == MSG_GIMBAL_STATE:
                         n_state += 1
                         if len(payload) == 21:

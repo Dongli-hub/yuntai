@@ -384,6 +384,24 @@ void gimbal_link_init(void)
     /* UART7 引脚：板子丝印已确认 RX=PE07 / TX=PE08，固定这一组 */
     UART7_BindPins(UART7_PAIR_PE);
 
+    /* ---- 上电信标 ----
+     * 用阻塞方式先直发一串 ASCII。哪怕协议层还有别的问题，
+     * 对面在"原始字节"里也能看到这行字，一眼区分：
+     *   看到字  = 物理链路 + UART7 都好，只是帧解析的问题
+     *   没看到  = H723 没在跑，或者线/引脚不对
+     */
+    if (UART7_InitError() == 0u)
+    {
+        static const char banner[] = "\r\nYUNTAI-UART7 PE7/PE8 alive\r\n";
+        HAL_UART_Transmit(&huart7, (uint8_t *)banner,
+                          (uint16_t)(sizeof(banner) - 1u), 50u);
+        gimbal_link_log("[LINK] UART7(PE7/PE8) ready");
+    }
+    else
+    {
+        gimbal_link_log("[LINK] UART7 init FAIL !!");
+    }
+
     /* 打开 UART7 的接收中断（接收只做"存字节"这一件事） */
     __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
