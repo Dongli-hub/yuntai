@@ -101,6 +101,8 @@ class ParamId:
     PITCH_ILIM = 0x08
     PITCH_OUT_RPM = 0x09
     PITCH_PLAT_SIGN = 0x0A   # 平台俯仰补偿：0=关，±1=开并定方向
+    YAW_STICTION_RPM = 0x0B  # 偏航静摩擦补偿转速(rpm)，0=关（2026-09-30 新增）
+    YAW_ILIM = 0x0C          # 偏航积分限幅（ki*该值 = 积分单独能给出的最大 rpm）
 
 
 class AimMode:

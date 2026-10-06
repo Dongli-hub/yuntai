@@ -23,6 +23,7 @@
 import argparse
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -34,11 +35,22 @@ from eaim.app import AimApp, RunOptions  # noqa: E402
 from eaim.config import find_default_config, load_config, save_yaml  # noqa: E402
 
 
-def measure(app, tag: str, seconds: float = 1.2):
-    """在 seconds 秒内统计靶心与光斑的中位位置。"""
+def measure(app, tag: str, seconds: float = 2.0):
+    """在 seconds 秒内统计靶心与光斑的中位位置，并读回云台电机实际角度。
+
+    读电机角很重要：它能把"云台没接受偏置"（电机不动）和"电机动了但图像
+    没动"（机构/装配问题）区分开 —— 这两种情况以前都只能靠猜。
+    """
     t_end = time.monotonic() + seconds
     tus, tvs, sus, svs = [], [], [], []
+    st = None
     while time.monotonic() < t_end:
+        for frame in app.gimbal_link.read_frames():
+            if frame.msg_id == proto.MsgId.GIMBAL_STATE:
+                try:
+                    st = proto.unpack_gimbal_state(frame.payload)
+                except Exception:                              # noqa: BLE001
+                    pass
         f, _ = app.camera.read()
         if f is not None:
             app.gimbal_link.send(
@@ -58,10 +70,12 @@ def measure(app, tag: str, seconds: float = 1.2):
         "target": (float(np.median(tus)), float(np.median(tvs))) if tus else None,
         "spot": (float(np.median(sus)), float(np.median(svs))) if svs else None,
         "n_target": len(tus), "n_spot": len(sus),
+        "motor": ((st.yaw_motor_deg, st.pitch_motor_deg) if st is not None else None),
     }
-    print("  [%s] 靶心=%s (n=%d)  光斑=%s (n=%d)"
+    print("  [%s] 靶心=%s (n=%d)  光斑=%s (n=%d)  电机=%s"
           % (tag, _fmt(out["target"]), out["n_target"],
-             _fmt(out["spot"]), out["n_spot"]))
+             _fmt(out["spot"]), out["n_spot"],
+             ("(%.1f, %.1f)" % out["motor"]) if out["motor"] else "?"))
     return out
 
 
@@ -79,6 +93,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(find_default_config())
+    # 标定要重新找光斑位置，必须全图搜索（关掉 ROI 限制）
+    cfg.laser.roi_px = 0
     if args.port_gimbal:
         cfg.link_gimbal.port = args.port_gimbal
     cfg.link_gimbal.enable = not args.no_gimbal
@@ -88,6 +104,26 @@ def main():
     app = AimApp(cfg, RunOptions(laser=True, quiet=True))
     if not app.setup():
         return 1
+
+    # ---- AIM 保活线程（少了它，标定结果就是噪声）----
+    # H723 侧有 0.5s 掉线看门狗：超过 0.5s 收不到 AIM/心跳帧就自动切 STAB
+    # 并把偏置清零。**关键**：这个切回 STAB 是"粘性"的 —— 之后 AIM 帧恢复了
+    # 也不会自动回到 AIM 模式，必须由上位机重新下发 MODE=AIM。
+    # 而标定流程每两步之间有 0.6~0.8s 停顿，正好踩中这个坑：
+    # 现象是"给了 6° 偏置，云台纹丝不动"，算出来的 sign 是纯噪声
+    # （实测踩过：du/dyaw 只有 0.43 px/°、理论应 11 px/°）。
+    _keep = threading.Event()
+
+    def _keepalive():
+        while not _keep.is_set():
+            try:
+                app.gimbal_link.send(proto.MsgId.MODE,
+                                     proto.pack_mode(proto.AimMode.AIM))
+            except Exception:                                  # noqa: BLE001
+                pass
+            _keep.wait(0.25)
+
+    threading.Thread(target=_keepalive, daemon=True).start()
     # 直接进 AIM 模式（跳过状态机），只做标定
     app.gimbal_link.send(proto.MsgId.MODE, proto.pack_mode(proto.AimMode.AIM))
     time.sleep(0.3)
@@ -106,6 +142,8 @@ def main():
     sign_yaw = cfg.calib.sign_yaw
     sign_pitch = cfg.calib.sign_pitch
     pxu = pxv = 0.0
+    fx_deg = cfg.calib.fx * np.pi / 180.0
+    fy_deg = cfg.calib.fy * np.pi / 180.0
     if base["target"] is None:
         print("\n画面里没检测到靶纸 —— 无法判定符号。"
               "请把靶纸放进画面（可以临时只放一张贴了黑框的 A4）后重跑。")
@@ -114,35 +152,48 @@ def main():
         print("第 2 步：给 yaw 偏置 +%.1f 度，看靶心往哪边跑" % args.step)
         print("=" * 64)
         app.aim.set_offset(0.0, 0.0)
-        time.sleep(0.6)
+        time.sleep(1.5)          # 停够时间：偏置回到 0 后要等云台真的转回去
         a = measure(app, "yaw=0")
         app.aim.set_offset(args.step, 0.0)
-        time.sleep(0.8)
+        time.sleep(1.5)
         b = measure(app, "yaw=+%.0f" % args.step)
         app.aim.set_offset(0.0, 0.0)
         if a["target"] and b["target"]:
             du = b["target"][0] - a["target"][0]
             pxu = abs(du) / args.step
-            sign_yaw = -1.0 if du > 0 else 1.0
             print("  -> du/dyaw = %+.1f px/%.0f° = %+.2f px/°   sign_yaw = %+.0f"
-                  % (du, args.step, du / args.step, sign_yaw))
+                  % (du, args.step, du / args.step, -1.0 if du > 0 else 1.0))
+            if pxu < 0.4 * fx_deg:
+                # 动得太少 = 云台根本没接受偏置，这时算出来的符号是纯噪声，
+                # 必须保持原值（否则会把好好的配置写成反的，越修越偏）
+                print("  ✘ 移动量太小（%.2f px/°，理论应 %.2f）—— 云台没接受偏置，"
+                      "本次 yaw 符号不作数，保持原值 %+.0f"
+                      % (pxu, fx_deg, sign_yaw))
+                print("     常见原因：AIM 模式被 H723 的 0.5s 看门狗切回 STAB"
+                      "（本工具已加保活线程）；或云台还没进 RUNNING。")
+                pxu = 0.0
+            else:
+                sign_yaw = -1.0 if du > 0 else 1.0
         print("\n" + "=" * 64)
         print("第 3 步：给 pitch 偏置 +%.1f 度，看靶心往哪边跑" % args.step)
         print("=" * 64)
-        time.sleep(0.5)
+        time.sleep(1.5)
         a = measure(app, "pitch=0")
         app.aim.set_offset(0.0, args.step)
-        time.sleep(0.8)
+        time.sleep(1.5)
         b = measure(app, "pitch=+%.0f" % args.step)
         app.aim.set_offset(0.0, 0.0)
         if a["target"] and b["target"]:
             dv = b["target"][1] - a["target"][1]
             pxv = abs(dv) / args.step
-            sign_pitch = -1.0 if dv > 0 else 1.0
             print("  -> dv/dpitch = %+.1f px/%.0f° = %+.2f px/°   sign_pitch = %+.0f"
-                  % (dv, args.step, dv / args.step, sign_pitch))
-        fx_deg = cfg.calib.fx * np.pi / 180.0
-        fy_deg = cfg.calib.fy * np.pi / 180.0
+                  % (dv, args.step, dv / args.step, -1.0 if dv > 0 else 1.0))
+            if pxv < 0.4 * fy_deg:
+                print("  ✘ 移动量太小（%.2f px/°，理论应 %.2f）—— 本次 pitch 符号不作数，"
+                      "保持原值 %+.0f" % (pxv, fy_deg, sign_pitch))
+                pxv = 0.0
+            else:
+                sign_pitch = -1.0 if dv > 0 else 1.0
         print("\n理论增益：fx 方向 %.2f px/°，fy 方向 %.2f px/°" % (fx_deg, fy_deg))
         if pxu > 0 and abs(pxu - fx_deg) / fx_deg > 0.25:
             print("警告：yaw 实测与理论差 %.0f%%，检查 fx 标定 / 分辨率 / 是否加了数字变焦"
@@ -164,6 +215,7 @@ def main():
     save_yaml(out, data)
     print("已写入 %s" % out)
     print("运行：python main.py run --extra-config configs/boresight.yaml")
+    _keep.set()
     app.gimbal_link.send(proto.MsgId.MODE, proto.pack_mode(proto.AimMode.STAB))
     app.shutdown()
     return 0

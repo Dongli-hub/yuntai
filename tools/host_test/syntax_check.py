@@ -23,7 +23,11 @@ SRC = os.path.join(PROJ, "Core", "Src")
 # 只检查"我自己写的、且依赖 HAL 的"文件；gimbal_proto.c 已在 run_test.py 里真编译过
 FILES = [
     "yuntai_task.c",
+    # 注意：main.c 不在这里 —— 它调用 CubeMX/HAL 的 RCC 类型与初始化函数，
+    # 本地桩要复制大半个 HAL 才能编过，收益不值。main.c 的语法错误靠
+    # CubeIDE 编译时暴露（曾经有一个 "}." 的拼写错误就是这样抓到的）。
     "gimbal_link.c",
+    "MahonyAHRS.c",
     "jc4310.c",
     "can_bsp.c",
     "debug_uart.c",

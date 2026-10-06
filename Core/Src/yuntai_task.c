@@ -72,10 +72,27 @@
  *   CLOSED_LOOP/SET_MODE：各留 0.5s 等驱动器把模式切换吃进去
  */
 #define BMI_RETRY_MS             500u    /* BMI088 初始化失败时的重试间隔 */
+/* ---- 姿态积分方式：按【昨天那版（GitHub master）】的行为 ---- 
+ * 昨天那版 MahonyAHRS.c 写死 sampleFreq=1000，而实际调用是 500Hz，
+ * 于是姿态积分步长只有真实的一半 —— 姿态角"走一半"、零偏造成的漂移也减半。
+ * 用户在真机上反复验证：那一版"不飘、控制顺畅"，今天改成 1:1 之后开始飘。
+ * 所以这里按用户要求【恢复昨天那版】：
+ *   =1 -> 采样频率按实际的 2 倍（等价于昨天那版的写死 1000Hz）
+ * 代价：地瓜派下发的偏置会"命令 1° 实际转 2°"，需要在 RDK 侧把
+ *       control.kp 大约减半来匹配（否则视觉环增益翻倍）。这一步我在
+ *       RDK 侧已经改好（yaw 专用缩放），见 docs/06。
+ */
+#define AHRS_LEGACY_HALF_RATE      1
 #define MOTOR_BOOT_DELAY_MS     2000u    /* 等驱动器上电自检：纯延时，不要改小 */
 #define CLOSED_LOOP_DELAY_MS     500u    /* 进闭环后等 0.5s */
 #define SET_MODE_DELAY_MS        500u    /* 切速度模式后等 0.5s */
-#define LOCK_DELAY_MS            500u    /* 锁基准前的观察时间，同时预热编码器 */
+/* 锁基准前的等待。⚠ 这里同时用来做【第二次陀螺零偏标定】，必须留够 1.5s：
+ * 第一次标定是在"电机还没使能、轴是自由的"那 2 秒里做的，线缆扭力会让
+ * 平台慢慢转，测出来的零偏里混进了这个转速 —— 于是之后环路会忠实地按
+ * 这个假零偏匀速转（实测 1.1°/s、方向每次一样）。第二次在速度模式
+ * （0 指令 = 轴被驱动器按住）下重测，才是干净的。 */
+#define LOCK_DELAY_MS           2000u    /* 1500ms 采零偏 + 500ms 余量 */
+#define LOCK_BIAS_CAL_MS        1500u    /* 第二次零偏采样时长 */
 
 /* ---- 节拍 ---- */
 #define IMU_PERIOD_MS              2u    /* 500Hz 读 IMU */
@@ -92,11 +109,33 @@
 #define YAW_KI                  30.0f   /* rpm/(rad*s) */
 #define YAW_KD                  10.0f   /* rpm/(rad/s) */
 #define YAW_OUT_RPM             50.0f   /* 输出限幅；约 300°/s 的补偿能力 */
-#define YAW_ILIM                 1.0f   /* 积分限幅：ki*ilim 要小于脱困转速，
-                                         * 否则积分单独就能把输出顶到满 */
+/* ⚠ 2026-09-30 现场事故：这里原来是 1.0，而 ki=30 -> 积分单独就能给出 30rpm，
+ *   是"能推动轴的最小转速"（≈10rpm）的 3 倍。后果：只要有一点点残余误差
+ *   （陀螺零偏残留、基准误差），积分就会顶到限幅、**把轴慢慢推着匀速转** ——
+ *   用户现场看到的就是"靶子明明静止，水平电机自己在慢慢转"。
+ *   现在压到 0.25 -> ki*ilim = 7.5rpm < 脱困转速：积分只能帮 P 精修，
+ *   再也不可能靠自己把轴推动。 */
+#define YAW_ILIM                0.25f
+/* 偏航角度误差死区（度）：小于它就把误差当 0，积分不再爬，
+ * 避免"噪声让积分一点点攒起来 -> 轴慢慢爬"。 */
+#define YAW_DEADBAND_DEG        0.10f
 #define YAW_FF_RPM_PER_RADS     66.85f  /* 66.85 rpm per (rad/s) ≈ 7 倍理论抵消量，
                                          * 故意过量才能保证越过静摩擦 */
 #define YAW_FF_SIGN            (-1.0f)
+
+/* ---- 偏航静摩擦补偿（2026-09-30 新增）----
+ * 现场逐帧实测：视觉环给出 1.5° 的目标变化时，平台 0.7 秒只走了 0.34° ——
+ * 小指令推不动轴。后果有两个，都是用户看到的现象：
+ *   ① 视觉环只能靠"把误差攒大"才推得动（慢慢晃 → 攒够了 → 突然猛动一下）；
+ *   ② 细修正永远做不出来，靶心附近压不下去（稳态误差 3~10cm）。
+ * 做法：角度环误差超过死区、而 PID 输出又低于"能推动"的转速时，
+ * 补一个最小有效转速（方向与误差一致）；误差小于死区时一点都不补，
+ * 免得在目标点上来回抖。 */
+/* ⚠ 补偿量故意取得保守（6rpm），而且**误差越大补得越多**（0.3~1 倍）。
+ *   补太猛会让轴"一跳一跳"：这个值可以用 tools/tune_pitch.py 的
+ *   PARAM 0x0B 在台架上在线加，找到刚好能推动又不抖的数再写回这里。 */
+#define YAW_STICTION_RPM         6.0f
+#define YAW_STICTION_DEADBAND_DEG 0.15f /* 小于这个角度误差就不补，防抖 */
 
 /* ---- 俯仰：电机编码器位置环 + 陀螺前馈 ----
  * ⚠⚠ 比例增益的稳定上限（这条公式很重要，之前算错过一次，代价是"手一碰
@@ -124,8 +163,16 @@
  *   现场若听到电机持续"滋滋"响 -> KP 再往小调；
  *   若俯仰被扰动后回不来 -> KI 往大调（不是 KP）。
  */
-#define PITCH_KP                15.0f   /* rpm/deg；上限见上面的公式 */
-#define PITCH_KI                45.0f   /* rpm/(deg*s)；消静差、负责"推得动" */
+/* ⚠ 2026-09-27 晚 现场实测：KP=15/KI=45 会让俯仰位置环自激。
+ *   证据（tools/pitch_probe.py，AIM 模式下偏置恒为 0）：
+ *     俯仰电机角在 133 ↔ 260 之间以 ~1Hz 来回摆，峰峰 115、逐次跳变中位 73。
+ *   为什么一直没被发现：IMU 装在俯仰轴【下方】，姿态遥测里俯仰纹波不动
+ *   （实测 2.36~2.39），只有相机画面在上下跳 —— 于是靶纸一会儿在画面里、
+ *   一会儿跑出去，视觉环怎么调都收敛不了。
+ *   在线把 KP 降到 8、KI 降到 20 之后，俯仰电机角立刻静如止水（跳变 0.0）。
+ *   所以默认值改成安全预设。要更快再往上加，但"一次只动一个数"。 */
+#define PITCH_KP                 8.0f   /* rpm/deg；原 15，实测自激 */
+#define PITCH_KI                20.0f   /* rpm/(deg*s)；原 45，实测自激 */
 #define PITCH_KD                 0.10f  /* 编码器测速做一点阻尼；大了会被量化噪声放大 */
 #define PITCH_OUT_RPM          120.0f   /* 约 720°/s，够甩开了 */
 #define PITCH_ILIM               0.40f  /* 积分限幅；ki*ilim = 18rpm，
@@ -135,6 +182,7 @@
 #define PITCH_FF_RPM_PER_RADS   15.0f   /* ≈1.6 倍理论抵消量 */
 #define PITCH_FF_SIGN          (-1.0f)
 #define PITCH_TRAVEL_LIMIT_DEG  80.0f   /* 相对上电位置的行程软限位 */
+#define PITCH_TGT_RATE_DPS     150.0f   /* 俯仰目标角速率限幅（防饱和打摆，见控制里说明） */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
 #define PITCH_RUNAWAY_DEG       25.0f   /* 跟踪误差持续这么大 = 方向反了或卡死 */
 #define PITCH_RUNAWAY_MS       400u     /* 持续这么久就锁故障并降级 */
@@ -291,6 +339,12 @@ static uint8_t    g_unwind_done;    /* 本次解绕是否已完成并重锁过�
 static uint8_t    g_prev_mode = 0xFFu;
 static float      g_yaw_cmd_rpm;
 static float      g_pitch_cmd_rpm;
+static uint8_t    g_bias_cal;       /* 1 = 正在采陀螺零偏样本（见 gyro_bias_accumulate） */
+static float      g_yaw_err_rad;    /* 偏航角度环当前误差（rad），给零偏自校准判据用 */
+static uint8_t    g_yaw_stiction_on;/* 当前是否正在做静摩擦补偿（调试打印用） */
+static uint8_t    g_bias_by_rest;   /* 本次零偏修正是靠"平台自静止"判据进来的 */
+static float      g_yaw_stiction_rpm = YAW_STICTION_RPM;  /* 可在线改（PARAM 0x0B）*/
+static float      g_yaw_ilim = YAW_ILIM;                  /* 可在线改（PARAM 0x0C）*/
 
 /* ---- 运行时可改的当前参数值（GP_MSG_PARAM 改写的就是这些）----
  * 上电时用上面 #define 的默认值初始化；之后现场用 tools/tune_pitch.py 改，
@@ -453,6 +507,20 @@ static void enc_update(EncFb_t *e, float raw, uint32_t now)
         {
             d += 360.0f;
         }
+        /* ---- 反馈异常保护（实测踩过）----
+         * 驱动器会同时/交替上报两路位置：0x2A 主动上报 与 0x43 查询回复。
+         * 两路在"±180° 翻转点"附近可能差一点点，于是解卷绕就会多算一圈，
+         * cont 瞬间跳 ±360°，位置环看到"偏了 360°"-> 输出打满 -> 轴飞车，
+         * 表现为【俯仰电机一直大幅前后摆动】（p 在 126↔250 之间跳、o=±120）。
+         * 判据：折到 ±180 之后，若单次变化还是超过 90°，那它不是真运动
+         * （200Hz 控制 + 最大 720°/s 也才 3.6°/拍），直接丢弃这一帧，
+         * 既不改 cont 也不改 prev —— 等下一个正常帧再继续。
+         */
+        if (fabsf(d) > 90.0f)
+        {
+            e->t_ms = now;          /* 只刷新时间戳，位置保持不变 */
+            return;
+        }
         e->cont += d;
     }
     e->raw  = raw;
@@ -549,7 +617,7 @@ static void gyro_bias_accumulate(void)
 /** 2 秒到点：算出零偏并打日志。无论采样质量如何都必须走完，绝不重来 */
 static void gyro_bias_finalize(void)
 {
-    char    buf[72];
+    char    buf[96];
     uint8_t i;
 
     if (g_gyro_n < GYRO_BIAS_MIN_SAMPLES)
@@ -580,6 +648,132 @@ static void gyro_bias_finalize(void)
     gimbal_link_log(buf);
 }
 
+/* ==========================================================================
+ * 陀螺零偏【慢速自校准】—— 解决"上电那 2 秒被碰过 -> 之后一直慢慢飘"
+ *
+ * 现象（实测）：上电后如果立刻有晃动，零偏就标偏了；角度估计按恒定速率
+ * 漂走，偏航环追着这个漂移走 -> 云台自己慢慢转，越转越偏。
+ * 上电后不动的话就没事。
+ *
+ * 做法（很土但很稳）：只要【两个电机几乎没被驱动】且【陀螺三轴读数都很小】
+ * 持续 1.5s，就认为平台是静止的，把零偏慢慢往当前读数拉（τ≈2.5s）。
+ *   · 平台真在动时（任一角速度 > 1.7°/s 或电机在出力）绝不触发，
+ *     所以不会把真实转动吃掉
+ *   · 有 ±GYRO_BIAS_MAX 硬限幅，误触发也拉不飞
+ * ========================================================================== */
+#define GYRO_TRACK_QUIET_RADS   0.15f    /* ≈8.6°/s：只当"读数不离谱"的兜底 */
+#define GYRO_TRACK_QUIET_MS     1500u    /* "已锁定"持续这么久才开始修零偏 */
+#define GYRO_TRACK_ALPHA        0.004f   /* 每拍修正比例：5ms/0.004 -> τ≈1.25s */
+
+static void gyro_bias_track(void)
+{
+    static uint32_t quiet_ms = 0u;
+    static uint32_t adapt_ms = 0u;
+    static uint32_t total_ms = 0u;
+    static uint8_t  logged = 0u;
+    float alpha;
+    uint8_t i;
+
+    total_ms += CONTROL_PERIOD_MS;
+
+    /* ---- "平台在世界里到底动没动"的判据：上位机的【已锁定】标志 ----
+     * ⚠ 这个判据换过三版，每一版都撞过墙，写在这里防止再走回头路：
+     *   · "电机没在出力"      —— 云台顶线缆扭力时一直有小出力 -> 永不触发；
+     *   · "陀螺原始读数小"    —— 读数里就含零偏本身：零偏大 -> 读数大 ->
+     *                            永远判不出静止 -> 永远修不了（死循环）；
+     *   · "电机编码器不转"    —— 关节恰恰会【慢慢转】来抵消零偏（就是我们要
+     *                            修的那个现象），所以轴在转也不能说明平台在动；
+     *   · 现在用 AIM.locked —— 上位机报告"视觉已稳稳压住靶心"时，云台的
+     *     **世界朝向被视觉闭环钉住了**：关节也许在慢慢转（抵消漂移），但平台
+     *     在世界里不转 -> 陀螺原始读数 = 零偏本身。这是物理上唯一说得通的判据。
+     * 另外加一条兜底：陀螺读数不能离譍（<8.6°/s），防止误触发把零偏拉飞。 */
+    {
+        const GimbalCmd_t *cmd = gimbal_link_cmd();
+        uint8_t quiet = (uint8_t)((fabsf(gyro[0]) <= GYRO_TRACK_QUIET_RADS) &&
+                                  (fabsf(gyro[1]) <= GYRO_TRACK_QUIET_RADS) &&
+                                  (fabsf(gyro[2]) <= GYRO_TRACK_QUIET_RADS));
+        /* 判据一：上位机报"视觉已锁定"（世界朝向被视觉钉住，最可信） */
+        uint8_t by_lock = (uint8_t)((cmd->locked != 0u) &&
+                                    (cmd->mode == GP_MODE_AIM));
+        /* 判据二（2026-09-30 新增）：**平台自己就是静止的**，不需要视觉帮忙。
+         *   为什么必须加这一条 —— 上一版只认"已锁定"，可是零偏偏了就出现
+         *   "误差压不下去 -> 永远锁不上 -> 零偏永远修不了"的死循环，
+         *   现场表现就是偏置被视觉环一路积分到 -89° 跑飞（逐帧数据确认：
+         *   画面完全没动，姿态角却以 2.4°/s 匀速漂）。
+         *   物理依据：角度环误差很小（说明已经停在目标姿态）＋ 电机指令低于
+         *   能推动轴的转速（说明没在主动转动）＝ 平台在世界里是静止的，
+         *   此时陀螺原始读数就是零偏本身（这就是惯导里的 ZUPT 零速修正）。
+         *   两条都要求陀螺读数安静，防止误触发把零偏拉飞。 */
+        /* ⚠ 2026-09-30 现场再修：**STAB 模式也要允许这条判据**。
+         *   现象：机载计算机不跑命令时（云台在 STAB 保持朝向），水平电机一直
+         *   朝同一个方向慢慢转。原因就是这里原来只在 AIM 模式下修零偏 ——
+         *   STAB 下零偏没人管，残留零偏被陀螺前馈变成"恒定的电机转速"，
+         *   于是轴匀速爬（而且永远是同一个方向，正好符合现场描述）。
+         *   STAB 的物理情形和这条判据完全一致：角度环误差小、电机指令小、
+         *   平台应该静止 —— 此时陀螺读数就是零偏。 */
+        uint8_t mode_ok = (uint8_t)((cmd->mode == GP_MODE_AIM) ||
+                                    (cmd->mode == GP_MODE_STAB));
+        uint8_t by_rest = (uint8_t)(mode_ok &&
+                                    (fabsf(g_yaw_err_rad) < 0.0087f) /* 0.5° */ &&
+                                    (fabsf(g_yaw_cmd_rpm) < YAW_STICTION_RPM));
+        uint8_t ok = (uint8_t)(quiet && (by_lock || by_rest));
+        g_bias_by_rest = (uint8_t)(quiet && by_rest && !by_lock);
+        if (!ok)
+        {
+            quiet_ms = 0u;
+            adapt_ms = 0u;
+            return;
+        }
+    }
+
+    quiet_ms += CONTROL_PERIOD_MS;
+    /* "自己静止"这条判据不如视觉锁定可靠，所以要求静得更久、修得更慢：
+     * 连续 2 秒静止才开始修，步长减半。 */
+    if (g_bias_by_rest)
+    {
+        if (quiet_ms < 2000u)
+        {
+            return;
+        }
+    }
+    else if (quiet_ms < GYRO_TRACK_QUIET_MS)
+    {
+        return;
+    }
+    /* 开机前 30 秒用快档收敛（τ≈0.5s）：把上电那次标定留下的偏差迅速抹掉。
+     * 之后回到慢档（τ≈1.25s），只在确实静止时才修，不影响正常跟踪。 */
+    alpha = (total_ms < 30000u) ? 0.010f : GYRO_TRACK_ALPHA;
+    if (g_bias_by_rest)
+    {
+        alpha *= 0.5f;          /* 静止判据档：慢一半，宁慢勿错 */
+    }
+    for (i = 0u; i < 3u; i++)
+    {
+        g_gyro_bias[i] += alpha * gyro[i];
+        g_gyro_bias[i] = clampf(g_gyro_bias[i], -GYRO_BIAS_MAX, GYRO_BIAS_MAX);
+    }
+    /* 第一次生效立刻打一条，之后每 10 秒一条 —— 现场一眼就能确认
+     * "自校准到底有没有在工作"（上一版就是因为它没工作、而界面上看不出来，
+     * 白烧了一次固件）。 */
+    if (!logged)
+    {
+        logged = 1u;
+        adapt_ms = 10000u;
+    }
+    adapt_ms += CONTROL_PERIOD_MS;
+    if (adapt_ms >= 10000u)
+    {
+        char bx[16], by[16], bz[16];
+        char buf[96];
+        adapt_ms = 0u;
+        fmt_f(bx, sizeof(bx), g_gyro_bias[0] * 57.29578f, 2);
+        fmt_f(by, sizeof(by), g_gyro_bias[1] * 57.29578f, 2);
+        fmt_f(bz, sizeof(bz), g_gyro_bias[2] * 57.29578f, 2);
+        snprintf(buf, sizeof(buf), "[GYRO] bias tracked x=%s y=%s z=%s", bx, by, bz);
+        gimbal_link_log(buf);
+    }
+}
+
 static void yuntai_imu_update(uint32_t now)
 {
     uint8_t i;
@@ -594,6 +788,11 @@ static void yuntai_imu_update(uint32_t now)
     for (i = 0u; i < 3u; i++)
     {
         gyro_c[i] = gyro[i] - g_gyro_bias[i];
+    }
+    /* 零偏采样（第一次：电机自由，只作粗值；第二次：LOCK 阶段电机按住） */
+    if (g_bias_cal)
+    {
+        gyro_bias_accumulate();
     }
     ahrs_update(imuQuat, gyro_c, acc);
     get_angle(imuQuat, &imuAngle[0], &imuAngle[1], &imuAngle[2]);
@@ -619,6 +818,9 @@ static void yuntai_control(uint32_t now)
     const float   rad2deg = 57.29578f;
     float yaw_rpm, pitch_rpm;
     uint8_t pitch_fb_ok;
+
+    /* 陀螺零偏慢速自校准：平台静止时悄悄把零偏修准（见函数说明） */
+    gyro_bias_track();
 
     /* 模式一变就清掉"解绕已完成"标志，让下一次解绕重新开始 */
     if (mode != g_prev_mode)
@@ -718,10 +920,34 @@ static void yuntai_control(uint32_t now)
          * 也就是"保持上电时的朝向不动" —— 这是掉线后的安全行为。 */
         float off_rad = (mode == GP_MODE_AIM) ? (cmd->yaw_offset_deg / rad2deg) : 0.0f;
         float err = angle_diff_rad(g_yaw_lock_rad + off_rad, imuAngle[0]);
+        /* 死区：误差很小时不再驱动积分（防"慢慢爬"），见 YAW_DEADBAND_DEG */
+        if (fabsf(err) < (YAW_DEADBAND_DEG / rad2deg))
+        {
+            err = 0.0f;
+        }
         PID_Update(&g_yaw_pid, err, 0.0f, dt);
         /* 前馈：车体怎么转，前馈就让电机反向跟多少。
          * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。 */
         yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * gyro_c[2] * g_yaw_ff_gain;
+
+        /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
+        g_yaw_err_rad = err;                  /* 给零偏自校准的"静止判据"用 */
+        {
+            float err_deg = err * 57.29578f;
+            if ((fabsf(err_deg) > YAW_STICTION_DEADBAND_DEG) &&
+                (fabsf(yaw_rpm) < g_yaw_stiction_rpm))
+            {
+                /* 误差越大补得越多：0.15° 只补 30%，1° 以上补满 */
+                float gain = clampf(fabsf(err_deg) / 1.0f, 0.3f, 1.0f);
+                float kick = g_yaw_stiction_rpm * gain;
+                yaw_rpm = (err_deg > 0.0f) ? kick : -kick;
+                g_yaw_stiction_on = 1u;
+            }
+            else
+            {
+                g_yaw_stiction_on = 0u;
+            }
+        }
     }
     g_yaw_cmd_rpm = clampf(yaw_rpm, -YAW_OUT_RPM, YAW_OUT_RPM);
     yuntai_set_yaw(g_yaw_cmd_rpm);
@@ -780,6 +1006,23 @@ static void yuntai_control(uint32_t now)
         /* 行程软限位：别撞机构、别把线扯断 */
         tgt = clampf(tgt, g_pitch_motor_lock - PITCH_TRAVEL_LIMIT_DEG,
                           g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
+        /* ---- 目标角速率限幅（防"大跳变 -> 输出打满 -> 来回打摆"）----
+         * 实测（扫描时）：目标一步跳 35° -> 位置环误差瞬间 35° -> P 项算出
+         * 525rpm -> 被限到 120rpm 一路冲过去 -> 反向再打满 …… 云台就
+         * "大幅前后摆动"（日志 p=172↔280、o=±120 打满）。
+         * 改成斜坡（150°/s）之后误差始终只有 1~2°，环路一直工作在线性区：
+         * 既不打摆，响应也够快（视觉环需要的偏置变化只有几度/秒）。 */
+        {
+            float dmax_t = PITCH_TGT_RATE_DPS * dt;
+            if (tgt > g_pitch_tgt_deg + dmax_t)
+            {
+                tgt = g_pitch_tgt_deg + dmax_t;
+            }
+            else if (tgt < g_pitch_tgt_deg - dmax_t)
+            {
+                tgt = g_pitch_tgt_deg - dmax_t;
+            }
+        }
         g_pitch_tgt_deg = tgt;
 
         float err = tgt - g_pitch_fb.cont;
@@ -828,7 +1071,7 @@ static void yuntai_control(uint32_t now)
 /* 慢速调试文本：现场调参主要看这一条 */
 static void yuntai_debug(uint32_t now)
 {
-    char buf[96];
+    char buf[128];
     const GimbalCmd_t *cmd = gimbal_link_cmd();
     if ((now - g_last_dbg_ms) < DEBUG_PERIOD_MS)
     {
@@ -844,7 +1087,7 @@ static void yuntai_debug(uint32_t now)
     }
     {
         /* 注意：这里全部用 fmt_f，不能写 %f（newlib-nano 会截断输出） */
-        char b0[16], b1[16], b2[16], b3[16], b4[16], b5[16], b6[16];
+        char b0[16], b1[16], b2[16], b3[16], b4[16], b5[16], b6[16], b7[16];
         /* 俯仰编码器反馈的"新鲜度"（ms）。
          * 为什么必须显示：位置环的稳定性和这个数直接相关 —— 反馈越旧，
          * 等效延迟越大，同样的 KP 就越容易自激。上次数据没刷新时，
@@ -858,9 +1101,13 @@ static void yuntai_debug(uint32_t now)
         fmt_f(b4, sizeof(b4), cmd->yaw_offset_deg, 1);
         fmt_f(b5, sizeof(b5), cmd->pitch_offset_deg, 1);
         fmt_f(b6, sizeof(b6), g_plat_comp, 1);
+        /* 偏航电机角也打出来：现场判断"还在不在飘"就看这个数有没有匀速爬
+         * （实测飘的时候它以 0.245°/s 匀速增长，肉眼看不出来但日志里很明显） */
+        fmt_f(b7, sizeof(b7), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
         snprintf(buf, sizeof(buf),
-                 "[DBG] P p=%s t=%s o=%s | Y o=%s | off=%s %s | c=%s | fb=%ums",
-                 b0, b1, b2, b3, b4, b5, b6, (unsigned)fb_age);
+                 "[DBG] P p=%s t=%s o=%s | Y o=%s ym=%s%s | off=%s %s | c=%s | fb=%ums",
+                 b0, b1, b2, b3, b7, (g_yaw_stiction_on ? " S" : ""),
+                 b4, b5, b6, (unsigned)fb_age);
     }
     gimbal_link_log(buf);
 }
@@ -873,6 +1120,15 @@ void yuntai_init(void)
 {
     can_bsp_init();
     laser_init();
+    /* ⚠ 告诉 AHRS"我们多久调一次它"：必须等于 1000/IMU_PERIOD_MS。
+     * 之前这里写死 1000Hz，而实际只在 IMU_PERIOD_MS=2ms（500Hz）调用，
+     * 于是四元数积分步长 halfT 只有真实的一半 —— 姿态角"走一半"。
+     * 表现：上位机给 6° 偏置、电机要转 11.1° 才让角度到 6°（实测），
+     * 等于把 yaw 环的等效增益放大近 2 倍。改这里之后 yaw 变 1:1。 */
+    mahonySampleFreq = 1000.0f / (float)IMU_PERIOD_MS;
+#if AHRS_LEGACY_HALF_RATE
+    mahonySampleFreq *= 2.0f;   /* =1000Hz：姿态积分减半（昨天那版的行为） */
+#endif
     ahrs_init(imuQuat);
     g_laser_on = 0u;
     g_fault    = FAULT_NONE;
@@ -964,11 +1220,8 @@ void yuntai_control_loop(void)
          * 这是"上电后云台朝一个方向慢慢转"的根因修复，且不额外花时间。
          * ⚠ 这里绝不能加"必须静止才计数/否则清零重来"之类条件 ——
          *   那种写法会卡死启动流程（见文件顶部铁律）。 */
-        if ((now - g_last_imu_ms) >= IMU_PERIOD_MS)
-        {
-            g_last_imu_ms = now;
-            gyro_bias_accumulate();
-        }
+        g_bias_cal = 1u;        /* 第一次标定（电机还自由，只作粗值，LOCK 里会重测） */
+        yuntai_imu_update(now); /* 里面会按 g_bias_cal 采样零偏（300~500Hz） */
         if ((now - g_state_ms) > MOTOR_BOOT_DELAY_MS)
         {
             gyro_bias_finalize();
@@ -1011,6 +1264,10 @@ void yuntai_control_loop(void)
             g_state    = YUNTAI_STATE_LOCK;
             g_state_ms = now;
             g_last_imu_ms = now;
+            /* 清空累加器，准备做【第二次零偏标定】（这次电机已经把轴按住了） */
+            g_gyro_sum[0] = g_gyro_sum[1] = g_gyro_sum[2] = 0.0f;
+            g_gyro_n = 0u;
+            g_bias_cal = 1u;
             gimbal_link_log("[IMU] locking reference ...");
         }
         break;
@@ -1021,6 +1278,16 @@ void yuntai_control_loop(void)
      * 状态机会永久停在这里，两个轴都不会发出任何指令。
      */
     case YUNTAI_STATE_LOCK:
+        /* ---- 第二次陀螺零偏标定（这次在电机按住的情况下测）----
+         * 速度模式下给 0 指令 = 驱动器把速度环闭到 0，轴是被"按住"的，
+         * 线缆扭力顶不动它 —— 这时测出来的才是真正的零偏。
+         * 上电头 2 秒电机还自由，那次标定会被平台自身的缓慢转动污染。 */
+        if (g_bias_cal && (now - g_state_ms) > LOCK_BIAS_CAL_MS)
+        {
+            gyro_bias_finalize();
+            g_bias_cal = 0u;
+            gimbal_link_log("[GYRO] bias re-calibrated (motors holding)");
+        }
         yuntai_imu_update(now);
         if ((now - g_last_read_ms) >= 50u)
         {
@@ -1034,7 +1301,7 @@ void yuntai_control_loop(void)
             PID_Init(&g_yaw_pid,   YAW_KP,   YAW_KI,   YAW_KD,   YAW_OUT_RPM);
             PID_Init(&g_pitch_pid, g_pitch_kp, g_pitch_ki, g_pitch_kd, g_pitch_out_rpm);
             PID_Init(&g_yaw_unwind_pid, UNWIND_KP, 0.0f, 0.0f, UNWIND_RPM_MAX);
-            g_yaw_pid.integral_limit   = YAW_ILIM;
+            g_yaw_pid.integral_limit   = g_yaw_ilim;   /* 可在线改（PARAM 0x0C）*/
             g_pitch_pid.integral_limit = g_pitch_ilim;
             g_pitch_pid.dead_zone      = PITCH_DEADZONE_DEG;
             yuntai_lock_reference();
@@ -1103,6 +1370,19 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
 
     case GP_PARAM_YAW_FF_GAIN:
         g_yaw_ff_gain = clampf(v, 0.0f, 200.0f);
+        break;
+
+    case GP_PARAM_YAW_STICTION_RPM:
+        /* 偏航静摩擦补偿转速：0 = 关。上限 30rpm（再大就是"猛推"了，
+         * 会让轴一跳一跳）。现场按 2rpm 一档往上加，找到刚好推得动的值。 */
+        g_yaw_stiction_rpm = clampf(v, 0.0f, 30.0f);
+        break;
+
+    case GP_PARAM_YAW_ILIM:
+        /* 偏航积分限幅：ki*该值 = 积分单独能给出的最大 rpm。
+         * 现场如果还看到"轴自己慢慢转"，先把它压到 0.1 试试。 */
+        g_yaw_ilim = clampf(v, 0.0f, 2.0f);
+        g_yaw_pid.integral_limit = g_yaw_ilim;
         break;
 
     case GP_PARAM_PITCH_FF_SIGN:
@@ -1177,6 +1457,10 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         fmt_f(n1, sizeof(n1), g_pitch_plat_sign, 1);
         fmt_f(n2, sizeof(n2), g_plat_comp, 1);
         snprintf(buf, sizeof(buf), "[PARAM] platComp %s now %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_yaw_stiction_rpm, 1);
+        fmt_f(n2, sizeof(n2), g_yaw_ilim, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] yawStiction %s yawILim %s", n1, n2);
         gimbal_link_log_force(buf);
         return;
 

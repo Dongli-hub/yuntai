@@ -87,8 +87,18 @@ class Camera:
             self._cap = cv2.VideoCapture(str(cfg.device))
         else:
             # 显式指定 V4L2 后端，避免 OpenCV 自己挑到别的后端导致属性设置失效
-            self._cap = cv2.VideoCapture(int(cfg.device), cv2.CAP_V4L2) \
-                if hasattr(cv2, "CAP_V4L2") else cv2.VideoCapture(int(cfg.device))
+            # device 允许两种写法：
+            #   0 / "0"            -> 按索引打开（插拔后索引会变！实测踩过：
+            #                         摄像头重新枚举后 /dev/video0 变成了 video1，
+            #                         程序整轮都读不到图，看起来像"检测全废"）
+            #   "/dev/v4l/by-id/..." -> 按稳定路径打开（推荐，插拔/重启都不变）
+            dev = cfg.device
+            try:
+                dev_arg = int(str(dev).strip())
+            except (TypeError, ValueError):
+                dev_arg = str(dev)
+            self._cap = cv2.VideoCapture(dev_arg, cv2.CAP_V4L2) \
+                if hasattr(cv2, "CAP_V4L2") else cv2.VideoCapture(dev_arg)
             if self._cap.isOpened():
                 # ⚠⚠ 属性设置顺序非常关键（实测踩过）：
                 #   V4L2 下"设分辨率"会重新协商整条视频管线，

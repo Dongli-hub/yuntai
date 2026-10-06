@@ -193,7 +193,17 @@ def build_rectifier(paper_mm: Sequence[float], quad, scale: float) -> Rectifier:
     dst = np.array([[0.0, 0.0], [sw, 0.0], [sw, sh], [0.0, sh]], dtype=np.float32)
     quad32 = np.asarray(quad, dtype=np.float64).reshape(4, 2).astype(np.float32)
     h_img2rect = cv2.getPerspectiveTransform(quad32, dst)
-    h_rect2img = np.linalg.inv(h_img2rect)
+    # 退化四边形（四点近共线/重合）会让单应矩阵奇异，np.linalg.inv 直接抛
+    # LinAlgError —— 实测把一个跑了 30 多秒的程序整个打挂（现场表现就是
+    # "程序自己中断了"）。这里判一下条件数，坏的就返回 None，让调用方跳过。
+    if not np.all(np.isfinite(h_img2rect)) or abs(np.linalg.det(h_img2rect)) < 1e-9:
+        return None
+    try:
+        h_rect2img = np.linalg.inv(h_img2rect)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(h_rect2img)):
+        return None
     return Rectifier(
         h_mm2px=h_mm2px,
         h_px2mm=h_px2mm,

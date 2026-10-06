@@ -1,13 +1,26 @@
 """激光光斑检测。
 
-405nm 蓝紫激光在彩色相机里的特征是"B 通道远大于 R/G 且极亮"，
-而靶纸上的干扰（红色记号笔圆、黑胶带）都是 R 或中性占优，
-方向性不同，所以颜色判据本身就足够分辨。
+判据有两种模式（配置 laser.mode），必须按**实测**选，不能想当然：
 
-更关键的是本模块用了同轴装配带来的强先验：
+  blue : advantage = B - max(G,R)          "蓝通道占优"
+         适合蓝紫激光（405nm）没被打亮、颜色还是深蓝紫的情况
+  warm : advantage = min(B,R) - G  + 亮度  "够亮 + 暖色（红/品红）占优"
+         本项目的激光是**红色**的，打在白纸上中心过曝成白芯、边上一圈暖色，
+         实测 BGR≈(89,43,150)（R>B>G），蓝优势是**负的** —— 用 blue 会
+         一直检不到真光斑，只检到窗边/衣物的蓝色色散伪影（实测踩过）。
+
+红色激光 + 红色靶心：**光靠颜色是分不开的**，真正把它们分开的是
+  (1) 亮度：打印的红圈是"暗红"，红激光光斑是过曝的亮斑；
+  (2) 位置：光斑相对图像是刚性固定的（同轴装配），只在标定的那一小块里找；
+  (3) 尺寸/形状：光斑是团，红圈是细环。
+
+不管哪种模式，"亮度"这一条都要一起满足：它能排掉那些又暗又蓝的
+色散伪影（实测伪影 BGR≈(133,115,132)，亮度只有 115）。
+
+更关键的是同轴装配带来的强先验：
     光斑在图像里的位置是"刚性固定"的（见 docs/00 第一节）。
-因此只在已知光斑位置附近搜，其它地方一律不认，
-白色反光/顶灯高光/纸面高光这类误检基本被一网打尽。
+所以默认只在已知光斑位置附近搜（门控 / ROI），其它地方一律不认，
+白色反光、顶灯高光、窗边色散这类误检基本被一网打尽。
 """
 
 import math
@@ -127,8 +140,28 @@ class LaserSpotDetector:
 
         scale < 1 时在缩小图上找（光斑是个大团，缩小后照样能找到），
         找到的坐标再乘回去。这样在 CPU 弱的地瓜派上能省好几倍时间。
+
+        若配置了 roi_px 且已知光轴点（标定过），则改为"在光轴点周围
+        一小块里做全分辨率搜索"：光斑只有几个像素，缩放到 0.5 会被糊掉，
+        而全图全分辨率又太慢 —— ROI 让两者兼得，而且 ROI 本身就起门控作用。
         """
         cfg = self.cfg
+        ox = oy = 0
+        roi_active = False
+        if cfg.roi_px > 0:
+            center = self.boresight if self.boresight is not None else self.gate_center
+            R = int(cfg.roi_px)
+            if center is not None and frame.shape[0] > 2 * R and frame.shape[1] > 2 * R:
+                cx = int(round(center[0]))
+                cy = int(round(center[1]))
+                x0 = max(0, min(frame.shape[1] - 1, cx - R))
+                y0 = max(0, min(frame.shape[0] - 1, cy - R))
+                x1 = min(frame.shape[1], x0 + 2 * R)
+                y1 = min(frame.shape[0], y0 + 2 * R)
+                frame = frame[y0:y1, x0:x1]
+                ox, oy = x0, y0
+                scale = 1.0            # ROI 内用全分辨率（这正是要它的原因）
+                roi_active = True
         if scale and abs(scale - 1.0) > 1e-6 and scale > 0.05:
             sw = max(16, int(round(frame.shape[1] * scale)))
             sh = max(16, int(round(frame.shape[0] * scale)))
@@ -140,13 +173,26 @@ class LaserSpotDetector:
 
         b, g, r = cv2.split(small)
         # 用 cv2.subtract（饱和减，SIMD 优化过）比 numpy 的 int16 转换快好几倍
-        advantage = cv2.subtract(b, cv2.max(g, r))
-        # 蓝优势 + 亮度双条件
-        _, m1 = cv2.threshold(advantage, max(1, cfg.b_minus_others - 1), 255,
+        if str(cfg.mode).lower() in ("warm", "violet"):
+            # "够亮 + 暖色（红/品红）占优"：R（和 B）都比 G 明显高。
+            # 打印的红圈虽然也是红色，但它是**暗红**（亮度条件排掉）；
+            # 窗边/衣物的蓝色色散是 B 高、R/G 都低（亮度条件也排掉）。
+            advantage = cv2.subtract(cv2.min(b, r), g)
+            bright = cv2.min(cv2.min(b, g), r)
+            gap_min = max(1, cfg.violet_gap - 1)
+            br_min = max(1, cfg.bright_min - 1)
+        else:
+            advantage = cv2.subtract(b, cv2.max(g, r))
+            bright = b
+            gap_min = max(1, cfg.b_minus_others - 1)
+            br_min = max(1, cfg.b_min - 1)
+        # 颜色优势 + 亮度双条件
+        _, m1 = cv2.threshold(advantage, gap_min, 255,
                               cv2.THRESH_BINARY)
-        _, m2 = cv2.threshold(b, max(1, cfg.b_min - 1), 255, cv2.THRESH_BINARY)
+        _, m2 = cv2.threshold(bright, br_min, 255, cv2.THRESH_BINARY)
         mask = cv2.bitwise_and(m1, m2)
-        gate = self._gate_mask(small.shape, scale)
+        # ROI 生效时它本身就是门控，不用再加一层（坐标也不是全图的了）
+        gate = None if roi_active else self._gate_mask(small.shape, scale)
         if gate is not None:
             mask = cv2.bitwise_and(mask, gate)
         if cv2.countNonZero(mask) == 0:
@@ -163,9 +209,11 @@ class LaserSpotDetector:
         m = max(0, int(round(cfg.border_margin * scale)))
         best = None
         best_key = -1.0
+        # 面积门槛要跟着缩放走（面积按 scale^2 缩）
+        min_area = max(2, int(round(cfg.min_area * scale * scale)))
         for i in range(1, n_labels):
             area = int(stats[i, cv2.CC_STAT_AREA])
-            if area < cfg.min_area or area > max_area:
+            if area < min_area or area > max_area:
                 continue
             x0 = int(stats[i, cv2.CC_STAT_LEFT])
             y0 = int(stats[i, cv2.CC_STAT_TOP])
@@ -185,7 +233,7 @@ class LaserSpotDetector:
                     continue
             sub = labels[y0:y0 + h, x0:x0 + w] == i
             adv_sub = advantage[y0:y0 + h, x0:x0 + w]
-            b_sub = b[y0:y0 + h, x0:x0 + w]
+            b_sub = bright[y0:y0 + h, x0:x0 + w]
             score = float(adv_sub[sub].mean()) if area else 0.0
             brightness = float(b_sub[sub].mean()) if area else 0.0
             # 打分：蓝优势为主，面积作为次要因素（大一点更可能是激光而不是噪点）
@@ -201,6 +249,8 @@ class LaserSpotDetector:
             self._binary_centroid(sub, x0, y0)
         if inv != 1.0:
             uv = (uv[0] * inv, uv[1] * inv)      # 缩放图坐标 -> 原图坐标
+        if roi_active:
+            uv = (uv[0] + ox, uv[1] + oy)        # ROI 坐标 -> 原图坐标
         self.hits += 1
         self.misses = 0
         gated = self.learned

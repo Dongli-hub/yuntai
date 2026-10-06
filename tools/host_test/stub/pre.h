@@ -149,4 +149,14 @@ extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 extern SPI_HandleTypeDef   hspi2;
 
+/* 7) CubeMX 生成的外设初始化函数（main.c 里调用；本地桩环境补上声明，
+ *    这样 main.c 也能一起做语法检查 —— 曾经漏检过 main.c 里的 "}." 拼写错误，
+ *    直到 CubeIDE 编译才炸） */
+void MX_GPIO_Init(void);
+void MX_SPI2_Init(void);
+void MX_USART1_UART_Init(void);
+void MX_FDCAN1_Init(void);
+void MX_FDCAN2_Init(void);
+void SystemClock_Config(void);
+
 #endif /* __HOST_SYNTAX_STUB_PRE_H__ */

@@ -42,6 +42,9 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(find_default_config())
+    # 这个工具的用途就是"在整幅图里找光斑"（可能要重新标定光轴点），
+    # 所以必须关掉 ROI 限制做全图搜索，否则会陷入"只在我以为的位置附近找"。
+    cfg.laser.roi_px = 0
     if args.port:
         cfg.link_gimbal.port = args.port
     cfg.link_gimbal.enable = not args.no_gimbal

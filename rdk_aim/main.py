@@ -99,7 +99,7 @@ def cmd_run(args):
     opt = RunOptions(duration_s=args.duration, draw=args.draw, laps=args.laps,
                      auto_start_car=args.start_car, laser=not args.no_laser,
                      budget_s=args.budget, start_corner=args.car_corner,
-                     quiet=args.quiet)
+                     keep_aim=True, quiet=args.quiet)
     app = AimApp(cfg, opt)
     return app.run()
 

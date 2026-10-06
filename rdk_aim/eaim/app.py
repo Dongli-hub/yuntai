@@ -16,9 +16,11 @@
 并且每次转移都打印一行日志 —— 现场"卡在哪一步"一眼可见。
 """
 
+import math
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -53,6 +55,10 @@ class RunOptions:
     laser: bool = True               # 是否使用激光
     budget_s: float = 0.0            # 0 = 用配置里的
     start_corner: int = 0            # 小车起跑时所在的段（0=A..B）
+    # 到点后不退出、继续把激光压在靶心上（观察/拍照用；Ctrl-C 才退出）。
+    # 为什么需要：默认到点就切 STAB，偏置归零 -> 激光会离开靶心回到上电朝向，
+    # 看起来像"打中了又跑掉"。
+    keep_aim: bool = False
     stop_at_lap: bool = True         # 跑完设定圈数就结束
     quiet: bool = False
 
@@ -73,11 +79,24 @@ class AimApp:
         self.spot_detector = LaserSpotDetector(cfg.laser)
         self.aim = AimController(cfg.control, self.cam_model,
                                  cfg.calib.sign_yaw, cfg.calib.sign_pitch)
-        self.tracker = AlphaBetaTracker()
+        # α-β 跟踪器：α 是"多信新测量"，越小越平滑但越滞后。
+        # 实测（9fps + 检测本身有 ±20~40px 抖动）默认 0.45 太"跟"，环路会
+        # 追着检测噪声来回摆（表现为"激光一直晃、停不在一个点上"）。
+        # 这里降到 0.25；因为云台自身的运动已经被"命令偏置前馈"补偿掉了，
+        # 平滑带来的那点滞后不会再拖累跟踪。
+        # α 从 0.25 提到 0.8（见 ControlConfig.track_alpha 的说明）：
+        # 检测已经很稳，滤波滞后才是环路的主要延迟来源。
+        self.tracker = AlphaBetaTracker(
+            alpha=float(getattr(cfg.control, "track_alpha", 0.8)),
+            beta=float(getattr(cfg.control, "track_beta", 0.05)))
         self.trajectory = CircleTrajectory(cfg.draw, self.cam_model)
         self.sweep = SweepPlanner(cfg.acquire.mode, cfg.acquire.yaw_range_deg,
                                   cfg.acquire.pitch_range_deg,
-                                  cfg.acquire.step_deg)
+                                  cfg.acquire.step_deg,
+                                  center=(cfg.acquire.center_yaw_deg,
+                                          cfg.acquire.center_pitch_deg),
+                                  pitch_layers=getattr(cfg.acquire,
+                                                       "pitch_layers", None))
         self.rec: Optional[Recorder] = None
         self.state = State.INIT
         self.state_since = 0.0
@@ -100,6 +119,8 @@ class AimApp:
         self._lock_time: Optional[float] = None
         self._last_target_t = -1e9
         self._acquire_target_frames = 0
+        self._fine_pts: list = []
+        self._fine_i = 0
         self._last_rect = None
         self._lost_since: Optional[float] = None
         self._prev_state = State.INIT
@@ -124,6 +145,13 @@ class AimApp:
         self.detect_ok = 0
         self.spot_ok = 0
         self.spot_fallback = 0
+        self.gate_reject = 0        # 被"跳变门控"拦掉的误检帧数
+        self.detect_scale_fallback = 0   # 缩小图没检到、退回全图才检到的帧数
+        # ---- 命令偏置前馈预测（见 _process_vision 里的说明）----
+        self._ff_uv = None          # 最近一次实测靶心
+        self._ff_off = (0.0, 0.0)   # 那次实测时的云台偏置
+        self.pred_uv = None         # 由它外推出来的"本帧靶心应该在哪"
+        self._bs_rows = []          # 自动学的"距离 -> 光斑像素"表
 
     # ------------------------------------------------------------------
     # 装配
@@ -173,6 +201,15 @@ class AimApp:
             if not self.car_link.start():
                 self.log("小车链路未打开: %s"
                          % getattr(self.car_link, "error", ""), level="WARN")
+            # ---- 启动时下发"在线安全参数" ----
+            # 最要紧的是俯仰位置环增益：默认 KP=15/KI=45 会让俯仰轴自激
+            # （实测峰峰摆 115），而 IMU 装在俯仰轴下方、遥测里俯仰一直是"稳的"，
+            # 只有画面在跳 —— 表现就是"靶纸完整在画面里也检不到、误差收不敛"。
+            # 固件默认值虽已改，但这里每次启动都下发一遍，没重烧固件也能用。
+            for pid, val in getattr(cfg.link_gimbal, "startup_params", []) or []:
+                self.gimbal_link.send(proto.MsgId.PARAM,
+                                      proto.pack_param(pid, float(val)))
+                self.log("启动参数: 0x%02X = %g" % (pid, val), level="DBG")
         run_dir = cfg.app.run_dir
         if not os.path.isabs(run_dir):
             run_dir = os.path.join(os.path.dirname(os.path.dirname(
@@ -205,6 +242,8 @@ class AimApp:
                     cfg.acquire.dwell_ms, cfg.acquire.step_deg,
                     cfg.acquire.move_dps))
         self._set_state(State.BOOT_WAIT, time.monotonic())
+        # 云台保活线程：即使视觉卡住，AIM 也照发（否则 H723 的 0.5s 看门狗跳闸）
+        self._start_tx_thread()
         return True
 
     def _make_sim_link(self, kind: str):
@@ -232,8 +271,33 @@ class AimApp:
         extra = (" <- %s" % reason) if reason else ""
         self.log("状态 %s -> %s%s" % (old.label, new.label, extra))
         if new == State.ACQUIRE:
-            self.sweep.reset()
+            # 丢靶后从【丢靶前一刻的云台位置】开始左右找，而不是回到上电零位
+            # 重新扫一圈（用户实测要求：这样找回来快得多）。
+            # 第一次捕获时 aim 的偏置就是 (0,0) = 上电朝向，行为不变。
+            self.sweep.set_center(self.aim.yaw_deg, self.aim.pitch_deg)
             self._acquire_target_frames = 0
+            # 上一轮扫描留下的"当前目标点"必须清掉：否则重新进入 ACQUIRE 时
+            # 会直接沿用上次的点位（还带着 old 的到位时间戳），扫描节奏全乱。
+            self._scan_tgt = None
+            self._scan_arrived_t = 0.0
+            # ---- 两档扫描：先"就近细扫"，再"大范围扫描" ----
+            # 刚刚还在跟踪（fine_recent_s 秒内看到过靶纸）-> 说明靶纸就在附近，
+            # 大概率只是漏了几帧，先以当前位置为中心 ±16° 慢慢找；
+            # 细扫走完还是没有 -> 才交给 ±175° 的大范围扫描。
+            # 现场踩过的坑：丢了就甩 60° 大格扫描，靶纸早飞出画面，
+            # 表现为"光斑在靶纸宽度内来回匀速摆、永远停不下来"。
+            acq = self.cfg.acquire
+            recent = (now - self._last_target_t) < acq.fine_recent_s
+            if recent and acq.fine_span_deg > 0.5:
+                self._fine_pts = self.sweep.fine_points(
+                    (self.aim.yaw_deg, self.aim.pitch_deg),
+                    acq.fine_span_deg, acq.fine_step_deg, acq.fine_pitch_deg)
+                self._fine_i = 0
+                self.log("就近细扫：以当前位姿为中心 ±%.0f°，%d 个点位"
+                         % (acq.fine_span_deg, len(self._fine_pts)), level="DBG")
+            else:
+                self._fine_pts = []
+                self._fine_i = 0
         if new == State.LOST:
             self._lost_since = now
         if new == State.FAULT:
@@ -248,6 +312,16 @@ class AimApp:
 
     def shutdown(self) -> None:
         self._running = False
+        # 先把保活线程停掉，免得它在关闭链路之后又去写串口
+        self._tx_stop = getattr(self, "_tx_stop", None)
+        if self._tx_stop is not None:
+            self._tx_stop.set()
+        th = getattr(self, "_tx_thread", None)
+        if th is not None:
+            try:
+                th.join(timeout=0.5)
+            except Exception:
+                pass
         try:
             self.log("退出：切换到 STAB 并关激光（云台仍保持稳定）")
             self._safe_mode()
@@ -300,12 +374,28 @@ class AimApp:
         self._running = True
         loop_period = 1.0 / max(30.0, min(240.0, self.cfg.camera.fps * 2.0))
         deadline = (self.t0 + self.opt.duration_s) if self.opt.duration_s > 0 else None
+        held = False
+        # SIGTERM（kill / timeout 命令）默认直接杀进程、跳过所有收尾 —— 那样
+        # H723 会一直保持在最后一个偏置上，下一次锁零就把零点记歪（实测踩过）。
+        # 这里把它变成优雅退出：循环退出后的 finally 会切回 STAB。
+        try:
+            import signal
+
+            def _on_term(_sig, _frm):
+                self.log("收到终止信号，切回 STAB 后退出", level="WARN")
+                self._running = False
+
+            signal.signal(signal.SIGTERM, _on_term)
+        except Exception:                                      # noqa: BLE001
+            pass
         try:
             while self._running:
                 t_loop = time.monotonic()
                 if deadline is not None and t_loop >= deadline:
-                    self.log("到达设定运行时长，退出")
-                    break
+                    if not held:
+                        held = True
+                        self.log("到达设定运行时长（统计口径到此为止）——"
+                                 "继续实时瞄准，不打完不撒手；Ctrl-C 才退出")
                 frame, _ = self.camera.read()
                 new_frame = frame is not None
                 if frame is not None:
@@ -342,21 +432,122 @@ class AimApp:
         # 检测在缩小图上做（地瓜派 CPU 是瓶颈：全分辨率 111ms/帧 = 9fps，
         # 缩到 0.5 后约 30ms/帧 = 30fps；瞄准精度不受影响，见 target.detect 注释）
         scale = cfg.camera.process_scale
-        self.target = self.detector.detect(image, scale)
-        if self.target is not None and \
-                self.target.confidence >= cfg.target.min_confidence:
-            self.detect_ok += 1
-            self._last_target_t = t
-            if self.target.rect is not None:
-                self._last_rect = self.target.rect
-        elif self.target is not None:
-            self.target = None        # 置信度不够就当没看到
-        # 光斑
+        # ---- 光斑先检 ----
+        # 两个原因：① 靶纸检测要用光斑位置去"补"黑胶带上被打亮的洞
+        # （否则靶心落在 u≈500 这种位姿时，激光正好打在胶带上，
+        #   胶带环断开 -> 连续丢靶 -> 云台锁一下丢一下地来回摆）；
+        # ② 光斑本身走的是 ROI，很快，先检不会拖慢整体。
         self.spot = None
         if self._laser_on():
             self.spot = self.spot_detector.detect(image, scale)
         if self.spot is not None:
             self.spot_ok += 1
+        spot_arg = None
+        if self.spot is not None and self.spot.area > 0:
+            spot_arg = (self.spot.uv[0], self.spot.uv[1],
+                        math.sqrt(self.spot.area / math.pi))
+        # ---- 跟踪快通道：锁定/跟踪时只在靶心附近找 ----
+        # 全图 1280x720 的二值化+找轮廓是单帧耗时的大头（实测 110~210ms，
+        # 也就是 5~9fps，视觉环的延时主要来自这里）。锁定之后靶心位置已知，
+        # 裁一块以它为中心的正方形就够，实测能省 60% 以上时间。
+        # ROI 里没检到会自动退回全图，所以不会因此丢靶。
+        roi = None
+        if (self.state in (State.LOCK, State.TRACK, State.DRAW)
+                and getattr(self.tracker, "initialized", False)):
+            try:
+                tu, tv = float(self.tracker.pos[0]), float(self.tracker.pos[1])
+                rr = float(getattr(cfg.target, "roi_track_px", 260.0))
+                # rr <= 40 视为"关掉快通道"（方便现场 A/B 对比）
+                if rr > 40.0 and 0.0 <= tu < image.shape[1] \
+                        and 0.0 <= tv < image.shape[0]:
+                    roi = (tu, tv, rr)
+            except Exception:                                  # noqa: BLE001
+                roi = None
+        self.target = self.detector.detect(image, scale, spot=spot_arg, roi=roi)
+        # ---- 降分辨率提速的保险 ----
+        # 现场实测（2026-09-30）：process_scale=0.65 时单帧从 ~100ms 降到 ~60ms，
+        # 近距离 8/8 全检出；但靶纸变远（>0.9m）时胶带只剩几个像素，缩小图可能
+        # 检不到。所以"缩小图没检到 -> 全图再找一遍"，用一点点时间换不漏靶。
+        if (self.target is None and scale < 0.999
+                and self.state in (State.LOCK, State.TRACK, State.DRAW)):
+            self.target = self.detector.detect(image, 1.0, spot=spot_arg)
+            if self.target is not None:
+                self.detect_scale_fallback += 1
+        if self.target is not None and \
+                self.target.confidence < cfg.target.min_confidence:
+            self.target = None            # 置信度不够就当没看到
+        if self.target is not None:
+            # ---- 跳变门控（只在"已经在跟踪"时生效）----
+            # 云台跟踪阶段不可能一瞬间把靶心挪几百像素，出现这种跳变一定是
+            # 误检（别的四边形/反光被当成靶纸）——实测会把环路一把拽走，
+            # 表现就是"俯仰突然上下摆动一下又回来"。这里直接丢掉这一帧。
+            # 连续丢失超过 1s 后门控失效，避免真的换了靶纸后永远锁不上。
+            #
+            # ⚠⚠ 2026-09-27 晚 现场抓到的致命 bug：门控【必须扣掉云台自己的运动】。
+            #   原来拿"上一次检出的像素位置"当基准，可云台在这中间是按我们自己的
+            #   指令转的：靶纸在画面里移动 266px 是【指令造成的】，
+            #   却被判成"跳变误检"丢掉 -> 连续 1 秒没结果 -> 判丢靶 -> 重新扫描。
+            #   实测日志：60° 处锁定 uv=(417,384)，伺服把偏置往 +7° 拉，
+            #   靶心跟着走到 ~683px（>120px 门限），于是整整 1.05s 全被门控吃掉。
+            #   现在改成：先按"命令偏置变化 × px/°"预测靶心该在哪，再和预测比。
+            last = getattr(self, "_gate_uv", None)
+            last_t = getattr(self, "_gate_t", 0.0)
+            off_now = (self.aim.yaw_deg, self.aim.pitch_deg)
+            gate_off = getattr(self, "_gate_off", off_now)
+            pred_u = last[0] + (off_now[0] - gate_off[0]) * self.aim.px_per_deg_u \
+                if last is not None else 0.0
+            pred_v = last[1] + (off_now[1] - gate_off[1]) * self.aim.px_per_deg_v \
+                if last is not None else 0.0
+            if (last is not None and self.state in (State.LOCK, State.TRACK,
+                                                    State.DRAW)
+                    and (t - last_t) < 1.0 and
+                    math.hypot(self.target.uv[0] - pred_u,
+                               self.target.uv[1] - pred_v) > cfg.target.jump_gate_px):
+                self.gate_reject += 1
+                self.target = None
+            else:
+                self._gate_uv = self.target.uv
+                self._gate_t = t
+                self._gate_off = off_now
+                self.detect_ok += 1
+                self._last_target_t = t
+                if self.target.rect is not None:
+                    self._last_rect = self.target.rect
+        # ---- ① 命令偏置前馈预测：把 ~9fps 的观测"连续化" ----
+        # 相机只有 9fps、云台还有延迟，靠"像素速度外推"很不准（实测表现就是
+        # 飘忽）。但"云台转了多少"是我们自己下发的命令（已知、无噪声），所以：
+        #     靶心预测位置 = 上次实测位置 + (当前偏置 - 那次实测时的偏置) × px/°
+        # 掉帧时用这个预测顶上（_state_aiming 里用），比速度外推稳得多，
+        # 而且它天然补偿了云台自身的运动（相当于把已知量从观测里扣掉）。
+        # 用【实测姿态】而不是【命令偏置】推算靶心该在哪：
+        #   命令偏置发下去之后，云台要过 0.3~1s 才真的转到位。拿命令去外推，
+        #   等于提前把"还没发生的转动"算进去 —— 环路以为已经到了，
+        #   于是继续积偏置，等平台真转过来就冲过头，形成左右摆。
+        #   改用遥测里的实际姿态（gz_yaw/gz_pitch）后，外推的是真发生过的转动，
+        #   环路就不会跟自己较劲。没有遥测时自动退回原来的命令外推。
+        att_now = None
+        gz = self.gimbal
+        if gz is not None and bool(getattr(gz, "ready", lambda: False)()):
+            att_now = (float(gz.yaw_deg), float(gz.pitch_deg))
+        lead_src = att_now if att_now is not None else \
+            (self.aim.yaw_deg, self.aim.pitch_deg)
+        if self.target is not None:
+            self._ff_uv = (float(self.target.uv[0]), float(self.target.uv[1]))
+            self._ff_off = lead_src
+        self.pred_uv = None
+        if self._ff_uv is not None:
+            self.pred_uv = (
+                self._ff_uv[0] + (lead_src[0] - self._ff_off[0]) * self.aim.px_per_deg_u,
+                self._ff_uv[1] + (lead_src[1] - self._ff_off[1]) * self.aim.px_per_deg_v)
+
+        # ---- ② 自动学"距离 -> 光斑像素位置"表 ----
+        # 用户要求：先用外框面积估距离，再用距离把激光点映射到画面里的位置。
+        # 这里不需要手工标定：光斑检到时顺手把 (距离, 光斑像素) 记下来，
+        # 按距离分档慢速更新；光斑检不到时 _spot_uv() 就用这张表插值兜底。
+        if (self.spot is not None and self.target is not None
+                and self.target.distance_m > 0.2):
+            self._learn_boresight(self.target.distance_m, self.spot.uv)
+
         # 跟踪滤波
         uv = self.target.uv if self.target is not None else None
         self.track = self.tracker.update(uv, t,
@@ -366,6 +557,52 @@ class AimApp:
             self.trajectory.set_target(self._last_rect)
 
     def _spot_uv(self) -> Optional[Tuple[float, float]]:
+        return self._spot_uv_impl()
+
+    def _att_rel(self) -> Optional[Tuple[float, float]]:
+        """云台【实测姿态】相对锁零基准的变化量（度）。
+
+        锁零那一刻（SET_ZERO）的姿态就是"偏置 0"，把它记下来；
+        之后 gz_yaw - 基准 = 平台真正转过去的角度 —— 用它才能知道
+        "平台到底跟没跟上指令"。没遥测/没锁零时返回 None（调用方自动跳过）。
+        """
+        gz = self.gimbal
+        if gz is None:
+            return None
+        try:
+            if not gz.ready():
+                return None
+        except Exception:                                      # noqa: BLE001
+            return None
+        base = getattr(self, "_att_zero", None)
+        if base is None:
+            return None
+        return (float(gz.yaw_deg) - base[0], float(gz.pitch_deg) - base[1])
+
+    def _learn_boresight(self, dist_m: float, uv) -> None:
+        """把 (距离, 光斑像素) 记进表里：光斑检不到时按距离插值兜底。
+
+        为什么按距离分档：激光和相机不同轴，光斑在画面里的位置是距离的函数
+        （角度 ≈ 两轴夹角 + 平移/距离），固定一个像素点只在标定距离上准。
+        这里不手工标定——只要光斑能检到就顺手更新，2cm 内算同一档，
+        每档慢速收敛（0.25 的步长，抗偶发误检）。
+        """
+        rows = self._bs_rows
+        for r in rows:
+            if abs(r[0] - dist_m) < 0.02:
+                r[1] += 0.25 * (float(uv[0]) - r[1])
+                r[2] += 0.25 * (float(uv[1]) - r[2])
+                break
+        else:
+            rows.append([float(dist_m), float(uv[0]), float(uv[1])])
+            rows.sort(key=lambda r: r[0])
+            del rows[12:]                    # 最多留 12 档，够覆盖 0.4~2m
+        try:
+            self.spot_detector.set_boresight_table(rows)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    def _spot_uv_impl(self) -> Optional[Tuple[float, float]]:
         if self.spot is not None:
             return self.spot.uv
         # 光斑没检到时的兜底顺序：
@@ -541,9 +778,35 @@ class AimApp:
                     self.t0 = now
                     self.log("收到触发，开始计时（预算 %.1fs）" % self.opt.budget_s)
                 return
+            # ---- 重新锁零之前，先把云台送回它自己的基准位 ----
+            # SET_ZERO 的含义是"把当前电机角记成新的零点"。如果上一次运行
+            # 是被 Ctrl-C / kill 掉的（没走到收尾，H723 还保持在某个扫描偏置上），
+            # 直接 SET_ZERO 就会把零点记到那个偏置上：之后"偏置 0"指向别处。
+            # 实测踩过：俯仰基准被挪了 36.7°（正好一个扫描档位），云台一进
+            # STAB 就对着天花板，而且怎么调都找不回来（只能重启 H723）。
+            # 所以先发 STAB + 偏置 0，等它真的转回旧基准，再锁零。
+            t_pre = getattr(self, "_pre_zero_t", 0.0)
+            if t_pre == 0.0:
+                self._pre_zero_t = now
+                self.log("锁零前先回基准位（STAB + 偏置清零，等 1.2s）")
+            self.gimbal_link.send(proto.MsgId.MODE, proto.pack_mode(AimMode.STAB))
+            self.gimbal_link.send(proto.MsgId.AIM,
+                                  proto.pack_aim(0.0, 0.0, 0, 0))
+            # 等 1 秒让云台回到基准位即可 —— 陀螺零偏的标定现在由 H723
+            # 自己在 LOCK 阶段（电机已使能、轴被按住）完成，比这里等更准，
+            # 而且上位机本来就是等 READY 位才走到这一步的。
+            if now - t_pre < 1.0:
+                return
             self.aim.reset(0.0, 0.0)
             self.trajectory.reset()
             self.tracker.reset()
+            # 锁零这一刻的姿态 = 偏置 0 的基准，记下来给"防超前"限幅用
+            gz0 = self.gimbal
+            if gz0 is not None:
+                try:
+                    self._att_zero = (float(gz0.yaw_deg), float(gz0.pitch_deg))
+                except Exception:                              # noqa: BLE001
+                    self._att_zero = None
             self.gimbal_link.send(proto.MsgId.SET_ZERO, b"")
             self._set_state(State.ACQUIRE, now,
                             "云台就绪 state=%d" % self.gimbal.state)
@@ -564,32 +827,127 @@ class AimApp:
 
     def _state_acquire(self, now: float, new_frame: bool = True) -> None:
         acq = self.cfg.acquire
-        if now - self.state_since > acq.timeout_s:
+        # timeout_s <= 0 表示"一直找，不放弃"（台架定点测试用）。
+        # 默认 12s 是为了比赛：找不到就进 FAULT 停住，别让云台一直转。
+        if acq.timeout_s > 0 and now - self.state_since > acq.timeout_s:
             self._set_state(State.FAULT, now,
                             "扫描 %.1fs 未找到靶纸" % acq.timeout_s)
             return
         if not new_frame:
             return
-        settled = (now - getattr(self, "_sweep_move_t", 0.0)) * 1000.0 >= acq.settle_ms
-        if self.target is not None and settled:
-            self._acquire_target_frames += 1
-        elif self.target is None:
+
+        # ---- 1) 朝当前扫描点【缓慢】移动 ----
+        # 为什么限速：以前是直接把偏置一步设过去，轴以最快速度甩过去
+        # （日志里 "P p=109 t=172 o=120"：差 63° 还在追），拍到的全是运动模糊帧，
+        # 结果"扫一圈什么都找不到"。现在按 scan_dps 慢慢挪，挪到位再判。
+        tgt = getattr(self, "_scan_tgt", None)
+        if tgt is None:
+            # ⚠ 扫描点位要夹到偏置限幅之内（yaw ±170 / pitch ±60）。
+            #   SweepPlanner 会给出 ±175 这种点，而 AimController.set_offset()
+            #   会把它夹回 170 —— 到位判定永远不满足，扫描就卡在那一格不动
+            #   （现场表现："扫了两下就停住、再也不动了"）。实测踩过。
+            sy, sp = self._next_scan_point()
+            ctl = self.cfg.control
+            # 单向扫一圈时偏置会走到 360°，扫描限幅要单独放宽（跟踪限幅不变）
+            ylim = float(getattr(ctl, "max_yaw_scan_deg", 400.0)) \
+                if getattr(self.sweep, "one_way", False) else ctl.max_yaw_deg
+            tgt = (max(-ylim, min(ylim, sy)),
+                   max(-ctl.max_pitch_deg, min(ctl.max_pitch_deg, sp)))
+            self._scan_tgt = tgt
+            self._scan_arrived_t = 0.0
+            if getattr(self, "_scan_from_fine", False):
+                pass                     # 细扫的点已经在 _next_scan_point 里打过日志
+            elif self.sweep.index <= 3 or self.sweep.index % 5 == 1:
+                self.log("扫描 %d/%d -> (%.0f°, %.0f°)"
+                         % (self.sweep.index, len(self.sweep), tgt[0], tgt[1]),
+                         level="DBG")
+        dt = max(1e-3, now - getattr(self, "_scan_step_t", now))
+        self._scan_step_t = now
+        fine = bool(self._fine_pts) and self._fine_i <= len(self._fine_pts)
+        dps = acq.fine_scan_dps if fine else acq.scan_dps
+        step = max(5.0, dps) * dt
+        cy, cp = self.aim.yaw_deg, self.aim.pitch_deg
+        dy = max(-step, min(step, tgt[0] - cy))
+        # ⚠ 俯仰单独限速（很慢）：用户实测反馈"俯仰电机寻找时上下摆动太快"。
+        #   俯仰层只在换层时动一次，慢一点既省时间也不会把画面甩糊。
+        dstep = max(4.0, float(getattr(acq, "pitch_scan_dps", 25.0))) * dt
+        dp = max(-dstep, min(dstep, tgt[1] - cp))
+        self.aim.set_offset(cy + dy, cp + dp,
+                            yaw_limit_deg=float(getattr(
+                                self.cfg.control, "max_yaw_scan_deg", 400.0)))
+        if abs(tgt[0] - (cy + dy)) > 1e-3 or abs(tgt[1] - (cp + dp)) > 1e-3:
+            # 还在路上：不看检测结果（模糊帧不算数）
+            self._scan_arrived_t = 0.0
             self._acquire_target_frames = 0
-        if self._acquire_target_frames >= 2:
+            return
+        if getattr(self, "_scan_arrived_t", 0.0) == 0.0:
+            self._scan_arrived_t = now        # 刚刚到位
+        # ---- 光"命令到位"还不够，必须等【平台真的停稳】再取帧 ----
+        # 现场逐帧数据（2026-09-30）：扫描点时命令是瞬间到的（200°/s），
+        # 可平台还在以几百°/s 追过来 —— 判定却在命令到位后立刻开始，
+        # 拍到的帧全是运动模糊，靶纸一掠而过（日志里 44.4s 就是这样：
+        # 检出时平台还在从 -120° 往回走，0.1s 后靶纸就飞出画面 -> 判丢靶）。
+        # 做法：用遥测里的实际姿态算角速度，还在动就重新计时。
+        gz = self.gimbal
+        if gz is not None:
+            try:
+                att = (float(gz.yaw_deg), float(gz.pitch_deg))
+                prev_att = getattr(self, "_scan_att", None)
+                self._scan_att = att
+                if prev_att is not None:
+                    dt_a = max(1e-3, now - getattr(self, "_scan_att_t", now))
+                    rate = max(abs(att[0] - prev_att[0]),
+                               abs(att[1] - prev_att[1])) / dt_a
+                    if rate > float(getattr(acq, "settle_rate_dps", 8.0)):
+                        self._scan_arrived_t = 0.0     # 还在飞 -> 重新计时
+                        return
+                self._scan_att_t = now
+            except Exception:                                  # noqa: BLE001
+                pass
+        settle_ms = acq.fine_settle_ms if fine else acq.settle_ms
+        dwell_ms = acq.fine_dwell_ms if fine else acq.dwell_ms
+        if (now - self._scan_arrived_t) * 1000.0 < settle_ms:
+            return                            # 再等它停稳（避开伺服余振）
+
+        # ---- 2) 停稳了：只要连续 confirm_frames 帧看到靶纸就开始打 ----
+        if self.target is not None:
+            self._acquire_target_frames += 1
+        else:
+            self._acquire_target_frames = 0
+        if self._acquire_target_frames >= max(1, acq.confirm_frames):
             self.aim.clear_lock()
             self._set_state(State.LOCK, now,
                             "检出靶纸 conf=%.2f %s"
                             % (self.target.confidence, self.target.describe()))
             return
-        if now >= getattr(self, "_sweep_next_t", 0.0):
-            yaw, pitch = self.sweep.next_point()
-            self.aim.set_offset(yaw, pitch)
-            self._sweep_move_t = now
-            self._sweep_next_t = now + acq.dwell_ms / 1000.0
-            if self.sweep.index % 6 == 1:
-                self.log("扫描 %d/%d -> (%.0f°, %.0f°)"
-                         % (self.sweep.index, len(self.sweep), yaw, pitch),
+
+        # ---- 3) 这个点看够了，换下一个 ----
+        # 注意：判定窗口必须 >= settle + confirm_frames 个帧周期，否则会出现
+        # "还没攒够连续 2 帧就换点"-> 什么都检不到（提速后实测踩过：
+        # dwell 120ms < 2 帧(9fps≈220ms)，第一点明明有靶纸却直接跳走了）。
+        judge_ms = max(dwell_ms,
+                       120.0 + 160.0 * max(1, acq.confirm_frames))
+        if (now - self._scan_arrived_t) * 1000.0 >= settle_ms + judge_ms:
+            self._scan_tgt = None
+
+    def _next_scan_point(self):
+        """扫描取点：先把"就近细扫"的点走完，再交给大范围扫描规划器。"""
+        if self._fine_pts and self._fine_i < len(self._fine_pts):
+            pt = self._fine_pts[self._fine_i]
+            self._fine_i += 1
+            self._scan_from_fine = True
+            if self._fine_i == 1 or self._fine_i % 4 == 0:
+                self.log("细扫 %d/%d -> (%.0f°, %.0f°)"
+                         % (self._fine_i, len(self._fine_pts), pt[0], pt[1]),
                          level="DBG")
+            return pt
+        if self._fine_pts:
+            # 细扫走完还没看到靶纸 -> 放开大范围扫描（只提示一次）
+            self._fine_pts = []
+            self._fine_i = 0
+            self.log("就近细扫未找到，转入大范围扫描", level="DBG")
+        self._scan_from_fine = False
+        return self.sweep.next_point()
 
     def _state_lost(self, now: float) -> None:
         age = now - self._last_target_t
@@ -616,6 +974,10 @@ class AimApp:
         if self.track.valid:
             setpoint = self.track.uv
             velocity = self.track.vel
+        elif self.pred_uv is not None:
+            # 本帧没测到（或刚过滑行期）：用"命令偏置前馈"的预测顶上。
+            # 比 tracker 的像素速度外推稳得多 —— 命令是我们自己下的、无噪声。
+            setpoint = self.pred_uv
         if self.state == State.DRAW:
             status = self.trajectory.update(now)
             self.draw_status = status
@@ -638,7 +1000,8 @@ class AimApp:
                 setpoint = None
         out = self.aim.update(now, dt, setpoint if self.track.valid or
                               self.state == State.DRAW else None,
-                              velocity, self._spot_uv())
+                              velocity, self._spot_uv(),
+                              att_rel=self._att_rel())
         self.aim_out = out
         if out.locked and self._lock_time is None:
             self._lock_time = now
@@ -677,13 +1040,89 @@ class AimApp:
 
     # ------------------------------------------------------------------
     def _send(self, now: float) -> None:
+        """主循环里的发送：只负责小车链路。
+
+        云台（AIM/MODE）改由独立线程按固定频率发 —— 见 _start_tx_thread()。
+        """
+        if self.car_link is None:
+            return
+        out = getattr(self, "aim_out", None)
+        car_hz = max(1.0, self.cfg.link_car.tx_hz)
+        if now - self._last_car_tx < 1.0 / car_hz:
+            return
+        self._last_car_tx = now
+        err_u = out.err_u if out is not None else 0.0
+        err_v = out.err_v if out is not None else 0.0
+        flags = 0
+        if self._laser_on():
+            flags |= AimFlags.LASER_ON
+        if out is not None:
+            if out.valid:
+                flags |= AimFlags.AIM_VALID
+            if out.boost:
+                flags |= AimFlags.BOOST
+            if out.locked:
+                flags |= AimFlags.LOCKED
+        if self.state == State.DRAW:
+            flags |= AimFlags.DRAWING
+        quality = out.quality if out is not None else 0
+        self.car_link.send(proto.MsgId.AIM_STATE,
+                           proto.pack_aim_state(bool(out and out.locked),
+                                                int(self.state), quality,
+                                                flags, err_u, err_v))
+
+    # ------------------------------------------------------------------
+    def _start_tx_thread(self) -> None:
+        """独立线程：按固定频率给 H723 发 MODE + AIM。
+
+        为什么必须单独开线程（2026-09-27 晚 现场事故）：H723 侧有一个 0.5s 的
+        AIM 看门狗，超时就自动降级到 STAB 并清零偏置。而上位机是单线程模型，
+        检测偶尔会卡 0.4~0.55 秒（全分辨率二值化 + 多个候选透视矫正，
+        实测帧间隔分布里 0.4~0.55s 出现了 74 次）—— 这段时间发不出 AIM，
+        看门狗就跳闸。跳闸之后 H723 不会自己回来，而上位机还以为在 AIM，
+        于是偏置被一路积分到限幅、画面却不动（这就是现场"云台没反应"的真凶）。
+        把发送搬到独立线程之后，哪怕检测卡住一秒，链路也一直是活的。
+        """
+        if self.gimbal_link is None:
+            return
+        self._tx_stop = threading.Event()
+
+        def _loop():
+            period = 1.0 / max(1.0, min(200.0, self.cfg.link_gimbal.tx_hz))
+            while not self._tx_stop.is_set():
+                t0 = time.monotonic()
+                try:
+                    self._send_gimbal(t0)
+                except Exception:                              # noqa: BLE001
+                    pass
+                slack = (t0 + period) - time.monotonic()
+                if slack > 0:
+                    time.sleep(slack)
+
+        self._tx_thread = threading.Thread(target=_loop, name="aim_tx", daemon=True)
+        self._tx_thread.start()
+
+    def _send_gimbal(self, now: float) -> None:
+        """给 H723 发 MODE（周期性重发）+ AIM（当前偏置与标志）。"""
         if self.gimbal_link is None:
             return
         mode = self._desired_mode()
-        if mode != getattr(self, "_sent_mode", None):
+        # ⚠ 2026-09-27 晚 现场事故：H723 侧有"0.5s 收不到 AIM 就自动降级到 STAB"
+        #   的安全看门狗。一旦触发（串口卡顿、上位机被调度走），H723 会自己
+        #   回到 STAB 并且**不会再回到 AIM** —— 而上位机这边只在"模式变化时"
+        #   才下发 MODE，于是它一直以为还在 AIM：偏置被积分到 ±170°/-60° 的
+        #   限幅上，画面却一动不动（实测记录的 yaw 就是从 0 一路爬到 170）。
+        #   现在：① 每 mode_reassert_s 秒无条件下发一次 MODE（同值重发在固件里
+        #   是空操作，不刷日志）；② 偏置被夹住时冻结积分，避免风阻式累积。
+        last_mode_t = getattr(self, "_last_mode_t", 0.0)
+        if (mode != getattr(self, "_sent_mode", None)
+                or (now - last_mode_t) >= self.cfg.link_gimbal.mode_reassert_s):
             self.gimbal_link.send(proto.MsgId.MODE, proto.pack_mode(mode))
+            changed = mode != getattr(self, "_sent_mode", None)
             self._sent_mode = mode
-            self.log("下发模式 %s" % AimMode.name_of(mode), level="DBG")
+            self._last_mode_t = now
+            if changed:
+                self.log("下发模式 %s" % AimMode.name_of(mode), level="DBG")
         tx_hz = max(1.0, self.cfg.link_gimbal.tx_hz)
         if now - self._last_tx < 1.0 / tx_hz:
             return
@@ -705,16 +1144,16 @@ class AimApp:
         self.gimbal_link.send(proto.MsgId.AIM,
                               proto.pack_aim(self.aim.yaw_deg, self.aim.pitch_deg,
                                              flags, quality))
-        # 给小车报"锁定状态"，让小车可以做联锁或降速（可选）
-        car_hz = max(1.0, self.cfg.link_car.tx_hz)
-        if now - self._last_car_tx >= 1.0 / car_hz:
-            self._last_car_tx = now
-            err_u = out.err_u if out is not None else 0.0
-            err_v = out.err_v if out is not None else 0.0
-            self.car_link.send(proto.MsgId.AIM_STATE,
-                               proto.pack_aim_state(bool(out and out.locked),
-                                                    int(self.state), quality,
-                                                    flags, err_u, err_v))
+        # 偏置顶到限幅 = 环路被打开（云台没在 AIM 模式、或者机构卡住）。
+        # 现场实测就是靠这个现象才定位到"H723 偷偷降级回 STAB"。
+        ctl = self.cfg.control
+        if (abs(self.aim.yaw_deg) > ctl.max_yaw_deg - 1.0
+                or abs(self.aim.pitch_deg) > ctl.max_pitch_deg - 1.0):
+            if now - getattr(self, "_sat_warn_t", -1e9) > 3.0:
+                self._sat_warn_t = now
+                self.log("偏置顶到限幅 (%.0f°, %.0f°) —— 云台没跟上指令，"
+                         "检查是否被切回 STAB / 机构卡住"
+                         % (self.aim.yaw_deg, self.aim.pitch_deg), level="WARN")
 
     # ------------------------------------------------------------------
     # 记录与显示

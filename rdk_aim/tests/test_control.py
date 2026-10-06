@@ -67,6 +67,44 @@ def test_aim_converges_zero_error():
     assert errs[20] < 1.0, "20 帧内应收敛，实际 %.2fpx" % errs[20]
 
 
+def test_aim_proportional_fast_when_attitude_known():
+    """P+I（有实测姿态）必须"几步到位"且不过冲 —— 这是 2026-09-30 的主控制律。
+
+    结构：yaw_cmd = 实测姿态 + kp_p × 误差角度 + 积分量
+      · 没遥测时不能用 P（没有锚点会逐帧叠加，这个 bug 单元测试抓到过）；
+      · 有遥测时误差按 (1-kp_p) 的比例逐帧衰减：kp_p=0.55 → 6 帧剩 0.45^6≈0.8%。
+    """
+    cfg = ControlConfig()
+    cfg.kp_p = 0.55
+    cfg.kp = 0.05
+    cam = CameraModel(700.0, 700.0, 640.0, 360.0)
+    aim = AimController(cfg, cam)
+    ppd = aim.px_per_deg_u
+    e0 = 300.0
+    spot = (640.0, 360.0)
+    att = [0.0, 0.0]
+    uv = (640.0 + e0, 360.0)
+
+    def follow(out):
+        att[0] = out.yaw_deg            # 假设云台立刻跟到位
+        att[1] = out.pitch_deg
+        return (640.0 + e0 - att[0] * ppd, 360.0 - att[1] * aim.px_per_deg_v)
+
+    for i in range(10):
+        out = aim.update(i * 0.1, 0.1, uv, (0.0, 0.0), spot,
+                         att_rel=(att[0], att[1]))
+        uv = follow(out)
+        # 允许 20% 的余量：积分项会略微多给一点（随后自己退回来），
+        # 这里只防"P 项把偏置一次性推过头很多"这种真失效。
+        assert out.yaw_deg <= (e0 / ppd) * 1.2, "P 项过冲太多：%.3f°" % out.yaw_deg
+    # 注意：这里的"被控对象"是**理想零滞后**（命令给多少平台立刻到位），
+    # 而 D 项的作用是"误差在快速缩小时先松一点油门"，在这种理想对象上
+    # 只会拖慢收敛、拿不到任何好处；真实云台有 0.3~1s 滞后，D 项在那时
+    # 才发挥防过冲的作用。所以这里只要求"300px 在 10 帧内收敛到 15% 以内"，
+    # 真正的防过冲由上面那条 1.2 倍上限保证。
+    assert abs(uv[0] - 640.0) < 45.0, "10 帧后误差还剩 %.1fpx" % (uv[0] - 640.0)
+
+
 def test_kp_stability_boundary_matches_theory():
     """稳定边界 kp < 2*sin(45°/(d+0.5))，d = 环路延迟帧数。
 
@@ -190,3 +228,67 @@ def test_circle_phase_never_jumps():
             max_step = max(max_step, math.hypot(sp[0] - prev[0], sp[1] - prev[1]))
         prev = sp
     assert max_step < 12.0, "设定点单帧最大跳变 %.1fpx 太大" % max_step
+
+
+def test_sweep_is_zigzag_by_distance():
+    """扫描顺序必须是"由近及远、一左一右"，而不是先绕一圈。
+
+    用户实测要求：靶纸偏一点点时，前两个点就该扫到，不用先转 300°。
+    期望（一层一层扫；层内由近及远、一左一右）：
+        (0,0) -> (60,0) -> (-60,0) -> (120,0) -> (-120,0) -> ...
+    俯仰只在换层时动，避免"上下大幅摆动"。
+    """
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from eaim.state_machine import SweepPlanner
+
+    sp = SweepPlanner("spiral", 175.0, 35.0, 60.0)
+    pts = [sp.next_point() for _ in range(5)]
+    assert pts == [(0.0, 0.0), (60.0, 0.0), (-60.0, 0.0),
+                   (120.0, 0.0), (-120.0, 0.0)], pts
+    # 第一个点必须是正前方（上电朝向），这样"本来就朝着靶纸"时立刻命中
+    assert pts[0] == (0.0, 0.0)
+
+
+def test_sweep_circle_mode_goes_one_way():
+    """单向扫一圈（用户 2026-09-30 要求）：0→60→120→180→240→300，不来回甩。"""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from eaim.state_machine import SweepPlanner
+
+    sp = SweepPlanner("circle", 180.0, 10.0, 60.0,
+                      pitch_layers=[0.0])
+    pts = [sp.next_point() for _ in range(6)]
+    assert pts == [(0.0, 0.0), (60.0, 0.0), (120.0, 0.0),
+                   (180.0, 0.0), (240.0, 0.0), (300.0, 0.0)], pts
+    assert sp.one_way is True
+
+
+def test_stall_freeze_releases_after_timeout():
+    """丢靶重捕后不能卡在"指令无效冻结"里 —— 现场现象就是"再也收敛不了"。
+
+    场景：误差一直很大、平台一直不动（模拟漂移/被挡住）-> 会进入冻结；
+    但冻结必须**自动解冻**（stall_hold_s），否则一旦冻上就永远不动。
+    """
+    cfg = ControlConfig()
+    cfg.kp_p, cfg.kp, cfg.kp_d = 0.65, 0.02, 0.25
+    cfg.stall_err_px, cfg.stall_s = 60.0, 0.5
+    cfg.stall_delta_deg, cfg.stall_hold_s = 2.0, 1.0
+    cam = CameraModel(700.0, 700.0, 640.0, 360.0)
+    aim = AimController(cfg, cam)
+    spot = (640.0, 360.0)
+    att = [0.0, 0.0]                       # 平台一动不动
+    uv = (640.0 + 300.0, 360.0)            # 误差恒定 300px
+    frozen, released = False, False
+    for i in range(80):
+        out = aim.update(i * 0.1, 0.1, uv, (0.0, 0.0), spot,
+                         att_rel=(att[0], att[1]))
+        if out.stalled:
+            frozen = True
+        elif frozen:
+            released = True
+            break
+    assert frozen, "大误差 + 平台不动，应该进入冻结保护"
+    assert released, "冻结必须自动解冻，否则丢靶重捕后永远收敛不了"
+
+    # 重新捕获（clear_lock 会解开冻结）也必须立刻能动
+    aim.clear_lock()
+    assert not aim._stall_frozen, "clear_lock 之后不应还处于冻结状态"

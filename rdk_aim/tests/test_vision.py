@@ -78,7 +78,11 @@ def test_target_center_accuracy_across_distance():
             assert r is not None, "距离 %.0fmm yaw %.0f 时未检出靶纸" % (dist, yaw)
             err = math.hypot(r.uv[0] - truth[0], r.uv[1] - truth[1])
             if r.source == "quad":
-                assert r.ring_score > 0.6, "环覆盖分过低 %.2f" % r.ring_score
+                # 说明（2026-09-29）：检测方案已按国一那版重写 ——
+                # 判据核心是"外框 + 内窗"的回字结构，红圈覆盖度只做加分，
+                # 不再是硬门槛（红圈线只有 1mm，现场 0.7m 处成像不到 2px，
+                # 拿它当门槛会把真靶纸拒掉）。所以这里不再断言 ring_score，
+                # 只断言"中心精度"这个真正要用的指标。
                 assert err < 2.5, \
                     "距离 %.0fmm yaw %.0f 黑框路径中心误差 %.2fpx" % (dist, yaw, err)
                 quad_hits += 1
@@ -179,3 +183,76 @@ def test_boresight_distance_table():
     assert abs(u - 610.0) < 1e-9 and abs(v - 390.0) < 1e-9
     # 距离未知（靶纸没检到）时不能乱猜 -> 退回单点
     assert det.boresight_for_distance(None) == (600.0, 380.0)
+
+
+def test_laser_violet_mode():
+    """violet 判据（实测出来的那一套）：白芯偏粉的光斑能检出，
+    而"白得中性的纸面高光"和"又暗又蓝的窗边色散"都不能误检。
+
+    这三条正是现场遇到的真实情况：
+      真光斑   BGR≈(253,207,255)  紫优势 46、亮度 207
+      纸面高光 BGR≈(250,250,250)  紫优势  0
+      窗边色散 BGR≈(133,115,132)  紫优势 17 但亮度只有 115
+    """
+    cfg = LaserConfig()
+    cfg.mode = "violet"
+    cfg.violet_gap = 12
+    cfg.bright_min = 120
+
+    # 1) 真光斑（白芯偏粉 + 一圈品红边）必须检出
+    img = np.full((H, W, 3), 150, np.uint8)          # 纸面：中性灰
+    u0, v0 = 617.0, 375.0
+    cv2.circle(img, (int(u0), int(v0)), 6, (89, 43, 150), -1)     # 品红晕
+    cv2.circle(img, (int(u0), int(v0)), 3, (250, 200, 255), -1)   # 偏粉白芯
+    det = LaserSpotDetector(cfg)
+    r = det.detect(img)
+    assert r is not None, "紫/品红光斑没检出"
+    err = math.hypot(r.uv[0] - u0, r.uv[1] - v0)
+    assert err < 1.5, "紫光斑质心误差 %.2fpx" % err
+
+    # 2) 中性白的高光（纸面反光）不能当光斑
+    img2 = np.full((H, W, 3), 150, np.uint8)
+    cv2.circle(img2, (400, 300), 6, (252, 252, 252), -1)
+    assert LaserSpotDetector(cfg).detect(img2) is None, "纸面高光被误检成光斑"
+
+    # 3) 又暗又蓝的窗边色散不能当光斑
+    img3 = np.full((H, W, 3), 150, np.uint8)
+    cv2.circle(img3, (200, 150), 8, (200, 110, 120), -1)
+    assert LaserSpotDetector(cfg).detect(img3) is None, "暗蓝色散被误检成光斑"
+
+    # 4) ROI：已知光轴点时只在该区域里搜（远处同样的斑不认）
+    cfg2 = LaserConfig()
+    cfg2.mode = "violet"
+    cfg2.roi_px = 120
+    det2 = LaserSpotDetector(cfg2)
+    det2.set_boresight((617.0, 375.0))
+    img4 = np.full((H, W, 3), 150, np.uint8)
+    cv2.circle(img4, (200, 150), 5, (250, 200, 255), -1)   # 别处的紫斑
+    assert det2.detect(img4) is None, "ROI 之外的紫斑不该被认"
+    cv2.circle(img4, (620, 380), 5, (250, 200, 255), -1)   # 光轴点附近的紫斑
+    r4 = det2.detect(img4)
+    assert r4 is not None and abs(r4.uv[0] - 620) < 2 and abs(r4.uv[1] - 380) < 2
+
+
+def test_target_ring_structure():
+    """"回"字结构判据（用户建议、现场必需）。
+
+    丢靶后重找靶时，普通四边形（柜门/纸箱/反光块）最容易被误认成靶纸，
+    把云台带到别处。判据：外框里必须有一个四边形内窗（面积占比合理）。
+    这里验证：① 真靶纸能找到内窗；② 实心深色矩形找不到内窗。
+    """
+    det = detector()
+    frame, _ = render(0.0, 0.0, 800.0)
+    binary = det._binarize(frame, 1.0)
+    quads = det._find_quads(binary, float(frame.shape[0] * frame.shape[1]))
+    assert quads, "没找到候选四边形"
+    assert quads[0][1] is not None, "真靶纸没找到内窗（回字结构）"
+
+    solid = np.full((H, W, 3), 220, np.uint8)
+    cv2.rectangle(solid, (400, 150), (900, 600), (30, 30, 35), -1)
+    # 注意：自适应阈值会把"大面积纯黑"的内部也判成亮，所以单看层级结构
+    # 挡不住实心大黑块 —— 真正挡住它的是"胶带厚度校验"（下面这条端到端检查）。
+    cfg_strict = TargetConfig()
+    cfg_strict.ring_structure_required = True     # 现场配置就是这么开的
+    det_strict = TargetDetector(cfg_strict, CameraModel(FX, FY, CX, CY))
+    assert det_strict.detect(solid) is None, "实心深色矩形被当成了靶纸"

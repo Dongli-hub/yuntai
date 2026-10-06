@@ -70,7 +70,14 @@
 #define GP_PARAM_PITCH_ILIM      0x08u  /* 积分限幅 */
 #define GP_PARAM_PITCH_OUT_RPM   0x09u  /* 输出限幅 */
 #define GP_PARAM_PITCH_PLAT_SIGN 0x0Au  /* 平台俯仰补偿：0=关，+1/-1=开并定方向 */
-#define GP_PARAM_NUM             0x0Bu
+/* 0x0B：偏航静摩擦补偿转速（rpm）。小指令推不动轴时，补一个"最小有效转速"；
+ *       0 = 关掉补偿。现场用 tune_pitch.py 的 PARAM 在线加减，找到"刚好推得动
+ *       又不来回抖"的值。 */
+#define GP_PARAM_YAW_STICTION_RPM 0x0Bu
+/* 0x0C：偏航积分限幅。ki*该值 = 积分单独能给出的最大 rpm。
+ *       必须小于"能推动轴的最小转速"（约 10rpm），否则轴会被积分推着慢慢转。 */
+#define GP_PARAM_YAW_ILIM        0x0Cu
+#define GP_PARAM_NUM             0x0Du
 
 /* ---------------- 工作模式（GP_MSG_MODE） ---------------- */
 #define GP_MODE_IDLE       0u          /* 不使能、不控制（电机自由） */
