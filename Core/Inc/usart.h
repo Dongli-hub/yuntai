@@ -57,6 +57,10 @@ void UART7_BindPins(uint8_t pair);
 uint8_t UART7_CurrentPins(void);
 uint8_t UART7_InitError(void);
 
+/* UART7 单独自检：上电后只从 UART7 发 ASCII 并回显收到的字节。
+ * 由 main.c 里的 UART7_TX_TEST_LOOP 开关决定要不要进这个模式。 */
+void UART7_TxTest(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
