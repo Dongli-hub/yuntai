@@ -31,9 +31,10 @@ UART_HandleTypeDef huart7;
  * UART7 引脚对管理（K230 链路用）
  *
  * 为什么需要这个：板子上 UART7 接插件只标了 "UART7"，
- * 但 H723 的 UART7 有两个可选引脚对（都是 AF11）：
- *     UART7_PAIR_PE : PE7 = RX, PE8 = TX
- *     UART7_PAIR_PF : PF6 = RX, PF7 = TX
+ * 而 STM32H723VGT6(LQFP100) 上 UART7 有两组可用引脚（都是 AF11）：
+ *     UART7_PAIR_PE : PE7 = RX, PE8 = TX   （CubeMX 默认，最可能）
+ *     UART7_PAIR_PA : PA8 = RX, PB3 = TX   （备用；
+ *         PF6/PF7 组合在这颗 LQFP100 上不存在，别再试了）
  * 不可能靠猜，索性两个都试：gimbal_link_init() 里每个脚等 400ms，
  * 哪个脚收到字节就用哪个；都没收到就回默认 PE7/PE8。
  *
@@ -50,18 +51,22 @@ void UART7_BindPins(uint8_t pair)
 
   /* 先把两组脚都还原成模拟态，避免两个输出同时驱动 */
   HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7 | GPIO_PIN_8);
-  HAL_GPIO_DeInit(GPIOF, GPIO_PIN_6 | GPIO_PIN_7);
+  HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8);
+  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3);
 
   GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull      = GPIO_PULLUP;
   GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
   GPIO_InitStruct.Alternate = GPIO_AF11_UART7;
 
-  if (pair == UART7_PAIR_PF)
+  if (pair == UART7_PAIR_PA)
   {
-    __HAL_RCC_GPIOF_CLK_ENABLE();
-    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;      /* PF6=RX, PF7=TX */
-    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_8;                   /* PA8 = UART7_RX */
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = GPIO_PIN_3;                   /* PB3 = UART7_TX */
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   }
   else
   {
@@ -210,7 +215,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     /* UART7 clock enable */
     __HAL_RCC_UART7_CLK_ENABLE();
 
-    /* 引脚对由 s_uart7_pair 决定（PE7/PE8 或 PF6/PF7） */
+    /* 引脚对由 s_uart7_pair 决定（PE7/PE8 或 PA8/PB3） */
     UART7_BindPins(s_uart7_pair);
 
   /* USER CODE BEGIN UART7_MspInit 1 */
@@ -249,10 +254,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
     __HAL_RCC_UART7_CLK_DISABLE();
 
     /**UART7 GPIO Configuration
-    PE7/PE8 或 PF6/PF7 ------> UART7
+    PE7/PE8 或 PA8/PB3 ------> UART7
     */
     HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7|GPIO_PIN_8);
-    HAL_GPIO_DeInit(GPIOF, GPIO_PIN_6|GPIO_PIN_7);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3);
 
   /* USER CODE BEGIN UART7_MspDeInit 1 */
 

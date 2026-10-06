@@ -13,7 +13,7 @@
   *
   * 2026-10-06 迁移到 K230：
   *  - 链路外设从 USART1(PA9/PA10) 换到 UART7，接 K230 的 IO9(TXD)/IO10(RXD)。
-  *  - UART7 的引脚对不唯一（PE7/PE8 或 PF6/PF7），init 时自动探测。
+ *  - UART7 的引脚对不唯一（PE7/PE8 或 PA8/PB3），init 时自动探测。
   *  - 心跳回 ACK(0x12)，让上位机能分别确认"收"和"发"两个方向都通。
   *     这是"上位机崩了/线掉了"时的唯一保护，必须在 H723 侧做。
   ******************************************************************************
@@ -361,7 +361,7 @@ static void gl_handle_frame(uint32_t now_ms)
  * UART7 引脚自动识别（只在 init 时跑一次，最多阻塞 2 × GL_AUTOPIN_MS）
  *
  * 板子上的 UART7 接插件有两种可能的引脚对（见 usart.c 的 UART7_BindPins）：
- *      PE7(RX)/PE8(TX)   或   PF6(RX)/PF7(TX)
+ *      PE7(RX)/PE8(TX)   或   PA8(RX)/PB3(TX)
  * 不猜，直接试：每个候选脚等 GL_AUTOPIN_MS，看 RXNE 有没有置位。
  * 判据只读标志、不读 RDR，所以不会把数据吃掉。
  * 上位机（K230）任何测试程序都在持续发心跳/遥测请求，所以能试出来；
@@ -391,12 +391,12 @@ static void gl_uart7_autopin(void)
         return;
     }
 
-    UART7_BindPins(UART7_PAIR_PF);
+    UART7_BindPins(UART7_PAIR_PA);
     __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
     if (gl_uart7_probe_rx(GL_AUTOPIN_MS) != 0u)
     {
-        gimbal_link_log("[LINK] UART7 = PF6(RX)/PF7(TX)");
+        gimbal_link_log("[LINK] UART7 = PA8(RX)/PB3(TX)");
         return;
     }
 
@@ -508,8 +508,8 @@ void gimbal_link_poll(uint32_t now_ms)
         s_last_pin_try_ms = now_ms;
         if (UART7_CurrentPins() == UART7_PAIR_PE)
         {
-            UART7_BindPins(UART7_PAIR_PF);
-            gimbal_link_log("[LINK] UART7 试 PF6/PF7");
+            UART7_BindPins(UART7_PAIR_PA);
+            gimbal_link_log("[LINK] UART7 试 PA8/PB3");
         }
         else
         {
