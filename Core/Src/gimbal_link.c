@@ -39,11 +39,10 @@
  *  三路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换；
  *  中断入口（USART1_IRQHandler / UART7_IRQHandler / USART10_IRQHandler）也都在。
  * ===================================================================== */
-/* ★ 2026-10-07 实测：UART10 的发送（PE03）完全正常，但它的接收脚（PE02）
- *   一个字节都收不到（USB-TTL 直接往第 3 脚灌数据、H723 侧 B 始终为 0，
- *   连 ACK 都不回），判断是该路 RX 的硬件问题（22Ω 串阻/ESD 管/焊点）。
- *   为不耽误进度：数据走已经双向验证过的 USART1，
- *   5V 仍旧从 UART10 排针的 VCC 脚取（那一脚本来的用途就是给 K230 供电）。 */
+/* ★ 2026-10-07 现场决定：
+ *   · 数据线（TX/RX/GND）接 USART1 的 3 针端子（收发历史上都验证过）；
+ *   · 5V 从 UART10 排针的 VCC 脚取（那一脚本来的用途就是给 K230 供电）。
+ *   这样既满足"K230 靠板上 5V 供电"，又避开 UART10 接收脚收不到数据的问题。 */
 #define GL_LINK_UART_SEL     0
 
 #if (GL_LINK_UART_SEL == 1)
@@ -448,6 +447,26 @@ void gimbal_link_init(void)
     s_ready = 1u;
 }
 
+/* 把一个收到的字节放进环形缓冲（中断和轮询兜底共用这一份逻辑） */
+static void gl_rx_push(uint8_t b)
+{
+    uint16_t next = (uint16_t)(s_rx_head + 1u);
+    if (next >= GL_RX_BUF_SIZE)
+    {
+        next = 0u;
+    }
+    if (next != s_rx_tail)
+    {
+        s_rx_buf[s_rx_head] = b;
+        s_rx_head = next;
+    }
+    else
+    {
+        s_rx_ovf++;                       /* 缓冲满：丢字节，靠帧头重同步 */
+    }
+    s_rx_bytes++;
+}
+
 void gimbal_link_rx_isr(void)
 {
     uint32_t isr = GL_HUART.Instance->ISR;
@@ -455,21 +474,7 @@ void gimbal_link_rx_isr(void)
     if ((isr & USART_ISR_RXNE_RXFNE) != 0u)
     {
         uint8_t  b = (uint8_t)(GL_HUART.Instance->RDR & 0xFFu);
-        s_rx_bytes++;
-        uint16_t next = (uint16_t)(s_rx_head + 1u);
-        if (next >= GL_RX_BUF_SIZE)
-        {
-            next = 0u;
-        }
-        if (next != s_rx_tail)
-        {
-            s_rx_buf[s_rx_head] = b;
-            s_rx_head = next;
-        }
-        else
-        {
-            s_rx_ovf++;                       /* 缓冲满：丢字节，靠帧头重同步 */
-        }
+        gl_rx_push(b);
     }
 
     /* 溢出/帧错/噪声错误必须清掉，否则 RXNE 中断会被永久卡住 */
@@ -482,6 +487,25 @@ void gimbal_link_rx_isr(void)
 
 void gimbal_link_poll(uint32_t now_ms)
 {
+    /* ---- 0. 轮询兜底（关键加固）----
+     * 正常情况下收字节靠 RXNE 中断；但现场排障发现 UART10 的接收
+     * 一个字节都进不来（发送却是好的）。为了排除"中断没进来"这一类
+     * 原因，这里每次进 poll 都直接查一次 RXNE 标志把字节取走：
+     *   · 先关 RXNE 中断，避免和中断同时操作环形缓冲（竞态）
+     *   · 把当前 RX 寄存器里的字节全部取完
+     *   · 再打开中断，恢复正常的中断接收
+     * 这样即使 NVIC/优先级那边有问题，接收也照样能工作。 */
+    __HAL_UART_DISABLE_IT(&GL_HUART, UART_IT_RXNE);
+    while (__HAL_UART_GET_FLAG(&GL_HUART, UART_FLAG_RXNE) != 0u)
+    {
+        gl_rx_push((uint8_t)(GL_HUART.Instance->RDR & 0xFFu));
+    }
+    if (__HAL_UART_GET_FLAG(&GL_HUART, UART_FLAG_ORE) != 0u)
+    {
+        __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF);
+    }
+    __HAL_UART_ENABLE_IT(&GL_HUART, UART_IT_RXNE);
+
     /* ---- 1. 把接收缓冲里的字节喂给解析器 ---- */
     while (s_rx_tail != s_rx_head)
     {
