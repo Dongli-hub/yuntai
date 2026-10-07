@@ -39,7 +39,12 @@
  *  三路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换；
  *  中断入口（USART1_IRQHandler / UART7_IRQHandler / USART10_IRQHandler）也都在。
  * ===================================================================== */
-#define GL_LINK_UART_SEL     2
+/* ★ 2026-10-07 实测：UART10 的发送（PE03）完全正常，但它的接收脚（PE02）
+ *   一个字节都收不到（USB-TTL 直接往第 3 脚灌数据、H723 侧 B 始终为 0，
+ *   连 ACK 都不回），判断是该路 RX 的硬件问题（22Ω 串阻/ESD 管/焊点）。
+ *   为不耽误进度：数据走已经双向验证过的 USART1，
+ *   5V 仍旧从 UART10 排针的 VCC 脚取（那一脚本来的用途就是给 K230 供电）。 */
+#define GL_LINK_UART_SEL     0
 
 #if (GL_LINK_UART_SEL == 1)
 #define GL_HUART             huart7
