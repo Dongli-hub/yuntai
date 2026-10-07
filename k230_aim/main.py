@@ -176,17 +176,20 @@ class FrameParser(object):
             if i < 0:
                 if len(self.buf) > 1:
                     self.resync += 1
-                    del self.buf[:-1]
+                    # MicroPython 的 bytearray 不支持切片删除（del buf[x:]），
+                    # 必须用重新切片代替，否则报
+                    # "TypeError: 'bytearray' object doesn't support item deletion"
+                    self.buf = self.buf[-1:]
                 break
             if i > 0:
                 self.resync += 1
-                del self.buf[:i]
+                self.buf = self.buf[i:]
             if len(self.buf) < 5:
                 break
             length = self.buf[4]
             if length > 240:
                 self.bad_len += 1
-                del self.buf[:2]
+                self.buf = self.buf[2:]
                 continue
             total = 5 + length + 2
             if len(self.buf) < total:
@@ -195,11 +198,11 @@ class FrameParser(object):
             crc_rx = self.buf[5 + length] | (self.buf[6 + length] << 8)
             if crc16(body) != crc_rx:
                 self.crc_err += 1
-                del self.buf[:2]
+                self.buf = self.buf[2:]
                 continue
             self.ok += 1
             out.append((body[0], body[1], bytes(body[3:])))
-            del self.buf[:total]
+            self.buf = self.buf[total:]
         return out
 
 

@@ -107,17 +107,19 @@ class FrameParser(object):
             if i < 0:
                 if len(self.buf) > 1:
                     self.resync += 1
-                    del self.buf[:-1]
+                    # MicroPython 的 bytearray 不支持切片删除（del buf[x:]），
+                    # 只能用重新切片，否则报 TypeError
+                    self.buf = self.buf[-1:]
                 break
             if i > 0:
                 self.resync += 1
-                del self.buf[:i]
+                self.buf = self.buf[i:]
             if len(self.buf) < HEADER_LEN:
                 break
             length = self.buf[4]
             if length > MAX_PAYLOAD:
                 self.bad_len += 1
-                del self.buf[:2]
+                self.buf = self.buf[2:]
                 continue
             total = HEADER_LEN + length + CRC_LEN
             if len(self.buf) < total:
@@ -127,13 +129,13 @@ class FrameParser(object):
                 (self.buf[HEADER_LEN + length + 1] << 8)
             if crc16_modbus(body) != crc_rx:
                 self.crc_err += 1
-                del self.buf[:2]
+                self.buf = self.buf[2:]
                 continue
             self.frames_ok += 1
             out.append((body[0], body[1], bytes(body[3:])))
-            del self.buf[:total]
+            self.buf = self.buf[total:]
         if len(self.buf) > self.max_buffer:
-            del self.buf[:-self.max_buffer]
+            self.buf = self.buf[-self.max_buffer:]
         return out
 
     def stats(self):
