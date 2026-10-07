@@ -26,7 +26,8 @@ IMG_H = 480
 DISPLAY_QUALITY = 50       # IDE 画面质量（越小越流畅）
 
 # --- 黑胶带：暗色连通域（LAB）---
-TAPE_THRESHOLD = (0, 45, -60, 60, -60, 60)
+TAPE_L_MAX = 0             # 0 = 自动（Otsu + 候选阈值）；>0 = 手动固定阈值
+TAPE_L_ABS_MIN = 25        # 自动阈值的下限，防止切得太狠
 TAPE_MIN_AREA = 400        # 像素面积下限（太远时框会变小，可往下调）
 TAPE_MAX_AREA_RATIO = 0.60
 TAPE_ASPECT_MIN = 1.15     # 胶带框 297x180 → 1.65
@@ -229,8 +230,8 @@ def main():
     print("=" * 68)
     print("vision_check v6: 黑胶带暗块(find_blobs, C加速) + 暖色光斑")
     print("  胶带阈值=%s 面积≥%d 比例=[%.2f,%.2f]"
-          % (str(TAPE_THRESHOLD), TAPE_MIN_AREA, TAPE_ASPECT_MIN,
-             TAPE_ASPECT_MAX))
+          % ("自动(Otsu)" if TAPE_L_MAX <= 0 else str(TAPE_L_MAX),
+             TAPE_MIN_AREA, TAPE_ASPECT_MIN, TAPE_ASPECT_MAX))
     print("  距离 = %.0f × 0.297 ÷ 框长边像素" % FX_PX)
     print("=" * 68)
 
@@ -285,45 +286,72 @@ def main():
             img = sensor.snapshot(chn=CAM_CHN_ID_0)
             n_frame += 1
 
-            best = None            # (area, cx, cy, long_side_px, aspect)
+            # ---- 自适应阈值：胶带是画面里最暗的那一小块 ----
+            stats_txt = ""
+            try:
+                st = img.get_statistics()
+                stats_txt = " L均=%.0f 中=%.0f 小=%.0f 大=%.0f" % (
+                    st.l_mean(), st.l_median(), st.l_min(), st.l_max())
+            except Exception:
+                stats_txt = " (L统计不可用)"
+
+            if TAPE_L_MAX > 0:
+                th_list = [TAPE_L_MAX]
+            else:
+                th_list = []
+                try:
+                    l_th = img.get_histogram().get_threshold().l_value()
+                except Exception:
+                    l_th = 0
+                if l_th > 0:
+                    th_list.append(l_th)                       # Otsu
+                    th_list.append(max(TAPE_L_ABS_MIN,
+                                       int(l_th * 0.60)))       # 更严
+                    th_list.append(max(TAPE_L_ABS_MIN,
+                                       int(l_th * 0.40)))       # 最严
+                th_list.append(60)                             # 兜底固定值
+                th_list.append(40)
+
+            best = None            # (area, cx, cy, long_side_px, aspect, corners)
             n_blob = 0
             list_txt = ""
-            for b in img.find_blobs([TAPE_THRESHOLD], merge=True,
-                                    area_threshold=TAPE_MIN_AREA,
-                                    pixels_threshold=TAPE_MIN_AREA):
-                n_blob += 1
-                try:
-                    area = b.area()
-                except Exception:
-                    area = b[4]
-                if area < TAPE_MIN_AREA:
-                    continue
-                if area > TAPE_MAX_AREA_RATIO * img_area:
-                    continue
-                x, y, w, h = b[0], b[1], b[2], b[3]
-                aspect = max(w, h) / max(1.0, min(w, h))
-                if n_blob <= 3:
-                    list_txt += " [%dpx %.1f%% 比=%.2f]" % (area,
-                                                            100.0 * area /
-                                                            img_area, aspect)
-                if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
-                    continue
-                # 贴边的大块多半是背景/阴影，不要
-                if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
-                        (y + h >= IMG_H - 1):
-                    continue
-                # 有 min_corners 就做国一那套几何校验
-                ok_geo = True
-                corners = None
-                try:
-                    corners = b.min_corners()
-                    ok_geo = corners_geometry_ok(corners)
-                except Exception:
+            for th in th_list:
+                for b in img.find_blobs([(0, th, -60, 60, -60, 60)],
+                                        merge=True,
+                                        area_threshold=TAPE_MIN_AREA,
+                                        pixels_threshold=TAPE_MIN_AREA):
+                    n_blob += 1
+                    try:
+                        area = b.area()
+                    except Exception:
+                        area = b[4]
+                    if area < TAPE_MIN_AREA:
+                        continue
+                    if area > TAPE_MAX_AREA_RATIO * img_area:
+                        continue
+                    x, y, w, h = b[0], b[1], b[2], b[3]
+                    aspect = max(w, h) / max(1.0, min(w, h))
+                    if n_blob <= 3:
+                        list_txt += " [th%d %dpx %.1f%% 比=%.2f]" % (
+                            th, area, 100.0 * area / img_area, aspect)
+                    if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
+                        continue
+                    # 贴边的大块多半是背景/阴影，不要
+                    if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
+                            (y + h >= IMG_H - 1):
+                        continue
+                    # 有 min_corners 就做国一那套几何校验
+                    ok_geo = True
                     corners = None
-                if not ok_geo:
-                    continue
-                if best is None or area > best[0]:
-                    best = (area, b[5], b[6], max(w, h), aspect, corners)
+                    try:
+                        corners = b.min_corners()
+                        ok_geo = corners_geometry_ok(corners)
+                    except Exception:
+                        corners = None
+                    if not ok_geo:
+                        continue
+                    if best is None or area > best[0]:
+                        best = (area, b[5], b[6], max(w, h), aspect, corners)
 
             # ---------- 光斑：暖色亮块 ----------
             spot = None
@@ -389,7 +417,8 @@ def main():
             # ---------- 打印 ----------
             if time.ticks_diff(now, t_print) >= PRINT_MS:
                 t_print = now
-                line = "FPS=%.1f 暗块=%d%s" % (clock.fps(), n_blob, list_txt)
+                line = "FPS=%.1f%s 阈值=%s 暗块=%d%s" % (
+                    clock.fps(), stats_txt, str(th_list), n_blob, list_txt)
                 if best is None:
                     line += "  靶框: 未检出"
                 else:
