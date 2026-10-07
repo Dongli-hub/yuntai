@@ -273,71 +273,77 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 #include <stdio.h>
 
 /* ===========================================================================
- * UART7 单独自检（由 main.c 的 UART7_TX_TEST_LOOP 开关调用）
+ * 串口自检（由 main.c 的 UART7_TX_TEST_LOOP 开关调用）
  *
- * 目的：把"云台程序"完全排除在外，只验证 UART7 本身通不通。
- *   · 每 300ms 从 UART7 TX(PE8) 发一行 ASCII，带递增计数
- *   · 同时把 UART7 RX(PE7) 收到的字节以十六进制回显出来
- *     （这样即使对面在发，也能在同一个串口助手窗口里看到）
+ * 目的：把"云台程序"完全排除在外，只验证串口本身通不通。
+ *   同时从两个口发一模一样的内容，用来 A/B 对比是哪一侧的问题：
+ *       UART7  TX = PE08      （板上 UART7 排针那根）
+ *       USART1 TX = PA09      （原来接地瓜派的那根，应该也能接到）
  *
- * 测试接法：USB-TTL 的 RX 接 H723 的 UART7 TX(PE08)，GND 共地，
- *          串口助手 115200 / 8 / N / 1。
- *          此时请把 K230 的数据线拔掉，避免两个 TX 对顶。
+ * 发的内容（不可能看错）：
+ *   开机先发 64 个 'U'（16 进制就是 55 55 55 ...），
+ *   然后每 200ms 发一行 ASCII，带递增计数。
+ *
+ * 接法：USB-TTL 的 RX 接上面任意一个 TX 脚，**GND 必须共地**，
+ *      串口助手 115200 / 8 / N / 1。测的时候把 K230 的数据线拔掉。
  * ========================================================================= */
+static void uart_tx_both(const char *s, uint16_t n)
+{
+    HAL_UART_Transmit(&huart7, (uint8_t *)s, n, 50u);
+    HAL_UART_Transmit(&huart1, (uint8_t *)s, n, 50u);
+}
+
 void UART7_TxTest(void)
 {
     uint32_t n = 0u;
     uint32_t t;
-    char     line[80];
+    char     line[96];
+    static const char burst[] =
+        "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU"
+        "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU";   /* 64 个 0x55 */
     static const char head[] =
         "\r\n"
-        "==============================================\r\n"
-        " UART7 TX TEST   TX=PE08  RX=PE07  115200 8N1\r\n"
-        "==============================================\r\n";
+        "==================================================\r\n"
+        " TX SELF TEST     115200 8N1\r\n"
+        " sending on BOTH:  UART7 TX=PE08   USART1 TX=PA09\r\n"
+        " USB-TTL RX -> one of those TX pins, GND common\r\n"
+        " expect 64 x 'U' (HEX 55), then one line / 200ms\r\n"
+        "==================================================\r\n";
 
     /* 按板上丝印固定引脚：RX=PE7, TX=PE8 */
     UART7_BindPins(UART7_PAIR_PE);
 
-    if (UART7_InitError() != 0u)
-    {
-        /* UART 初始化就失败了：串口助手会什么都收不到，
-           说明问题在 UART7 初始化（那时候再看这两个函数的配置） */
-        while (1)
-        {
-            n++;
-        }
-    }
-
-    HAL_UART_Transmit(&huart7, (uint8_t *)head,
-                      (uint16_t)(sizeof(head) - 1u), 100u);
+    /* 先来一串 0x55：ASCII 是 UUUU...，HEX 是 55 55 55 ...，
+       收到这个就说明这条线通了（收不到就是线/脚/波特率的问题） */
+    uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
+    uart_tx_both(head, (uint16_t)(sizeof(head) - 1u));
 
     while (1)
     {
         int len = snprintf(line, sizeof(line),
-                           "UART7-OK  count=%lu  (UART7 TX works)\r\n",
+                           "SELFTEST count=%lu   U7=PE08  U1=PA09\r\n",
                            (unsigned long)n);
         if (len > 0)
         {
-            HAL_UART_Transmit(&huart7, (uint8_t *)line, (uint16_t)len, 100u);
+            uart_tx_both(line, (uint16_t)len);
         }
 
-        /* 回显收到的字节（十六进制），方便看对面有没有在发 */
+        /* 回显 UART7 收到的字节（十六进制），方便看对面有没有在发 */
         while (__HAL_UART_GET_FLAG(&huart7, UART_FLAG_RXNE) != 0u)
         {
             uint8_t b = (uint8_t)(huart7.Instance->RDR & 0xFFu);
-            char hex[8];
-            int m = snprintf(hex, sizeof(hex), "%02X ", b);
+            int m = snprintf(line, sizeof(line), "[U7 RX] %02X ", b);
             if (m > 0)
             {
-                HAL_UART_Transmit(&huart7, (uint8_t *)hex, (uint16_t)m, 100u);
+                uart_tx_both(line, (uint16_t)m);
             }
         }
 
         n++;
         t = HAL_GetTick();
-        while ((HAL_GetTick() - t) < 300u)
+        while ((HAL_GetTick() - t) < 200u)
         {
-            /* 空转 300ms */
+            /* 空转 200ms */
         }
     }
 }
