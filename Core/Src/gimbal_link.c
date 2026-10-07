@@ -26,8 +26,8 @@
 #include <stdio.h>
 
 /* ========================== 链路用哪一路串口 ==========================
- *  GL_LINK_UART_SEL :  0 = USART1  → TX=PA09 / RX=PA10   （3 针端子，无电源）
- *                      3 = 拆分    → TX=USART10 / RX=USART1   （★当前，见下）
+ *  GL_LINK_UART_SEL :  0 = USART1  → TX=PA09 / RX=PA10   （★当前：最终方案）
+ *                      3 = 拆分    → TX=USART10 / RX=USART1   （备用）
  *                      1 = UART7   → TX=PE08 / RX=PE07   （实测数据线不通）
  *                      2 = USART10 → TX=PE03 / RX=PE02   （★当前使用）
  *
@@ -48,7 +48,11 @@
  *                发给 K230 的数据走 UART10 排针（它自带 5V/GND），
  *                K230 发回来的数据走 USART1 端子的 RX 脚（多接一根线）。
  * ========================================================== */
-#define GL_LINK_UART_SEL     3
+/* ★ 2026-10-07 最终方案（现场确定）：
+ *   · 数据三根线（TX/RX/GND）接 USART1 的 3 针端子 —— 收发都实测可用；
+ *   · 5V 从 UART10 排针的第 1 脚 VCC 取 —— 给 K230 供电。
+ *   两个端子各司其职，互不影响。 */
+#define GL_LINK_UART_SEL     0
 
 #if (GL_LINK_UART_SEL == 1)
 #define GL_TX_HUART          huart7
