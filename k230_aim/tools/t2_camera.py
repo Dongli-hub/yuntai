@@ -16,7 +16,7 @@ import time
 import math
 
 # ============================ 参数 ============================
-METHOD = "cv2"             # cv2 | rects
+METHOD = "rects"           # rects(原生 find_rects, 和 main.py 默认一致) | cv2
 
 IMG_W = 640
 IMG_H = 480
