@@ -135,6 +135,8 @@ MODE_REASSERT_MS = 2000    # 周期性重发 MODE（H723 可能被看门狗切�
 TELEM_TIMEOUT_MS = 1500    # 遥测断这么久 -> 主动发 STAB
 LASER_ENABLE = True        # 是否让 H723 点激光（AIM 模式下才有效）
 DEBUG_PRINT_MS = 1000      # 终端打印周期
+LOG_TO_FILE = True         # 整机跑（没接电脑）时把日志写进 SD 卡，跑完插回电脑看
+LOG_PATH = "/sdcard/k230_log.txt"
 
 # ============================================================================
 #  协议
@@ -159,6 +161,20 @@ FLAG_LOCKED = 0x10
 
 ST_READY = 0x10
 ST_LASER_ON = 0x08
+
+
+_log_f = None
+
+
+def log(msg):
+    """同时输出到终端(接着 USB 能实时看)和 SD 卡日志文件(没接电脑时看)。"""
+    print(msg)
+    if _log_f is not None:
+        try:
+            _log_f.write(msg + "\n")
+            _log_f.flush()
+        except Exception:
+            pass
 
 
 def _crc_table():
@@ -1195,6 +1211,13 @@ def main():
     print("K230 瞄准程序启动  %dx%d  靶纸=白纸亮块+暗框  显示=%s"
           % (IMG_W, IMG_H, DISPLAY_MODE))
     print("=" * 60)
+    global _log_f
+    if LOG_TO_FILE:
+        try:
+            _log_f = open(LOG_PATH, "w")
+            log("(日志同时写入 %s；整机跑完把 SD 卡插回电脑看这个文件)" % LOG_PATH)
+        except Exception as e:
+            print("日志文件打不开(继续运行, 只是不写文件): %s" % e)
 
     try:
         while True:
@@ -1365,7 +1388,7 @@ def main():
                         target_det.state,
                         FX_PX * PAPER_LONG_M / max(1.0, target_det.meas[5]))
                 if gz is not None:
-                    print("[%s] %.1ffps gz(state=%d flags=0x%02X yaw=%.1f) "
+                    log("[%s] %.1ffps gz(state=%d flags=0x%02X yaw=%.1f) "
                           "靶=%s 命中%d/%d 光斑%d err=%.0f yaw=%.1f pit=%.1f "
                           "ok=%d crc=%d"
                           % (ST_NAME[state], fps, gz["state"], gz["flags"],
@@ -1373,9 +1396,9 @@ def main():
                              ctrl.err_px, ctrl.yaw, ctrl.pitch,
                              parser.ok, parser.crc_err))
                 else:
-                    print("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
-                          % (ST_NAME[state], tgt_s,
-                             parser.ok, parser.crc_err))
+                    log("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
+                        % (ST_NAME[state], tgt_s,
+                           parser.ok, parser.crc_err))
             if (n_frames % 30) == 0:
                 gc.collect()
             time.sleep_ms(1)
