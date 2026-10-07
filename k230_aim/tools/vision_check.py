@@ -36,11 +36,16 @@ CAM_VFLIP = True           # 画面上下颠倒 -> True（你现在需要这个�
 CAM_HMIRROR = False        # 画面左右镜像 -> True
 
 # ============================ cv_lite 四边形检测 ============================
-CANNY_LO = 50              # Canny 低阈值（检不到就调小，误检多就调大）
-CANNY_HI = 150             # Canny 高阈值
+# Canny 阈值/角度容差会自动在上面的参数组里挑一组能用的（现场太暗时
+# 例程默认的 50/150 会一个矩形都找不到），所以这里给 3 组由严到松。
+CV_PARAM_SETS = [
+    (50, 150, 0.35),       # 资料例程默认
+    (30, 90, 0.50),        # 偏暗/低对比场景
+    (20, 60, 0.65),        # 更宽松（斜视梯形角度偏差大时用）
+]
+_CV_SET = [-1]             # 记住哪组能用（-1=还没定）
 APPROX_EPS = 0.02          # 多边形拟合精度（越小越贴边，越小越易受噪声影响）
 AREA_MIN_RATIO = 0.002     # 最小面积比例（相对整幅）
-MAX_ANGLE_COS = 0.35       # 角度余弦上限（越小越接近直角矩形）
 BLUR_SIZE = 5              # 高斯模糊核（奇数）
 
 # ============================ 靶纸判据 ============================
@@ -293,14 +298,33 @@ def find_paper(img, roi, dbg_on=False):
     rx1 = rx + rw
     ry1 = ry + rh
     try:
-        rects = cv_lite.rgb888_find_rectangles_with_corners(
-            [IMG_H, IMG_W], img.to_numpy_ref(), CANNY_LO, CANNY_HI,
-            APPROX_EPS, AREA_MIN_RATIO, MAX_ANGLE_COS, BLUR_SIZE)
+        arr = img.to_numpy_ref()
     except Exception as e:
-        return None, 0, "[cv_lite异常:%s] " % e
+        return None, 0, "[to_numpy_ref异常:%s] " % e
+    # 参数自动扫：先用上次成功那组，没出矩形再依次试其它组，哪组出矩形就记住它
+    order = list(range(len(CV_PARAM_SETS)))
+    if _CV_SET[0] >= 0:
+        order = [_CV_SET[0]] + [i for i in order if i != _CV_SET[0]]
+    rects = []
+    rect_n = []
+    used = -1
+    for idx in order:
+        c1, c2, cosmax = CV_PARAM_SETS[idx]
+        try:
+            rects = cv_lite.rgb888_find_rectangles_with_corners(
+                [IMG_H, IMG_W], arr, c1, c2, APPROX_EPS, AREA_MIN_RATIO,
+                cosmax, BLUR_SIZE)
+        except Exception as e:
+            return None, 0, "[cv_lite异常:%s] " % e
+        rect_n.append(len(rects))
+        if rects:
+            used = idx
+            _CV_SET[0] = idx
+            break
     best = None
     n = 0
-    dbg = ""
+    dbg = "参数组%s→矩形%s " % (str(rect_n), CV_PARAM_SETS[used][:3]
+                              if used >= 0 else "-")
     for r in rects:
         if len(r) < 12:
             continue
@@ -597,21 +621,42 @@ class SpotDetector(object):
         return self.meas
 
 
+def apply_flip(sensor):
+    """把上下/左右翻转设置尽量都试一遍（不同固件的 set_vflip 签名/是否分通道不同，
+    现场实测过 set_vflip(True) 有时不生效，所以这里连通道一起试）。"""
+    for kw in ({}, {"chn": 0}, {"chn": 1}):
+        try:
+            sensor.set_vflip(CAM_VFLIP, **kw)
+        except Exception:
+            pass
+        try:
+            sensor.set_hmirror(CAM_HMIRROR, **kw)
+        except Exception:
+            pass
+
+
 def print_l_diag(img):
-    """丢靶时的亮度诊断，用来判断阈值该往哪调。"""
-    err = None
-    try:
-        st = img.get_statistics(roi=(0, 0, IMG_W, IMG_H))
-        print("  [诊断] L均=%.0f 中=%.0f 大=%.0f"
-              % (st.l_mean(), st.l_median(), st.l_max()))
-        return
-    except Exception as e:
-        err = e
-    try:
-        h = img.get_histogram(roi=(0, 0, IMG_W, IMG_H))
-        print("  [诊断] Otsu=%d" % h.get_threshold().l_value())
-    except Exception:
-        print("  [诊断] 统计不可用: %s" % err)
+    """丢靶时的亮度诊断：自己按网格采样（这块固件 get_statistics 返回 None）。"""
+    lo = 255
+    hi = 0
+    s = 0
+    k = 0
+    for gy in range(6):
+        y = int(IMG_H * (gy + 0.5) / 6)
+        for gx in range(8):
+            x = int(IMG_W * (gx + 0.5) / 8)
+            v = px_luma(img, x, y)
+            if v < 0:
+                continue
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+            s += v
+            k += 1
+    if k:
+        print("  [诊断] 采样L 均=%.0f 小=%d 大=%d（0~255）"
+              % (s / float(k), lo, hi))
 
 
 def main():
@@ -628,14 +673,11 @@ def main():
     sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
+    apply_flip(sensor)                 # 先试一次（有的固件要求配置前设置）
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
     # cv_lite 需要 RGB888（to_numpy_ref 拿到的就是它的数据）
     sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
-    try:
-        sensor.set_vflip(CAM_VFLIP)
-        sensor.set_hmirror(CAM_HMIRROR)
-    except Exception as e:
-        print("翻转设置失败(可忽略): %s" % e)
+    apply_flip(sensor)                 # 配置后再试一次
     Display.init(Display.ST7701, width=IMG_W, height=IMG_H,
                  to_ide=True, quality=DISPLAY_QUALITY)
     MediaManager.init()
@@ -665,9 +707,8 @@ def main():
     print("vision_check v17: 检测器=%s 画面VFLIP=%s HMIRROR=%s"
           % ("cv_lite四边形" if HAVE_CV else "亮块兜底(!)", CAM_VFLIP,
              CAM_HMIRROR))
-    print("  Canny=%d/%d eps=%.3f 面积比>=%.4f 角度cos<=%.2f 模糊%d"
-          % (CANNY_LO, CANNY_HI, APPROX_EPS, AREA_MIN_RATIO,
-             MAX_ANGLE_COS, BLUR_SIZE))
+    print("  参数组自动扫(cannyLo/Hi,角度cos): %s  eps=%.3f 面积比>=%.4f 模糊%d"
+          % (str(CV_PARAM_SETS), APPROX_EPS, AREA_MIN_RATIO, BLUR_SIZE))
     print("  长边%.0f~%.0f 比%.2f~%.2f 对比>=%d 暗边>=%.0f%%  跟踪窗=长边x%.2f+%d"
           % (PAPER_MIN_LONG, PAPER_MAX_LONG, PAPER_ASPECT_MIN,
              PAPER_ASPECT_MAX, PAPER_CONTRAST_MIN,
