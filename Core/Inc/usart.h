@@ -45,13 +45,16 @@ void MX_UART7_UART_Init(void);
 /* USER CODE BEGIN Prototypes */
 
 /* ---------------------------------------------------------------------------
- * UART7 引脚对（查过 CubeMX 芯片库：STM32H723VGT6 / LQFP100 上
- * UART7 只有这几种引脚组合，PF6/PF7 在这颗片子上根本不存在）：
- *   UART7_PAIR_PE : PE7 = UART7_RX, PE8 = UART7_TX   ← 板上丝印就是这一组，当前使用
- *   UART7_PAIR_PA : PA8 = UART7_RX, PB3 = UART7_TX   ← 备用（换板子才可能用上）
+ * UART7 引脚对（CubeMX 芯片库：STM32H723VGT6 / LQFP100 上 UART7 只有这三组）：
+ *   UART7_PAIR_PE  : PE7 = RX, PE8  = TX   ← 板上丝印写的就是这一组
+ *   UART7_PAIR_PB3 : PB3 = RX, PA15 = TX   ← 候选（怕丝印/走线不一致时扫出来）
+ *   UART7_PAIR_PA8 : PA8 = RX, PB4  = TX   ← 候选
+ * 自检模式会轮流切换这三组、每组发不同字符（U/V/W），
+ * 用串口助手看排针上出现的是哪个字符，就知道它实际连到哪组脚。
  * ------------------------------------------------------------------------- */
 #define UART7_PAIR_PE   0u
-#define UART7_PAIR_PA   1u
+#define UART7_PAIR_PB3  1u
+#define UART7_PAIR_PA8  2u
 
 void UART7_BindPins(uint8_t pair);
 uint8_t UART7_CurrentPins(void);

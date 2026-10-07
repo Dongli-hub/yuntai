@@ -58,23 +58,32 @@ void UART7_BindPins(uint8_t pair)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   s_uart7_pair = pair;
 
-  /* 先把两组脚都还原成模拟态，避免两个输出同时驱动 */
+  /* 先把所有候选脚都还原成模拟态，避免两个输出同时驱动 */
   HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7 | GPIO_PIN_8);
-  HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8);
-  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3);
+  HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8 | GPIO_PIN_15);
+  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3 | GPIO_PIN_4);
 
   GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull      = GPIO_PULLUP;
   GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
   GPIO_InitStruct.Alternate = GPIO_AF11_UART7;
 
-  if (pair == UART7_PAIR_PA)
+  if (pair == UART7_PAIR_PB3)
+  {
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_3;                   /* PB3 = UART7_RX */
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = GPIO_PIN_15;                  /* PA15 = UART7_TX */
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  }
+  else if (pair == UART7_PAIR_PA8)
   {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     GPIO_InitStruct.Pin = GPIO_PIN_8;                   /* PA8 = UART7_RX */
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    GPIO_InitStruct.Pin = GPIO_PIN_3;                   /* PB3 = UART7_TX */
+    GPIO_InitStruct.Pin = GPIO_PIN_4;                   /* PB4 = UART7_TX */
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   }
   else
@@ -256,11 +265,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
     __HAL_RCC_UART7_CLK_DISABLE();
 
     /**UART7 GPIO Configuration
-    PE7/PE8 或 PA8/PB3 ------> UART7
+    PE7/PE8 或 PB3/PA15 或 PA8/PB4 ------> UART7
     */
     HAL_GPIO_DeInit(GPIOE, GPIO_PIN_7|GPIO_PIN_8);
-    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8);
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8|GPIO_PIN_15);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3|GPIO_PIN_4);
 
   /* USER CODE BEGIN UART7_MspDeInit 1 */
 
@@ -297,57 +306,73 @@ void UART7_TxTest(void)
 {
     uint32_t n = 0u;
     uint32_t t;
+    int      i;
+    int      k;
     char     line[96];
-    static const char burst[] =
+    static const uint8_t pairs[3] = { UART7_PAIR_PE, UART7_PAIR_PB3,
+                                      UART7_PAIR_PA8 };
+    static const char *names[3] = { "PE7/PE8", "PB3/PA15", "PA8/PB4" };
+    static const char *bursts[3] = {
+        /* 0x55 / 0x56 / 0x57：看到哪个字母就知道是哪一组脚 */
         "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU"
-        "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU";   /* 64 个 0x55 */
+        "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU",
+        "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+        "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
+        "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+        "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+    };
     static const char head[] =
         "\r\n"
         "==================================================\r\n"
-        " TX SELF TEST     115200 8N1\r\n"
-        " sending on BOTH:  UART7 TX=PE08   USART1 TX=PA09\r\n"
-        " USB-TTL RX -> one of those TX pins, GND common\r\n"
-        " EVERY 200ms: 128 x 'U' (HEX 55) + one count line\r\n"
+        " UART7 PIN SCAN   115200 8N1\r\n"
+        " USART1(PA09) always sends the same data.\r\n"
+        " UART7 TX is switched every 1.5s between:\r\n"
+        "   U = PE8 (PE7/PE8)   V = PA15 (PB3/PA15)   W = PB4 (PA8/PB4)\r\n"
+        " Put USB-TTL RX on the UART7 header TX pin and see which\r\n"
+        " letter appears -> that tells which MCU pin that header uses.\r\n"
         "==================================================\r\n";
-
-    /* 按板上丝印固定引脚：RX=PE7, TX=PE8 */
-    UART7_BindPins(UART7_PAIR_PE);
 
     uart_tx_both(head, (uint16_t)(sizeof(head) - 1u));
 
     while (1)
     {
-        /* 每轮都连发两串 0x55（共 128 个）：
-           ASCII 视图是 UUUU...，HEX 视图是 55 55 55 ...。
-           持续发送的好处是：在串口助手里反复换波特率，
-           哪个波特率能读出一整串 U，就说明实际波特率是那个。 */
-        uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
-        uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
-
-        int len = snprintf(line, sizeof(line),
-                           "SELFTEST count=%lu   U7=PE08  U1=PA09\r\n",
-                           (unsigned long)n);
-        if (len > 0)
+        for (i = 0; i < 3; i++)
         {
-            uart_tx_both(line, (uint16_t)len);
-        }
+            /* 切到第 i 组候选引脚 */
+            UART7_BindPins(pairs[i]);
 
-        /* 回显 UART7 收到的字节（十六进制），方便看对面有没有在发 */
-        while (__HAL_UART_GET_FLAG(&huart7, UART_FLAG_RXNE) != 0u)
-        {
-            uint8_t b = (uint8_t)(huart7.Instance->RDR & 0xFFu);
-            int m = snprintf(line, sizeof(line), "[U7 RX] %02X ", b);
-            if (m > 0)
+            /* 这一组持续约 1.5 秒，期间每 100ms 发一串 */
+            for (k = 0; k < 15; k++)
             {
-                uart_tx_both(line, (uint16_t)m);
-            }
-        }
+                uart_tx_both(bursts[i], 32u);
 
-        n++;
-        t = HAL_GetTick();
-        while ((HAL_GetTick() - t) < 200u)
-        {
-            /* 空转 200ms */
+                int len = snprintf(line, sizeof(line),
+                                   "PAIR=%-8s char=%c  count=%lu\r\n",
+                                   names[i], bursts[i][0],
+                                   (unsigned long)n);
+                if (len > 0)
+                {
+                    uart_tx_both(line, (uint16_t)len);
+                }
+
+                /* 回显 UART7 收到的字节（十六进制） */
+                while (__HAL_UART_GET_FLAG(&huart7, UART_FLAG_RXNE) != 0u)
+                {
+                    uint8_t b = (uint8_t)(huart7.Instance->RDR & 0xFFu);
+                    int m = snprintf(line, sizeof(line), "[U7 RX] %02X ", b);
+                    if (m > 0)
+                    {
+                        uart_tx_both(line, (uint16_t)m);
+                    }
+                }
+
+                n++;
+                t = HAL_GetTick();
+                while ((HAL_GetTick() - t) < 100u)
+                {
+                    /* 空转 100ms */
+                }
+            }
         }
     }
 }

@@ -72,7 +72,7 @@ static void MPU_Config(void);
  *  自检接法：USB-TTL 的 RX 接 H723 的 UART7 TX(PE08)，GND 共地，
  *            串口助手 115200 / 8 / N / 1。测的时候把 K230 的数据线拔掉。
  * ========================================================================= */
-#define UART7_TX_TEST_LOOP   0
+#define UART7_TX_TEST_LOOP   1
 
 /* USER CODE END 0 */
 
