@@ -64,12 +64,18 @@ PAPER_MIN_LONG = 60        # 长边下限 px（2.2m 处约 60px；再小就是�
 PAPER_MAX_LONG = 480       # 长边上限 px
 PAPER_ASPECT_MIN = 1.05
 PAPER_ASPECT_MAX = 3.00
-PAPER_DENSITY_MIN = 0.70   # 外接框模式：实际像素/外接框面积
-PAPER_DENSITY_MIN_MR = 0.75  # 最小外接矩形模式（旋转不变，更准）
+PAPER_DENSITY_MIN = 0.70   # 兜底（没拟合出四边形时）：像素/外接框面积
+PAPER_DENSITY_QUAD_MIN = 0.72  # 拟合出四边形后：像素/四边形面积
 PAPER_CONTRAST_MIN = 40    # 内亮度 - 外亮度（0~255 量程）
 PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
 PAPER_DARK_FRAC_MIN = 0.70  # 外侧 12 个点里至少这么多比例要比内部暗
-TRACK_PAD = 45             # 跟踪窗 = 上次方框 + 余量
+# --- 四边形拟合（斜视时画出来是梯形，靶心=对角线交点=透视中心）---
+QUAD_SCAN_N = 7            # 每边取几行/几列做扫描
+QUAD_PERP_PX = 2           # 扫描时垂直方向各看几像素（跨过 1~2px 印刷细线）
+QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
+QUAD_AREA_HI = 1.35
+TRACK_K = 0.5              # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
+TRACK_PAD = 35
 HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
 LOST_FULL = 18             # 丢这么多帧后放弃小窗，改全图搜索
 FULL_EVERY = 3             # 每几帧做一次全图搜索
@@ -92,6 +98,7 @@ SPOT_THRESHOLDS = [        # LAB 阈值，可多组
 SPOT_MIN_AREA = 2
 SPOT_MAX_AREA = 3000
 SPOT_MAX_ASPECT = 3.0
+SPOT_EVERY = 4             # 每几帧搜一次光斑（光轴固定，中间帧复用）
 SPOT_ADAPT_GAIN = 0.06     # 光轴点慢速自适应（把误检拖跑的风险限制住）
 SPOT_ADAPT_LIMIT = 6.0     # 单次最多修正多少像素
 
@@ -416,38 +423,182 @@ def norm_bbox(bx, by, bw, bh, roi):
     return bx, by
 
 
-_MR = [0]                  # 0=没试过 1=可用 2=不可用（只探一次）
+def _bright(img, x, y, th):
+    """(x,y) 是不是“纸”；上下各看 2px 取最大，跨过 1~2px 印刷细线。"""
+    v = px_luma(img, x, y)
+    if v < 0:
+        return False
+    for d in (QUAD_PERP_PX, -QUAD_PERP_PX):
+        v2 = px_luma(img, x, y + d)
+        if v2 > v:
+            v = v2
+    return v >= th
 
 
-def blob_min_rect(b):
-    """blob 的最小外接矩形（旋转不变）：返回 (长边, 短边) 或 None。
+def _bright_x(img, x, y, th):
+    """左右各看 2px 取最大（扫上下边时用）。"""
+    v = px_luma(img, x, y)
+    if v < 0:
+        return False
+    for d in (QUAD_PERP_PX, -QUAD_PERP_PX):
+        v2 = px_luma(img, x + d, y)
+        if v2 > v:
+            v = v2
+    return v >= th
 
-    斜视/旋转时外接框会变大、密度就不准；最小外接矩形没这个问题。
-    取不到就返回 None，调用方退回外接框。
-    """
-    if _MR[0] == 2:
+
+def _edge(img, xc, yc, dx, dy, limit, th, use_x):
+    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“亮”像素的距离；找不到给 -1。"""
+    probe = _bright_x if use_x else _bright
+    if not probe(img, xc, yc, th):
+        return -1
+    lo = 0
+    hi = limit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if probe(img, xc + dx * mid, yc + dy * mid, th):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _lsq(pts):
+    """最小二乘拟合 v = a*u + b（点数<2 返回 None）。"""
+    n = len(pts)
+    if n < 2:
         return None
-    try:
-        cs = b.min_corners()
-    except Exception:
-        _MR[0] = 2
+    su = sv = suu = suv = 0.0
+    for u, v in pts:
+        su += u
+        sv += v
+        suu += u * u
+        suv += u * v
+    den = n * suu - su * su
+    if abs(den) < 1e-6:
         return None
-    _MR[0] = 1
-    try:
-        if (cs is None) or (len(cs) != 4):
+    a = (n * suv - su * sv) / den
+    return a, (sv - a * su) / float(n)
+
+
+def _lsq_robust(pts):
+    """Theil-Sen：点对斜率取中位数。斜视时部分扫描点会打到相邻边，
+    普通最小二乘会被带偏几十像素，中位数法最多容忍一半坏点。"""
+    n = len(pts)
+    if n < 2:
+        return None
+    if n == 2:
+        (u1, v1), (u2, v2) = pts[0], pts[1]
+        if abs(u2 - u1) < 1e-6:
             return None
-        d = []
-        for i in range(4):
-            x1, y1 = cs[i][0], cs[i][1]
-            x2, y2 = cs[(i + 1) % 4][0], cs[(i + 1) % 4][1]
-            d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
-        a = (d[0] + d[2]) / 2.0
-        c = (d[1] + d[3]) / 2.0
-        if a < 1.0 or c < 1.0:
-            return None
-        return (a, c) if a >= c else (c, a)
-    except Exception:
+        a = (v2 - v1) / (u2 - u1)
+        return a, v1 - a * u1
+    sl = []
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            du = pts[j][0] - pts[i][0]
+            if (du > 1.5) or (du < -1.5):
+                sl.append((pts[j][1] - pts[i][1]) / du)
+    if len(sl) < 2:
+        return _lsq(pts)
+    sl.sort()
+    m = len(sl)
+    a = sl[m // 2] if (m % 2) else 0.5 * (sl[m // 2 - 1] + sl[m // 2])
+    bs = []
+    for u, v in pts:
+        bs.append(v - a * u)
+    bs.sort()
+    nb = len(bs)
+    b = bs[nb // 2] if (nb % 2) else 0.5 * (bs[nb // 2 - 1] + bs[nb // 2])
+    return a, b
+
+
+def _cross(e1, e2):
+    """竖边 x = a*y+b 与横边 y = a*x+b 的交点。"""
+    al, bl = e1
+    at, bt = e2
+    den = 1.0 - al * at
+    if abs(den) < 1e-3:
         return None
+    x = (al * bt + bl) / den
+    return (x, at * x + bt)
+
+
+def quad_from_blob(img, bx, by, bw, bh, th):
+    """把亮块拟合成四边形（斜视=梯形）。
+    返回 (corners, center, long_side, short_side, quad_area) 或 None；
+    center = 两条对角线交点 = 透视意义下的靶心。"""
+    icx = int(bx + bw / 2.0)
+    icy = int(by + bh / 2.0)
+    lim_x = int(bw / 2.0) + 8
+    lim_y = int(bh / 2.0) + 8
+    left = []
+    right = []
+    top = []
+    bot = []
+    for k in range(1, QUAD_SCAN_N + 1):
+        yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
+        dl = _edge(img, icx, yy, -1, 0, lim_x, th, False)
+        dr = _edge(img, icx, yy, 1, 0, lim_x, th, False)
+        if dl >= 0:
+            left.append((yy, icx - dl))
+        if dr >= 0:
+            right.append((yy, icx + dr))
+        xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
+        du = _edge(img, xx, icy, 0, -1, lim_y, th, True)
+        dd = _edge(img, xx, icy, 0, 1, lim_y, th, True)
+        if du >= 0:
+            top.append((xx, icy - du))
+        if dd >= 0:
+            bot.append((xx, icy + dd))
+    if (len(left) < 3) or (len(right) < 3) or \
+            (len(top) < 3) or (len(bot) < 3):
+        return None
+    e_l = _lsq_robust(left)
+    e_r = _lsq_robust(right)
+    e_t = _lsq_robust(top)
+    e_b = _lsq_robust(bot)
+    if (e_l is None) or (e_r is None) or (e_t is None) or (e_b is None):
+        return None
+    tl = _cross(e_l, e_t)
+    tr = _cross(e_r, e_t)
+    br = _cross(e_r, e_b)
+    bl = _cross(e_l, e_b)
+    if (tl is None) or (tr is None) or (br is None) or (bl is None):
+        return None
+    for p in (tl, tr, br, bl):
+        if (p[0] < 1) or (p[0] > IMG_W - 2) or \
+                (p[1] < 1) or (p[1] > IMG_H - 2):
+            return None
+    c = (tl, tr, br, bl)
+    qa = 0.0
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        qa += x1 * y2 - x2 * y1
+    qa = abs(qa) * 0.5
+    if qa < 1.0:
+        return None
+    d = []
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+    dl1 = (d[0] + d[2]) / 2.0
+    dl2 = (d[1] + d[3]) / 2.0
+    if dl1 >= dl2:
+        long_side, short_side = dl1, dl2
+    else:
+        long_side, short_side = dl2, dl1
+    d1x, d1y = br[0] - tl[0], br[1] - tl[1]
+    d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
+    den = d1x * d2y - d1y * d2x
+    if abs(den) < 1e-6:
+        ctr = ((tl[0] + br[0]) / 2.0, (tl[1] + br[1]) / 2.0)
+    else:
+        t = ((tr[0] - tl[0]) * d2y - (tr[1] - tl[1]) * d2x) / den
+        ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
+    return (c, ctr, long_side, max(1.0, short_side), qa)
 
 
 class PaperDetector(object):
@@ -466,6 +617,7 @@ class PaperDetector(object):
         self.have = False
         self.lost = 0
         self.meas = None
+        self.corners = None
         self.pend = None       # [cu, cv, long, cnt, miss]
         self.frame = 0
         self.last_n = 0
@@ -476,7 +628,7 @@ class PaperDetector(object):
         self.err_msg = ""
 
     def roi(self):
-        r = int(max(self.w, self.h) * 0.6) + TRACK_PAD
+        r = int(max(self.w, self.h) * TRACK_K) + TRACK_PAD
         x = int(self.u - r)
         y = int(self.v - r)
         if x < 0:
@@ -508,9 +660,7 @@ class PaperDetector(object):
                 if self.pend[4] > PENDING_MISS:
                     self.pend = None
             return False
-        cu = cand[1] + cand[3] / 2.0
-        cv = cand[2] + cand[4] / 2.0
-        lo = cand[5]
+        cu, cv, lo = cand[11], cand[12], cand[5]
         if self.pend is None:
             self.pend = [cu, cv, lo, 1, 0]
             return False
@@ -532,8 +682,7 @@ class PaperDetector(object):
 
     def _accept(self, cand):
         x, y, w, h = cand[1], cand[2], cand[3], cand[4]
-        cu = x + w / 2.0
-        cv = y + h / 2.0
+        cu, cv = cand[11], cand[12]      # 四边形对角线交点 = 透视中心
         if not self.have:
             self.u, self.v, self.w, self.h = cu, cv, w, h
             self.have = True
@@ -547,6 +696,7 @@ class PaperDetector(object):
             if abs(h - self.h) > 2 * DEADBAND_PX:
                 self.h += SMOOTH * (h - self.h)
         self.meas = cand
+        self.corners = cand[10]
         self.lost = 0
         self.state = "锁定"
 
@@ -609,11 +759,11 @@ class PaperDetector(object):
                 self.state = "搜索"
         if cand is None:
             return None
-        px, x, y, w, h, long_side, aspect, density, ins, outs = self.meas
+        px, x, y, w, h, long_side, aspect, density, ins, outs = self.meas[:10]
         return {"center": (self.u, self.v), "box": (x, y, w, h),
                 "area": px, "aspect": aspect, "density": density,
                 "long_side": long_side, "contrast": ins - outs, "n": n,
-                "state": self.state}
+                "state": self.state, "corners": self.corners}
 
     def _find(self, img, roi, th):
         """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。"""
@@ -635,24 +785,31 @@ class PaperDetector(object):
             if w < 8 or h < 8:
                 continue
             box_long = w if w > h else h
-            mr = blob_min_rect(b)
-            if mr is not None:
-                if (mr[0] > 1.75 * box_long) or (mr[0] < 0.35 * box_long):
-                    mr = None
-            if mr is not None:
-                long_side, short_side = mr[0], mr[1]
-                density = px / float(long_side * short_side)
-                dens_min = PAPER_DENSITY_MIN_MR
-            else:
+            ins, outs, frac = paper_contrast(img, x, y, w, h)
+            if n <= 3:
+                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%%] " % (
+                    px, box_long, ins, outs, frac * 100.0)
+            if box_long < PAPER_MIN_LONG * 0.8 or \
+                    box_long > PAPER_MAX_LONG * 1.3:
+                continue
+            q = quad_from_blob(img, x, y, w, h, th)
+            corners = None
+            qa = 0.0
+            ctr = (x + w / 2.0, y + h / 2.0)
+            if q is not None:
+                corners, ctr, long_side, short_side, qa = q
+                if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+                    corners = None            # 拟合和亮块对不上，弃用
+            if corners is None:
                 long_side = box_long
                 short_side = w if w < h else h
                 density = px / float(w * h)
                 dens_min = PAPER_DENSITY_MIN
-            aspect = long_side / max(1.0, float(short_side))
-            ins, outs, frac = paper_contrast(img, x, y, w, h)
-            if n <= 3:
-                dbg += "[%dpx 长%.0f 比%.2f 密%.2f 内%d 外%d 暗边%.0f%%] " % (
-                    px, long_side, aspect, density, ins, outs, frac * 100.0)
+                ctr = (x + w / 2.0, y + h / 2.0)
+            else:
+                density = px / max(1.0, qa)
+                dens_min = PAPER_DENSITY_QUAD_MIN
+            aspect = long_side / max(1.0, short_side)
             if px < PAPER_MIN_AREA:
                 continue
             if px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
@@ -673,7 +830,7 @@ class PaperDetector(object):
             score = px * (0.5 + min(ins - outs, 80) / 80.0)
             if best is None or score > best[0]:
                 best = (score, (px, x, y, w, h, long_side, aspect, density,
-                                ins, outs))
+                                ins, outs, corners, ctr[0], ctr[1]))
         if best is None:
             return None, n, dbg
         return best[1], n, dbg
@@ -912,6 +1069,7 @@ def main():
     t_last_frame = time.ticks_ms()
     last_tgt = None
     last_tgt_t = 0
+    last_spot = None
     n_frames = 0
     n_frames_prev = 0
     n_hit = 0
@@ -994,7 +1152,9 @@ def main():
                 n_frames += 1
 
                 res = target_det.detect(img)
-                spot = spot_det.detect(img)
+                if ((n_frames % SPOT_EVERY) == 0) or (not spot_det.learned):
+                    last_spot = spot_det.detect(img)
+                spot = last_spot
 
                 # 丢靶滑行：短时间内沿用最后一次误差继续闭环
                 if res is not None:
@@ -1031,9 +1191,18 @@ def main():
                 # ---- 画到 IDE 画面 ----
                 if canvas is not None:
                     if res is not None:
-                        bx, by, bw, bh = res["box"]
-                        img.draw_rectangle(bx, by, bw, bh,
-                                           color=(0, 255, 0), thickness=2)
+                        qc = res.get("corners")
+                        if qc is not None:
+                            for i in range(4):
+                                a = qc[i]
+                                b = qc[(i + 1) % 4]
+                                img.draw_line(int(a[0]), int(a[1]),
+                                              int(b[0]), int(b[1]),
+                                              color=(0, 255, 0), thickness=2)
+                        else:
+                            bx, by, bw, bh = res["box"]
+                            img.draw_rectangle(bx, by, bw, bh,
+                                               color=(0, 255, 0), thickness=2)
                         img.draw_cross(int(res["center"][0]),
                                        int(res["center"][1]),
                                        color=(255, 0, 0), size=12,
