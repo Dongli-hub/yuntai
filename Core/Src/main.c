@@ -62,17 +62,19 @@ static void MPU_Config(void);
 /* USER CODE BEGIN 0 */
 
 /* ===========================================================================
- *  UART7 串口自检开关（2026-10-06 排障用）
+ *  串口自检开关（排障用）
  *
- *  1 = 上电后不跑云台程序，只在 UART7 上发 ASCII（每 300ms 一行，带计数），
- *      并把 RX 收到的字节以十六进制回显 —— 用来单独确认"UART7 硬件 + 接线"
- *      到底行不行，跟云台逻辑、IMU、电机全都无关。
- *  0 = 正常云台程序。
+ *  0 = 正常云台程序（链路走哪个串口由 gimbal_link.c 的 GL_LINK_ON_UART7 决定）
+ *  1 = UART7 引脚扫描：PE7/PE8 → PB3/PA15 → PA8/PB4 每 1.5s 轮换，
+ *      分别发 U / V / W，用来定位那个排针实际连到哪组脚。
+ *  2 = USART10 复用号扫描：AF4 / AF11 每 1.5s 轮换，分别发 A / B，
+ *      串口助手接 UART10 排针的 TX(PE03) 看是哪个字母。
  *
- *  自检接法：USB-TTL 的 RX 接 H723 的 UART7 TX(PE08)，GND 共地，
- *            串口助手 115200 / 8 / N / 1。测的时候把 K230 的数据线拔掉。
+ *  两种自检都会把同样的数据同时发到 USART1(PA09)，方便对照。
+ *  接法：USB-TTL 的 RX 接被测排针的 TX 脚，GND 必须共地，
+ *        串口助手 115200 / 8 / N / 1。
  * ========================================================================= */
-#define UART7_TX_TEST_LOOP   0
+#define UART_TX_TEST_MODE    2
 
 /* USER CODE END 0 */
 
@@ -113,10 +115,14 @@ int main(void)
   MX_SPI2_Init();
   MX_USART1_UART_Init();
   MX_UART7_UART_Init();          /* K230 链路（原来在 USART1 上） */
+  MX_USART10_UART_Init();        /* UART10 排针（RX=PE02 / TX=PE03） */
   /* USER CODE BEGIN 2 */
-#if UART7_TX_TEST_LOOP
-  /* 自检模式：只发 ASCII，不跑云台程序（不会返回） */
+#if (UART_TX_TEST_MODE == 1)
+  /* 自检 1：UART7 引脚扫描（不会返回） */
   UART7_TxTest();
+#elif (UART_TX_TEST_MODE == 2)
+  /* 自检 2：USART10 复用号扫描（不会返回） */
+  UART10_TxTest();
 #endif
   /* 先起链路，再起云台任务。
    * 顺序不能反：链路的 UART7 接收中断/发送通道要先就绪，

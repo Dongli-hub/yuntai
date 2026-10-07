@@ -26,6 +26,58 @@
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart7;
+UART_HandleTypeDef huart10;
+
+/* USART10（UART10 排针：RX=PE02 / TX=PE03）的复用号与状态 */
+static uint8_t s_uart10_af = UART10_AF4;
+static uint8_t s_uart10_err;
+
+uint8_t UART10_InitError(void)
+{
+  return s_uart10_err;
+}
+
+void UART10_BindPins(uint8_t af_sel)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  s_uart10_af = af_sel;
+
+  HAL_GPIO_DeInit(GPIOE, GPIO_PIN_2 | GPIO_PIN_3);
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+
+  GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Pin   = GPIO_PIN_2 | GPIO_PIN_3;   /* PE2=RX, PE3=TX */
+  GPIO_InitStruct.Alternate = (af_sel == UART10_AF11)
+                              ? GPIO_AF11_USART10 : GPIO_AF4_USART10;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+}
+
+/* USART10 init function */
+
+void MX_USART10_UART_Init(void)
+{
+  huart10.Instance = USART10;
+  huart10.Init.BaudRate = 115200;
+  huart10.Init.WordLength = UART_WORDLENGTH_8B;
+  huart10.Init.StopBits = UART_STOPBITS_1;
+  huart10.Init.Parity = UART_PARITY_NONE;
+  huart10.Init.Mode = UART_MODE_TX_RX;
+  huart10.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart10.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart10.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart10.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart10.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart10) != HAL_OK)
+  {
+    s_uart10_err = 1u;
+    return;
+  }
+  (void)HAL_UARTEx_SetTxFifoThreshold(&huart10, UART_TXFIFO_THRESHOLD_1_8);
+  (void)HAL_UARTEx_SetRxFifoThreshold(&huart10, UART_RXFIFO_THRESHOLD_1_8);
+  (void)HAL_UARTEx_DisableFifoMode(&huart10);
+}
 
 /* ---------------------------------------------------------------------------
  * UART7 引脚对管理（K230 链路用）
@@ -233,6 +285,18 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   /* USER CODE END UART7_MspInit 1 */
   }
+  else if(uartHandle->Instance==USART10)
+  {
+    /* USART10 的时钟和 USART1/6/9 同组（RCC_PERIPHCLK_USART16910）*/
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USART10;
+    PeriphClkInitStruct.Usart16ClockSelection = RCC_USART10CLKSOURCE_D2PCLK2;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      s_uart10_err = 1u;
+    }
+    __HAL_RCC_USART10_CLK_ENABLE();
+    UART10_BindPins(s_uart10_af);
+  }
 }
 
 void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
@@ -274,6 +338,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
   /* USER CODE BEGIN UART7_MspDeInit 1 */
 
   /* USER CODE END UART7_MspDeInit 1 */
+  }
+  else if(uartHandle->Instance==USART10)
+  {
+    __HAL_RCC_USART10_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_2|GPIO_PIN_3);
   }
 }
 
@@ -363,6 +432,88 @@ void UART7_TxTest(void)
                     if (m > 0)
                     {
                         uart_tx_both(line, (uint16_t)m);
+                    }
+                }
+
+                n++;
+                t = HAL_GetTick();
+                while ((HAL_GetTick() - t) < 100u)
+                {
+                    /* 空转 100ms */
+                }
+            }
+        }
+    }
+}
+
+/* ===========================================================================
+ * USART10 自检（main.c 的 UART_TX_TEST_MODE == 2 时进入）
+ *
+ * 同时往 USART10(PE3) 和 USART1(PA9) 发一样的内容；
+ * 每 1.5 秒在 AF4 / AF11 两种复用号之间切换：
+ *      'A' = AF4      'B' = AF11
+ * 串口助手接 UART10 排针的 TX(PE03)，看到哪种字母，就说明该用哪个复用号。
+ * ========================================================================= */
+static void uart10_tx_both(const char *s, uint16_t n)
+{
+    HAL_UART_Transmit(&huart10, (uint8_t *)s, n, 50u);
+    HAL_UART_Transmit(&huart1, (uint8_t *)s, n, 50u);
+}
+
+void UART10_TxTest(void)
+{
+    uint32_t n = 0u;
+    uint32_t t;
+    int      i;
+    int      k;
+    char     line[96];
+    static const uint8_t afs[2] = { UART10_AF4, UART10_AF11 };
+    static const char *names[2] = { "AF4", "AF11" };
+    static const char *bursts[2] = {
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    };
+    static const char head[] =
+        "\r\n"
+        "==================================================\r\n"
+        " USART10 TEST   115200 8N1    TX=PE3  RX=PE2\r\n"
+        " AF switches every 1.5s:   A = AF4    B = AF11\r\n"
+        " USB-TTL RX -> UART10 header TX (PE03), GND common\r\n"
+        " (the same data is also sent on USART1 PA09)\r\n"
+        "==================================================\r\n";
+
+    uart10_tx_both(head, (uint16_t)(sizeof(head) - 1u));
+
+    while (1)
+    {
+        for (i = 0; i < 2; i++)
+        {
+            /* 切换复用号：AF4 或 AF11 */
+            UART10_BindPins(afs[i]);
+
+            for (k = 0; k < 15; k++)
+            {
+                uart10_tx_both(bursts[i], 32u);
+
+                int len = snprintf(line, sizeof(line),
+                                   "U10 AF=%-4s char=%c count=%lu\r\n",
+                                   names[i], bursts[i][0],
+                                   (unsigned long)n);
+                if (len > 0)
+                {
+                    uart10_tx_both(line, (uint16_t)len);
+                }
+
+                /* 回显 USART10 收到的字节 */
+                while (__HAL_UART_GET_FLAG(&huart10, UART_FLAG_RXNE) != 0u)
+                {
+                    uint8_t b = (uint8_t)(huart10.Instance->RDR & 0xFFu);
+                    int m = snprintf(line, sizeof(line), "[U10 RX] %02X ", b);
+                    if (m > 0)
+                    {
+                        uart10_tx_both(line, (uint16_t)m);
                     }
                 }
 
