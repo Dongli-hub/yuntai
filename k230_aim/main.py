@@ -325,9 +325,17 @@ class Link(object):
 def order_corners(pts):
     cx = sum(p[0] for p in pts) / 4.0
     cy = sum(p[1] for p in pts) / 4.0
-    ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
-    ang.sort(key=lambda t: t[0])
-    return [list(t[1]) for t in ang]
+    try:
+        ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
+        ang.sort(key=lambda t: t[0])
+        return [list(t[1]) for t in ang]
+    except AttributeError:
+        # MicroPython 的 math 可能是裁剪版（例如没有 atan2）：
+        # 退化成"按 x 分左右、再按 y 分上下"。
+        s = sorted(pts, key=lambda p: p[0])
+        left = sorted(s[:2], key=lambda p: p[1])
+        right = sorted(s[2:], key=lambda p: p[1])
+        return [list(left[0]), list(right[0]), list(right[1]), list(left[1])]
 
 
 def quad_center_area_aspect(q):

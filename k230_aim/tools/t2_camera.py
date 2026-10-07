@@ -47,9 +47,17 @@ def order_corners(pts):
     """把 4 个角按绕中心的角度排序。"""
     cx = sum(p[0] for p in pts) / 4.0
     cy = sum(p[1] for p in pts) / 4.0
-    ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
-    ang.sort(key=lambda t: t[0])
-    return [list(t[1]) for t in ang]
+    try:
+        ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
+        ang.sort(key=lambda t: t[0])
+        return [list(t[1]) for t in ang]
+    except AttributeError:
+        # 这块固件的 math 是裁剪版（连 hypot 都没有），atan2 也可能没有：
+        # 退化成"按 x 分左右、再按 y 分上下"，靶纸大致竖直时结果一致。
+        s = sorted(pts, key=lambda p: p[0])
+        left = sorted(s[:2], key=lambda p: p[1])
+        right = sorted(s[2:], key=lambda p: p[1])
+        return [list(left[0]), list(right[0]), list(right[1]), list(left[1])]
 
 
 def quad_metrics(q):
@@ -65,10 +73,14 @@ def quad_metrics(q):
         center = (x0 + t * d1x, y0 + t * d1y)
     area = 0.5 * abs((x0 * y1 - x1 * y0) + (x1 * y2 - x2 * y1) +
                      (x2 * y3 - x3 * y2) + (x3 * y0 - x0 * y3))
-    sides = [math.hypot(x1 - x0, y1 - y0),
-             math.hypot(x2 - x1, y2 - y1),
-             math.hypot(x3 - x2, y3 - y2),
-             math.hypot(x0 - x3, y0 - y3)]
+    # 注意：MicroPython 的 math 模块没有 hypot()，只能用 sqrt 自己算
+    def dist(ax, ay, bx, by):
+        return math.sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+
+    sides = [dist(x1, y1, x0, y0),
+             dist(x2, y2, x1, y1),
+             dist(x3, y3, x2, y2),
+             dist(x0, y0, x3, y3)]
     a_len = (sides[0] + sides[2]) / 2.0
     b_len = (sides[1] + sides[3]) / 2.0
     return center, area, max(a_len, b_len) / max(1.0, min(a_len, b_len))
