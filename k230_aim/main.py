@@ -79,9 +79,9 @@ QUAD_PERP_PX = 2           # 扫描时垂直方向各看几像素（跨过 1~2px
 QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
 QUAD_AREA_HI = 1.35
 # 扫描用的相对亮度门槛（纸面有阴影时固定阈值会把暗的那半边切掉）
-SCAN_TH_K = 0.50
-SCAN_TH_LO = 50
-SCAN_TH_HI = 88
+SCAN_TH_K = 0.68           # 现场实证：0.5 时柜子面(≈95)会时过时不过 -> 边飞出去
+SCAN_TH_LO = 65
+SCAN_TH_HI = 125
 QUAD_LIM_PAD = 18          # 扫描半径 = 中心到亮块该边的距离 + 这个余量
 # 跟踪窗必须大于整张纸（四边形扫描要摸到四条边，窗口小了亮块会被裁掉）
 TRACK_K = 0.50             # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
@@ -744,10 +744,12 @@ class PaperDetector(object):
 
     def _accept(self, cand):
         x, y, w, h = cand[1], cand[2], cand[3], cand[4]
+        c = cand[10]
         cu, cv = cand[11], cand[12]      # 四边形对角线交点 = 透视中心
         if not self.have:
             self.u, self.v, self.w, self.h = cu, cv, w, h
             self.have = True
+            self.corners = c
         else:
             if abs(cu - self.u) > DEADBAND_PX:
                 self.u += SMOOTH * (cu - self.u)
@@ -757,8 +759,20 @@ class PaperDetector(object):
                 self.w += SMOOTH * (w - self.w)
             if abs(h - self.h) > 2 * DEADBAND_PX:
                 self.h += SMOOTH * (h - self.h)
+            # 四边形四角也做时间平滑：现场"比"逐帧在 1.26<->1.44 来回跳，
+            # 画出来就抖；平滑后绿框稳定（靶心用 u,v，本来就平滑）
+            if c is not None:
+                if self.corners is None:
+                    self.corners = c
+                else:
+                    sc = []
+                    for i in range(4):
+                        ax = self.corners[i][0]
+                        ay = self.corners[i][1]
+                        sc.append((ax + SMOOTH * (c[i][0] - ax),
+                                   ay + SMOOTH * (c[i][1] - ay)))
+                    self.corners = tuple(sc)
         self.meas = cand
-        self.corners = cand[10]
         self.lost = 0
         self.state = "锁定"
 
@@ -874,6 +888,16 @@ class PaperDetector(object):
                 corners, ctr, long_side, short_side, qa = q
                 if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
                     corners = None            # 拟合和亮块对不上，弃用
+                else:
+                    # 角点不能跑到亮块外框太远（否则就是某条边越过胶带摸到
+                    # 背景亮边）。超了就退回外接框：宁可稳的正矩形，
+                    # 也不要乱跳的梯形。
+                    lim = QUAD_LIM_PAD + 8
+                    for p in corners:
+                        if (p[0] < x - lim) or (p[0] > x + w + lim) or \
+                                (p[1] < y - lim) or (p[1] > y + h + lim):
+                            corners = None
+                            break
             if corners is None:
                 long_side = box_long
                 short_side = w if w < h else h
@@ -1057,14 +1081,26 @@ def init_camera():
     sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
+    apply_flip(sensor)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
     sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
-    try:
-        sensor.set_vflip(CAM_VFLIP)
-        sensor.set_hmirror(CAM_HMIRROR)
-    except Exception as e:
-        print("翻转设置失败(可忽略): %s" % e)
+    apply_flip(sensor)
     return sensor
+
+
+def apply_flip(sensor):
+    """上下/左右翻转尽量多试几种写法（不同固件的 set_vflip 签名/是否分通道不同，
+    现场实测 set_vflip(True) 有时不生效）。若最后还是倒的，就把摄像头模块整体
+    转 180° 装，并把 CAM_VFLIP 改回 False。"""
+    for kw in ({}, {"chn": 0}, {"chn": 1}):
+        try:
+            sensor.set_vflip(CAM_VFLIP, **kw)
+        except Exception:
+            pass
+        try:
+            sensor.set_hmirror(CAM_HMIRROR, **kw)
+        except Exception:
+            pass
 
 
 def print_fpioa_state():
