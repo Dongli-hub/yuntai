@@ -62,7 +62,7 @@ PAPER_MIN_AREA = 900       # 最小像素面积（2.2m 处 A4 约 60x42px ≈ 20
 PAPER_MAX_AREA_RATIO = 0.85
 PAPER_MIN_LONG = 60        # 长边下限 px（2.2m 处约 60px；再小就是背景小亮块）
 PAPER_MAX_LONG = 480       # 长边上限 px
-PAPER_ASPECT_MIN = 1.05
+PAPER_ASPECT_MIN = 0.70    # A4=1.41；斜视透视下会缩到接近 1
 PAPER_ASPECT_MAX = 3.00
 PAPER_DENSITY_MIN = 0.70   # 兜底（没拟合出四边形时）：像素/外接框面积
 PAPER_DENSITY_QUAD_MIN = 0.72  # 拟合出四边形后：像素/四边形面积
@@ -74,8 +74,16 @@ QUAD_SCAN_N = 7            # 每边取几行/几列做扫描
 QUAD_PERP_PX = 2           # 扫描时垂直方向各看几像素（跨过 1~2px 印刷细线）
 QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
 QUAD_AREA_HI = 1.35
-TRACK_K = 0.5              # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
-TRACK_PAD = 35
+# 扫描用的相对亮度门槛（纸面有阴影时固定阈值会把暗的那半边切掉）
+SCAN_TH_K = 0.50
+SCAN_TH_LO = 50
+SCAN_TH_HI = 88
+QUAD_LIM_K = 0.62          # 扫描半径 = 亮块边长x这个系数（超出亮块才能摸到真边）
+QUAD_LIM_PAD = 12
+# 跟踪窗必须大于整张纸（四边形扫描要摸到四条边，窗口小了亮块会被裁掉）
+TRACK_K = 0.50             # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
+TRACK_PAD = 30
+SEED_EVERY = 2             # 锁定后每几帧做一次亮块搜索（其它帧只做四边形复测）
 HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
 LOST_FULL = 18             # 丢这么多帧后放弃小窗，改全图搜索
 FULL_EVERY = 3             # 每几帧做一次全图搜索
@@ -423,40 +431,80 @@ def norm_bbox(bx, by, bw, bh, roi):
     return bx, by
 
 
-def _bright(img, x, y, th):
-    """(x,y) 是不是“纸”；上下各看 2px 取最大，跨过 1~2px 印刷细线。"""
-    v = px_luma(img, x, y)
-    if v < 0:
-        return False
-    for d in (QUAD_PERP_PX, -QUAD_PERP_PX):
-        v2 = px_luma(img, x, y + d)
-        if v2 > v:
-            v = v2
-    return v >= th
+def _scan_th(ref):
+    """按纸面自身亮度定的扫描门槛（纸面有阴影时也能摸到真边）。"""
+    t = ref * SCAN_TH_K
+    if t < SCAN_TH_LO:
+        t = SCAN_TH_LO
+    elif t > SCAN_TH_HI:
+        t = SCAN_TH_HI
+    return t
 
 
-def _bright_x(img, x, y, th):
-    """左右各看 2px 取最大（扫上下边时用）。"""
-    v = px_luma(img, x, y)
-    if v < 0:
-        return False
-    for d in (QUAD_PERP_PX, -QUAD_PERP_PX):
-        v2 = px_luma(img, x + d, y)
-        if v2 > v:
-            v = v2
-    return v >= th
+def _requad(img, seed):
+    """快速复测：拿上次的四边形当种子只重扫四条边（省一次 find_blobs 的固定开销）。
+
+    seed/main 的测量元组: (px,x,y,w,h,long,aspect,den,ins,outs,corners,cx,cy)
+    返回同样格式的 (best, 亮块数=0, 诊断串)。
+    """
+    px = seed[0]
+    c = seed[10]
+    if c is None:
+        return None, 0, ""
+    xs = (c[0][0], c[1][0], c[2][0], c[3][0])
+    ys = (c[0][1], c[1][1], c[2][1], c[3][1])
+    bx = min(xs)
+    by = min(ys)
+    w = max(xs) - bx
+    h = max(ys) - by
+    if w < 8 or h < 8:
+        return None, 0, ""
+    ins, outs, frac = paper_contrast(img, bx, by, w, h)
+    if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
+            (frac < PAPER_DARK_FRAC_MIN):
+        return None, 0, "[复测:亮度] "
+    q = quad_from_blob(img, bx, by, w, h, _scan_th(ins))
+    if q is None:
+        return None, 0, "[复测:拟合] "
+    corners, ctr, long_side, short_side, qa = q
+    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+        return None, 0, "[复测:面积] "
+    aspect = long_side / max(1.0, short_side)
+    if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG) or \
+            (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
+        return None, 0, "[复测:尺寸] "
+    return (px, bx, by, w, h, long_side, aspect, px / max(1.0, qa),
+            ins, outs, corners, ctr[0], ctr[1]), 0, ""
 
 
-def _edge(img, xc, yc, dx, dy, limit, th, use_x):
-    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“亮”像素的距离；找不到给 -1。"""
-    probe = _bright_x if use_x else _bright
-    if not probe(img, xc, yc, th):
+def _probe(img, x, y, dx, dy, th):
+    """沿射线前后各 2px 取样，多数（>=3/5）亮才算“纸”。
+
+    印刷圆圈的细线在“圆的正左/正右”几乎与横向射线垂直，只做垂直方向
+    取最大跨不过去（扫描会停在第一圈圆环，四边形缩到圆环范围）；
+    沿射线取多数则与细线角度无关。
+    """
+    if dx:
+        offs = ((x - 2, y), (x - 1, y), (x, y), (x + 1, y), (x + 2, y))
+    else:
+        offs = ((x, y - 2), (x, y - 1), (x, y), (x, y + 1), (x, y + 2))
+    k = 0
+    for p in offs:
+        v = px_luma(img, p[0], p[1])
+        if v >= th:
+            k += 1
+    return k >= 3
+
+
+def _edge(img, xc, yc, dx, dy, limit, th):
+    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“纸”像素的距离；找不到给 -1。"""
+    if not _probe(img, xc, yc, dx, dy, th):
         return -1
     lo = 0
     hi = limit
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if probe(img, xc + dx * mid, yc + dy * mid, th):
+        if _probe(img, xc + dx * mid, yc + dy * mid, dx, dy, th):
             lo = mid
         else:
             hi = mid - 1
@@ -530,23 +578,23 @@ def quad_from_blob(img, bx, by, bw, bh, th):
     center = 两条对角线交点 = 透视意义下的靶心。"""
     icx = int(bx + bw / 2.0)
     icy = int(by + bh / 2.0)
-    lim_x = int(bw / 2.0) + 8
-    lim_y = int(bh / 2.0) + 8
+    lim_x = int(bw * QUAD_LIM_K) + QUAD_LIM_PAD
+    lim_y = int(bh * QUAD_LIM_K) + QUAD_LIM_PAD
     left = []
     right = []
     top = []
     bot = []
     for k in range(1, QUAD_SCAN_N + 1):
         yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
-        dl = _edge(img, icx, yy, -1, 0, lim_x, th, False)
-        dr = _edge(img, icx, yy, 1, 0, lim_x, th, False)
+        dl = _edge(img, icx, yy, -1, 0, lim_x, th)
+        dr = _edge(img, icx, yy, 1, 0, lim_x, th)
         if dl >= 0:
             left.append((yy, icx - dl))
         if dr >= 0:
             right.append((yy, icx + dr))
         xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
-        du = _edge(img, xx, icy, 0, -1, lim_y, th, True)
-        dd = _edge(img, xx, icy, 0, 1, lim_y, th, True)
+        du = _edge(img, xx, icy, 0, -1, lim_y, th)
+        dd = _edge(img, xx, icy, 0, 1, lim_y, th)
         if du >= 0:
             top.append((xx, icy - du))
         if dd >= 0:
@@ -708,7 +756,15 @@ class PaperDetector(object):
         self.did_full = False
         try:
             if self.have and self.lost < LOST_FULL:
-                cand, n, dbg = self._find(img, self.roi(), PAPER_TH)
+                if ((self.frame % SEED_EVERY) == 0) or (self.meas is None):
+                    cand, n, dbg = self._find(img, self.roi(), PAPER_TH)
+                else:
+                    # 隔帧只做四边形复测（省 ~13ms），靶心仍每帧更新；
+                    # 复测失败立刻补一次完整搜索。
+                    cand, n, dbg = self._find(img, self.roi(), PAPER_TH,
+                                              self.meas)
+                    if cand is None:
+                        cand, n, dbg = self._find(img, self.roi(), PAPER_TH)
                 if (cand is not None) and (not self._size_ok(cand[5])):
                     dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
                     cand = None
@@ -765,8 +821,12 @@ class PaperDetector(object):
                 "long_side": long_side, "contrast": ins - outs, "n": n,
                 "state": self.state, "corners": self.corners}
 
-    def _find(self, img, roi, th):
-        """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。"""
+    def _find(self, img, roi, th, seed=None):
+        """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。
+
+        seed=上次测量元组时走快速复测（只重扫四边形，不找亮块）。"""
+        if seed is not None:
+            return _requad(img, seed)
         best = None
         n = 0
         dbg = ""
@@ -792,7 +852,7 @@ class PaperDetector(object):
             if box_long < PAPER_MIN_LONG * 0.8 or \
                     box_long > PAPER_MAX_LONG * 1.3:
                 continue
-            q = quad_from_blob(img, x, y, w, h, th)
+            q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
             corners = None
             qa = 0.0
             ctr = (x + w / 2.0, y + h / 2.0)
