@@ -1,68 +1,91 @@
 # -*- coding: utf-8 -*-
-"""vision_check.py —— K230 视觉验证 v17（改用 cv_lite 边缘四边形检测）
+"""vision_check.py —— K230 视觉验证 v13
 
-画面标注：绿四边形=靶纸四条边（贴着黑胶带）、红十=靶心(对角线交点)、黄圈=激光光斑
-终端每 0.5s 一行：FPS / 靶心 / 长边 / 比 / 对比 / 距离 / 光斑 / 误差 / 分段耗时
+在 CanMV IDE 里直接运行。画面显示在 IDE 帧缓冲，终端看数据。
 
-—— v17 相对 v16 的改动 ——
-1) **换检测器**：靶纸四边形不再用"亮块+扫描拟合"，改成资料里 cv_lite 的
-   `rgb888_find_rectangles_with_corners`（Canny 边缘 + 多边形拟合，C 加速，
-   直接给 4 个角点）。它是沿着**真实的边**（黑胶带内沿）走的，不像亮块那样
-   会被阴影/圆环/背景亮边带偏——现场"边跳变"就是这么来的。
-   找不到/装不了 cv_lite 时，退回"亮块外接框"这种最简兜底（只画正矩形）。
-2) **画面倒置**：新加 CAM_VFLIP / CAM_HMIRROR 开关（第 40 行），
-   画面倒着就把 CAM_VFLIP 设 True（sensor.set_vflip）。传感器翻转后
-   检测和绘制都在同一个坐标系里，靶心/误差不受影响。
-3) **删掉冗余**：v13~v16 试过的"行/列二分扫描、Theil-Sen 拟合、最小外接矩形、
-   快速复测"那套代码全部删除，只留当前在用的判据。
-4) 画面仍隔帧推送（to_ide 传输比处理慢，追太紧会撕裂/花屏）；
-   光斑每 SPOT_EVERY 帧搜一次（光轴固定，位置不变）。
+画面标注：
+    绿四边形 = 贴住黑胶带内沿的靶纸四边形（斜视时是梯形，不是正矩形）
+    红十     = 靶心 = 四边形**两条对角线的交点**（透视不变的中心）
+    黄圈     = 激光光斑
 
-判据（都来自现场日志实测）：真靶纸 长边184~225px、斜视时更短；
-误检是 36~38px 小亮块或 71~300px 的背景块。所以保留：
-长边 60~480px、长宽比 0.70~3.0、内外对比≥40 且外侧 12 点≥70% 更暗、
-以及跟踪尺寸闸门(0.55~1.45x)+连续确认(3次)+重新锁定尺寸闸门(0.4~2.5x)。
+终端每 0.5 秒一行：
+    FPS=32.0 靶=纸(锁定) 靶心=(430,300) 长边=222px 比1.41 密0.93 对比112
+             距离≈0.60m 光斑=(319,216) 误差=(111,84)px=139.2px(17.9°)
+             | ms 取图5 目标15 光斑3 显示3 | 靶12/60 斑12
+
+—— 为什么用四边形而不是外接矩形（v13 的关键改动）——
+1) 外接矩形（正四边形）在斜视时是"包住梯形的最小矩形"：边不贴靶纸，
+   中心也不等于靶纸中心（透视下偏差随倾角增大），靶心自然就飘。
+2) v13 用亮块当种子，向上下左右二分扫描出四条边，最小二乘拟合，
+   求出四个角点 → 画出来是贴着黑胶带的梯形；靶心取**对角线交点**，
+   这就是透视变换下的真正中心（也是同心圆圆心），与倾角无关。
+3) 边长/面积也从四边形算：长边=两条长边均值（近大远小已含在内），
+   密度=亮块像素/四边形面积（旋转、透视都不影响），距离更准。
+
+—— 帧率说明（为什么不是 80fps）——
+相机/ISP 确实能跑 90fps，瓶颈在 MicroPython 的经典 image 模块：
+实测每次 find_blobs 约 10ms 固定开销 + 约 0.07μs/像素（日志反推）。
+所以 v13 把开销压到“每帧只做一次 find_blobs”：
+  · 靶纸：只在跟踪窗里搜一次（窗口=四边形长边x0.5+35px）；
+  · 激光光斑：光轴固定不动，每 SPOT_EVERY 帧才搜一次，其它帧复用。
+想再往上（40~60fps）就要换成资料里的 cv_lite（C 加速：
+rgb888_find_rectangles_with_corners 直接给角点、rgb888_pnp_distance 直接给距离）。
+
+依据（现场日志实测）：真靶纸 长边184~190px / 密度0.83~0.96 / 对比90+；
+误检 密度0.51~0.73 / 对比22~67，还有一批长边36~38px 的小亮块。
+调参顺序：PAPER_TH(58→52/64) → PAPER_CONTRAST_MIN(40) → PAPER_DARK_FRAC_MIN(0.70)。
 """
 import os
 import time
 import math
 
-# ============================ 相机 / 显示 ============================
+# ============================ 画面 / 显示 ============================
 IMG_W = 640
 IMG_H = 480
-DISPLAY_QUALITY = 40       # IDE 画面 JPEG 质量（越小传输越快）
-SHOW_EVERY = 2             # 每几帧推一次画面（识别仍每帧都算）
-CAM_VFLIP = True           # 画面上下颠倒 -> True（你现在需要这个）
+DISPLAY_QUALITY = 40       # 越小传输越快（画面撕裂跟传输速度直接相关）
+SHOW_EVERY = 2             # 每几帧往 IDE 推一次画面（识别仍每帧都算）
+CAM_VFLIP = True           # 画面上下颠倒 -> True
 CAM_HMIRROR = False        # 画面左右镜像 -> True
 
-# ============================ cv_lite 四边形检测 ============================
-# Canny 阈值/角度容差会自动在上面的参数组里挑一组能用的（现场太暗时
-# 例程默认的 50/150 会一个矩形都找不到），所以这里给 3 组由严到松。
-CV_PARAM_SETS = [
-    (50, 150, 0.35),       # 资料例程默认
-    (30, 90, 0.50),        # 偏暗/低对比场景
-    (20, 60, 0.65),        # 更宽松（斜视梯形角度偏差大时用）
-]
-_CV_SET = [-1]             # 记住哪组能用（-1=还没定）
-APPROX_EPS = 0.02          # 多边形拟合精度（越小越贴边，越小越易受噪声影响）
-AREA_MIN_RATIO = 0.002     # 最小面积比例（相对整幅）
-BLUR_SIZE = 5              # 高斯模糊核（奇数）
-
-# ============================ 靶纸判据 ============================
-PAPER_MIN_LONG = 60        # 四边形长边下限 px（2.2m 处 A4 约 60px）
-PAPER_MAX_LONG = 480       # 上限 px
-PAPER_ASPECT_MIN = 0.70    # 长边/短边（A4=1.41，斜视透视会缩到接近 1）
+# ============================ 靶纸检测 ============================
+PAPER_TH = 58              # 亮度阈值（0~100）
+PAPER_TH_ALT = 72          # 兜底阈值：全图第一遍失败时再试一次
+PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
+PAPER_B_MAX = 32           # |b| 上限
+PAPER_MIN_AREA = 900       # 最小亮块像素（2.2m 处 A4 约 60x42px ≈ 2000px）
+PAPER_MAX_AREA_RATIO = 0.85
+PAPER_MIN_LONG = 60        # 四边形长边下限 px
+PAPER_MAX_LONG = 480       # 四边形长边上限 px
+PAPER_ASPECT_MIN = 0.70    # 长边/短边（A4=1.41；斜视透视下会缩到接近 1，甚至 <1）
 PAPER_ASPECT_MAX = 3.00
+PAPER_DENSITY_MIN = 0.70   # 兜底（没拟合出四边形时）：像素/外接框面积
+PAPER_DENSITY_QUAD_MIN = 0.72   # 拟合出四边形后：像素/四边形面积
 PAPER_CONTRAST_MIN = 40    # 内亮度 - 外亮度（0~255 量程）
 PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
 PAPER_DARK_FRAC_MIN = 0.70  # 外侧 12 个点里至少这么多比例比内部暗
 
-# ============================ 跟踪 / 闸门 ============================
+# 四边形拟合
+QUAD_SCAN_N = 7            # 每边取几行/几列做扫描（越多越稳，越慢）
+QUAD_PERP_PX = 2           # 扫描时上下（左右）各看几像素，跨过 1~2px 印刷细线
+QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
+QUAD_AREA_HI = 1.35
+# 扫描用的**相对**亮度门槛：纸面有阴影时，固定阈值会把暗的那半边切掉，
+# 四边形就被拉进纸里（现场截图里"不贴胶带"就是这么来的）。
+# 改成按纸面自身亮度 ins 的比例定：th_scan = ins*SCAN_TH_K，再夹在上下限之间。
+# 胶带(≈20~55)低于它、纸面阴影侧(≈90~130)高于它 → 边才落在胶带内沿。
+SCAN_TH_K = 0.50
+SCAN_TH_LO = 50
+SCAN_TH_HI = 88
+QUAD_LIM_PAD = 18          # 扫描半径 = 中心到亮块该边的距离 + 这个余量
+
+# 跟踪 / 闸门
+# 跟踪窗必须**大于整张纸**（四边形扫描要摸到纸的四条边，窗口小了亮块会被裁掉）
 TRACK_K = 0.50             # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
 TRACK_PAD = 30
+SEED_EVERY = 2             # 锁定后每几帧做一次亮块搜索（其它帧只做四边形复测）
 HOLD_FRAMES = 15           # 丢靶后还画多少帧
 LOST_FULL = 18             # 丢这么多帧后放弃小窗，改全图搜索
-FULL_EVERY = 2             # 每几帧做一次全图搜索
+FULL_EVERY = 3             # 每几帧做一次全图搜索
 SMOOTH = 0.55              # 平滑系数
 DEADBAND_PX = 1.5          # 平滑死区（小于它不动，画面不抖）
 SIZE_GATE_LO = 0.55        # 跟踪时允许的长边变化范围
@@ -70,22 +93,21 @@ SIZE_GATE_HI = 1.45
 CONFIRM_N = 3              # 全图候选连续确认几次才算重新锁定
 CONFIRM_DXY = 35           # 确认时的位置一致范围 px
 CONFIRM_DSIZE = 0.60       # 确认时的尺寸一致范围
-RELOCK_LO = 0.40           # 重新锁定时相对上次的尺寸范围（纸不会半秒变 1/4 大）
-RELOCK_HI = 2.50
-RELOCK_FREE_LOST = 100     # 丢靶超过这么多帧就放开尺寸限制（靶纸可能被搬远）
 PENDING_MISS = 3           # 确认过程中允许漏几次
 
 # ============================ 激光光斑 ============================
 SPOT_THRESHOLDS = [
-    (88, 100, -40, 90, -50, 90),   # 过曝白芯（纸面 LAB-L≈78 到不了）
-    (58, 100, 25, 90, -20, 70),    # 明显红边（a>=25）
+    # 过曝白芯：纸面 LAB-L≈78 到不了 88，只有激光点会这么亮
+    (88, 100, -40, 90, -50, 90),
+    # 红边：a>=25 才算明显偏红（原来 a>=6 太松，纸面暖色区也进来了）
+    (58, 100, 25, 90, -20, 70),
 ]
 SPOT_MIN_AREA = 2
 SPOT_MAX_AREA = 2500
 SPOT_MAX_ASPECT = 3.0
 SPOT_ROI_HALF = 45         # 只在学习到的光轴点附近找
 SPOT_LEARN_FRAMES = 10
-SPOT_NEAR_PX = 12
+SPOT_NEAR_PX = 12          # 学习时位置一致性要求（松了会锁到误检上）
 SPOT_EVERY = 4             # 每几帧搜一次光斑（光轴固定，中间帧复用）
 
 # ============================ 距离 ============================
@@ -107,12 +129,6 @@ MSG_SET_ZERO = 0x13
 MSG_GIMBAL_STATE = 0x90
 MSG_TEXT = 0x93
 ST_READY = 0x10
-
-try:
-    import cv_lite
-    HAVE_CV = True
-except Exception:
-    HAVE_CV = False
 
 
 def _crc_table():
@@ -212,12 +228,202 @@ def px_luma(img, x, y):
     return luma(p[0], p[1], p[2])
 
 
-def paper_contrast(img, x, y, w, h):
-    """内亮外暗校验：返回 (内部平均亮度, 外侧平均亮度, 外侧合格比例)。
+def _probe(img, x, y, dx, dy, th):
+    """沿射线前后各 QUAD_PERP_PX 取样，多数（>=3/5）亮才算“纸”。
 
-    外侧取 12 个点（四边各 3 个），要求至少 PAPER_DARK_FRAC_MIN 的比例
-    明显比内部暗——背景柜子那种“只有一边有暗边”的亮块因此过不了。
+    关键：印刷圆圈的细线在“圆的正左/正右”位置几乎与横向射线垂直，
+    只做垂直方向取最大是跨不过去的（扫描会停在第一圈圆环上，四边形
+    就缩到圆环范围）。沿射线方向取多数则与细线角度无关，一律能跨过。
     """
+    if dx:
+        offs = ((x - 2, y), (x - 1, y), (x, y), (x + 1, y), (x + 2, y))
+    else:
+        offs = ((x, y - 2), (x, y - 1), (x, y), (x, y + 1), (x, y + 2))
+    k = 0
+    for p in offs:
+        v = px_luma(img, p[0], p[1])
+        if v >= th:
+            k += 1
+    return k >= 3
+
+
+def _edge(img, xc, yc, dx, dy, limit, th):
+    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“纸”像素的距离；找不到返回 -1。
+
+    纸是凸的：沿任一条从内部出发的射线，先纸后不纸（细线由 _probe 的
+    多数投票跨过去），所以可以二分。
+    """
+    if not _probe(img, xc, yc, dx, dy, th):
+        return -1
+    lo = 0
+    hi = limit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _probe(img, xc + dx * mid, yc + dy * mid, dx, dy, th):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _lsq(pts):
+    """最小二乘拟合 v = a*u + b。pts=[(u,v), ...]，点数<2 返回 None。"""
+    n = len(pts)
+    if n < 2:
+        return None
+    su = sv = suu = suv = 0.0
+    for u, v in pts:
+        su += u
+        sv += v
+        suu += u * u
+        suv += u * v
+    den = n * suu - su * su
+    if abs(den) < 1e-6:
+        return None
+    a = (n * suv - su * sv) / den
+    b = (sv - a * su) / float(n)
+    return a, b
+
+
+def _lsq_robust(pts):
+    """Theil-Sen：取所有点对斜率的中位数，再取截距中位数。
+
+    斜视梯形的扫描里，靠近上/下边的行可能打到“上边/下边”而不是“左边/右边”，
+    这些点能把普通最小二乘带偏几十像素；中位数法最多容忍一半的坏点。
+    """
+    n = len(pts)
+    if n < 2:
+        return None
+    if n == 2:
+        (u1, v1), (u2, v2) = pts[0], pts[1]
+        if abs(u2 - u1) < 1e-6:
+            return None
+        a = (v2 - v1) / (u2 - u1)
+        return a, v1 - a * u1
+    sl = []
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            du = pts[j][0] - pts[i][0]
+            if (du > 1.5) or (du < -1.5):
+                sl.append((pts[j][1] - pts[i][1]) / du)
+    if len(sl) < 2:
+        return _lsq(pts)
+    sl.sort()
+    m = len(sl)
+    if m % 2:
+        a = sl[m // 2]
+    else:
+        a = 0.5 * (sl[m // 2 - 1] + sl[m // 2])
+    bs = []
+    for u, v in pts:
+        bs.append(v - a * u)
+    bs.sort()
+    nb = len(bs)
+    if nb % 2:
+        b = bs[nb // 2]
+    else:
+        b = 0.5 * (bs[nb // 2 - 1] + bs[nb // 2])
+    return a, b
+
+
+def _cross(e1, e2):
+    """e1 是竖边 x = a*y + b，e2 是横边 y = a*x + b，返回交点或 None。"""
+    al, bl = e1
+    at, bt = e2
+    den = 1.0 - al * at
+    if abs(den) < 1e-3:
+        return None
+    x = (al * bt + bl) / den
+    y = at * x + bt
+    return (x, y)
+
+
+def quad_from_blob(img, bx, by, bw, bh, th):
+    """用行/列二分扫描把亮块拟合成四边形。
+
+    返回 (corners, center, long_side, short_side, quad_area) 或 None。
+    corners=(TL,TR,BR,BL)；center=两条对角线交点（透视意义下的中心）。
+    """
+    icx = int(bx + bw / 2.0)
+    icy = int(by + bh / 2.0)
+    # 每条边的扫描半径 = 中心到亮块该边的距离 + QUAD_LIM_PAD。
+    # 不能放太远：越过黑胶带后会摸到背景亮边，那一条边就会“跳”出去
+    # （现场截图里上边飞到柜顶就是这个原因）。
+    lim_l = icx - int(bx) + QUAD_LIM_PAD
+    lim_r = int(bx + bw) - icx + QUAD_LIM_PAD
+    lim_u = icy - int(by) + QUAD_LIM_PAD
+    lim_d = int(by + bh) - icy + QUAD_LIM_PAD
+    left = []
+    right = []
+    top = []
+    bot = []
+    for k in range(1, QUAD_SCAN_N + 1):
+        yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
+        dl = _edge(img, icx, yy, -1, 0, lim_l, th)
+        dr = _edge(img, icx, yy, 1, 0, lim_r, th)
+        if dl >= 0:
+            left.append((yy, icx - dl))
+        if dr >= 0:
+            right.append((yy, icx + dr))
+        xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
+        du = _edge(img, xx, icy, 0, -1, lim_u, th)
+        dd = _edge(img, xx, icy, 0, 1, lim_d, th)
+        if du >= 0:
+            top.append((xx, icy - du))
+        if dd >= 0:
+            bot.append((xx, icy + dd))
+    if (len(left) < 3) or (len(right) < 3) or \
+            (len(top) < 3) or (len(bot) < 3):
+        return None
+    e_l = _lsq_robust(left)
+    e_r = _lsq_robust(right)
+    e_t = _lsq_robust(top)
+    e_b = _lsq_robust(bot)
+    if (e_l is None) or (e_r is None) or (e_t is None) or (e_b is None):
+        return None
+    tl = _cross(e_l, e_t)
+    tr = _cross(e_r, e_t)
+    br = _cross(e_r, e_b)
+    bl = _cross(e_l, e_b)
+    if (tl is None) or (tr is None) or (br is None) or (bl is None):
+        return None
+    for p in (tl, tr, br, bl):
+        if (p[0] < 1) or (p[0] > IMG_W - 2) or \
+                (p[1] < 1) or (p[1] > IMG_H - 2):
+            return None
+    c = (tl, tr, br, bl)
+    qa = 0.0
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        qa += x1 * y2 - x2 * y1
+    qa = abs(qa) * 0.5
+    if qa < 1.0:
+        return None
+    d = []
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+    dl1 = (d[0] + d[2]) / 2.0
+    dl2 = (d[1] + d[3]) / 2.0
+    if dl1 >= dl2:
+        long_side, short_side = dl1, dl2
+    else:
+        long_side, short_side = dl2, dl1
+    d1x, d1y = br[0] - tl[0], br[1] - tl[1]
+    d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
+    den = d1x * d2y - d1y * d2x
+    if abs(den) < 1e-6:
+        ctr = ((tl[0] + br[0]) / 2.0, (tl[1] + br[1]) / 2.0)
+    else:
+        t = ((tr[0] - tl[0]) * d2y - (tr[1] - tl[1]) * d2x) / den
+        ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
+    return (c, ctr, long_side, max(1.0, short_side), qa)
+
+
+def paper_contrast(img, x, y, w, h):
+    """内亮外暗校验：返回 (内部平均亮度, 外侧平均亮度, 外侧合格比例)。"""
     u = ((x + w * 0.30, y + h * 0.50), (x + w * 0.70, y + h * 0.50),
          (x + w * 0.50, y + h * 0.30), (x + w * 0.50, y + h * 0.70),
          (x + w * 0.50, y + h * 0.50))
@@ -252,167 +458,143 @@ def paper_contrast(img, x, y, w, h):
     return ins, so / float(no), ok / float(no)
 
 
-def _quad_metrics(c):
-    """给 4 个角点算 (中心, 长边, 短边, 面积)。角点按轮廓顺序给出。"""
-    a = 0.0
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        a += x1 * y2 - x2 * y1
-    qa = abs(a) * 0.5
-    if qa < 1.0:
-        return None
-    d = []
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
-    dl1 = (d[0] + d[2]) / 2.0
-    dl2 = (d[1] + d[3]) / 2.0
-    if dl1 >= dl2:
-        long_side, short_side = dl1, dl2
-    else:
-        long_side, short_side = dl2, dl1
-    # 对角线交点 = 透视意义下的中心（角点顺序循环即可，c0-c2 / c1-c3 是对角线）
-    d1x, d1y = c[2][0] - c[0][0], c[2][1] - c[0][1]
-    d2x, d2y = c[3][0] - c[1][0], c[3][1] - c[1][1]
-    den = d1x * d2y - d1y * d2x
-    if abs(den) < 1e-6:
-        ctr = ((c[0][0] + c[2][0]) / 2.0, (c[0][1] + c[2][1]) / 2.0)
-    else:
-        t = ((c[1][0] - c[0][0]) * d2y - (c[1][1] - c[0][1]) * d2x) / den
-        ctr = (c[0][0] + t * d1x, c[0][1] + t * d1y)
-    return ctr, long_side, max(1.0, short_side), qa
+def norm_bbox(bx, by, bw, bh, roi):
+    """兼容 find_blobs 返回“相对 ROI”或“全图”两种坐标。"""
+    if roi[0] or roi[1]:
+        if (bx + bw / 2.0) < roi[0] or (by + bh / 2.0) < roi[1]:
+            return bx + roi[0], by + roi[1]
+    return bx, by
 
 
-def find_paper(img, roi, dbg_on=False):
-    """找靶纸四边形。返回 (best, 候选数, 诊断串)。
+def _scan_th(ref):
+    """按纸面自身亮度定的扫描门槛（纸面有阴影时也能摸到真边）。"""
+    t = ref * SCAN_TH_K
+    if t < SCAN_TH_LO:
+        t = SCAN_TH_LO
+    elif t > SCAN_TH_HI:
+        t = SCAN_TH_HI
+    return t
 
-    best = (px, cu, cv, long_side, aspect, density, ins, outs, corners)
-    · 有 cv_lite：用 Canny+四边形检测（沿真实边缘，C 加速），直接拿 4 角
-    · 没有 cv_lite：退回亮块外接框（只画正矩形，功能受限但能跑）
+
+def _requad(img, seed):
+    """快速复测：拿上次的四边形当种子，只重扫四条边（省一次 find_blobs 的固定开销）。
+
+    返回 (best, 亮块数=0, 诊断串)，格式与 find_paper 一致。
     """
-    if not HAVE_CV:
-        return _find_paper_blob(img, roi, dbg_on)
-    rx, ry, rw, rh = roi
-    rx1 = rx + rw
-    ry1 = ry + rh
-    try:
-        arr = img.to_numpy_ref()
-    except Exception as e:
-        return None, 0, "[to_numpy_ref异常:%s] " % e
-    # 参数自动扫：先用上次成功那组，没出矩形再依次试其它组，哪组出矩形就记住它
-    order = list(range(len(CV_PARAM_SETS)))
-    if _CV_SET[0] >= 0:
-        order = [_CV_SET[0]] + [i for i in order if i != _CV_SET[0]]
-    rects = []
-    rect_n = []
-    used = -1
-    for idx in order:
-        c1, c2, cosmax = CV_PARAM_SETS[idx]
-        try:
-            rects = cv_lite.rgb888_find_rectangles_with_corners(
-                [IMG_H, IMG_W], arr, c1, c2, APPROX_EPS, AREA_MIN_RATIO,
-                cosmax, BLUR_SIZE)
-        except Exception as e:
-            return None, 0, "[cv_lite异常:%s] " % e
-        rect_n.append(len(rects))
-        if rects:
-            used = idx
-            _CV_SET[0] = idx
-            break
-    best = None
-    n = 0
-    dbg = "参数组%s→矩形%s " % (str(rect_n), CV_PARAM_SETS[used][:3]
-                              if used >= 0 else "-")
-    for r in rects:
-        if len(r) < 12:
-            continue
-        c = ((r[4], r[5]), (r[6], r[7]), (r[8], r[9]), (r[10], r[11]))
-        m = _quad_metrics(c)
-        if m is None:
-            continue
-        ctr, long_side, short_side, qa = m
-        if (ctr[0] < rx) or (ctr[0] > rx1) or (ctr[1] < ry) or (ctr[1] > ry1):
-            continue                      # 不在跟踪窗里
-        n += 1
-        aspect = long_side / short_side
-        xs = (c[0][0], c[1][0], c[2][0], c[3][0])
-        ys = (c[0][1], c[1][1], c[2][1], c[3][1])
-        bx = min(xs)
-        by = min(ys)
-        w = max(xs) - bx
-        h = max(ys) - by
-        if dbg_on and n <= 3:
-            dbg += "[四边%.0fx%.0f 比%.2f 面%.0f] " % (
-                long_side, short_side, aspect, qa)
-        if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG):
-            continue
-        if (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
-            continue
-        if (bx <= 1) or (by <= 1) or ((bx + w) >= IMG_W - 1) or \
-                ((by + h) >= IMG_H - 1):
-            continue
-        ins, outs, frac = paper_contrast(img, bx, by, w, h)
-        if dbg_on and n <= 3:
-            dbg += "{内%d 外%d 暗边%.0f%%} " % (ins, outs, frac * 100.0)
-        if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
-                (frac < PAPER_DARK_FRAC_MIN):
-            continue
-        score = qa * (0.5 + min(ins - outs, 80) / 80.0)
-        if best is None or score > best[0]:
-            best = (score, (qa, ctr[0], ctr[1], long_side, aspect, 1.0,
-                            ins, outs, c))
-    if best is None:
-        return None, n, dbg
-    return best[1], n, dbg
+    px = seed[0]
+    c = seed[8]
+    if c is None:
+        return None, 0, ""
+    xs = (c[0][0], c[1][0], c[2][0], c[3][0])
+    ys = (c[0][1], c[1][1], c[2][1], c[3][1])
+    bx = min(xs)
+    by = min(ys)
+    w = max(xs) - bx
+    h = max(ys) - by
+    if w < 8 or h < 8:
+        return None, 0, ""
+    ins, outs, frac = paper_contrast(img, bx, by, w, h)
+    if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
+            (frac < PAPER_DARK_FRAC_MIN):
+        return None, 0, "[复测:亮度] "
+    q = quad_from_blob(img, bx, by, w, h, _scan_th(ins))
+    if q is None:
+        return None, 0, "[复测:拟合] "
+    corners, ctr, long_side, short_side, qa = q
+    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+        return None, 0, "[复测:面积] "
+    aspect = long_side / max(1.0, short_side)
+    if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG) or \
+            (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
+        return None, 0, "[复测:尺寸] "
+    return (px, ctr[0], ctr[1], long_side, aspect, px / max(1.0, qa),
+            ins, outs, corners), 0, ""
 
 
-def _find_paper_blob(img, roi, dbg_on=False):
-    """兜底：没有 cv_lite 时用亮块外接框当四边形（只画正矩形）。"""
+def find_paper(img, roi, th, dbg_on=False, seed=None):
+    """在 roi 里找 A4 靶纸四边形。
+
+    返回 (best, 亮块数, 诊断串)；
+    best = (px, cu, cv, long_side, aspect, density, ins, outs, corners)
+    corners=None 表示四边形没拟合出来（退回外接框）。
+    seed=上次的测量元组时走快速复测（只重扫四边形，不找亮块）。
+    """
+    if seed is not None:
+        return _requad(img, seed)
     best = None
     n = 0
     dbg = ""
-    blobs = img.find_blobs([(58, 100, -32, 32, -32, 32)], roi=roi, merge=True,
-                           margin=6, area_threshold=900, pixels_threshold=900)
+    blobs = img.find_blobs(
+        [(th, 100, -PAPER_A_MAX, PAPER_A_MAX, -PAPER_B_MAX, PAPER_B_MAX)],
+        roi=roi, merge=True, margin=6,
+        area_threshold=PAPER_MIN_AREA, pixels_threshold=PAPER_MIN_AREA)
+    if not blobs:
+        return None, 0, ""
     for b in blobs:
-        x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
-        if roi[0] or roi[1]:
-            if (x + w / 2.0) < roi[0] or (y + h / 2.0) < roi[1]:
-                x += roi[0]
-                y += roi[1]
         n += 1
-        long_side = w if w > h else h
-        aspect = long_side / max(1.0, float(w if w < h else h))
-        inset = px / float(w * h)
+        x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
+        x, y = norm_bbox(x, y, w, h, roi)
+        if w < 8 or h < 8:
+            continue
+        box_long = w if w > h else h
         ins, outs, frac = paper_contrast(img, x, y, w, h)
         if dbg_on and n <= 3:
-            dbg += "[亮块%dx%d 密%.2f 内%d 外%d 暗边%.0f%%] " % (
-                w, h, inset, ins, outs, frac * 100.0)
-        if (w < 8) or (h < 8) or (inset < 0.70):
+            dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%%] " % (
+                px, box_long, ins, outs, frac * 100.0)
+        if px < PAPER_MIN_AREA:
             continue
-        if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG):
+        if px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
             continue
-        if (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
+        if box_long < PAPER_MIN_LONG * 0.8 or box_long > PAPER_MAX_LONG * 1.3:
             continue
-        if (x <= 1) or (y <= 1) or ((x + w) >= IMG_W - 1) or \
-                ((y + h) >= IMG_H - 1):
+        if (x <= 1) or (y <= 1) or \
+                ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1):
             continue
-        if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
-                (frac < PAPER_DARK_FRAC_MIN):
+        if ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
             continue
-        c = ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
+        if frac < PAPER_DARK_FRAC_MIN:
+            continue
+        q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
+        corners = None
+        qa = 0.0
+        if q is not None:
+            corners, ctr, long_side, short_side, qa = q
+            if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+                corners = None             # 拟合结果和亮块对不上，弃用
+        if corners is None:
+            long_side = box_long
+            short_side = w if w < h else h
+            density = px / float(w * h)
+            dens_min = PAPER_DENSITY_MIN
+            ctr = (x + w / 2.0, y + h / 2.0)
+        else:
+            density = px / max(1.0, qa)
+            dens_min = PAPER_DENSITY_QUAD_MIN
+        aspect = long_side / max(1.0, short_side)
+        if long_side < PAPER_MIN_LONG or long_side > PAPER_MAX_LONG:
+            continue
+        if aspect < PAPER_ASPECT_MIN or aspect > PAPER_ASPECT_MAX:
+            continue
+        if density < dens_min:
+            continue
+        if dbg_on and n <= 3:
+            dbg += "{四边%.0fx%.0f 密%.2f} " % (long_side, short_side, density)
         score = px * (0.5 + min(ins - outs, 80) / 80.0)
         if best is None or score > best[0]:
-            best = (score, (px, x + w / 2.0, y + h / 2.0, long_side, aspect,
-                            inset, ins, outs, c))
+            best = (score, (px, ctr[0], ctr[1], long_side, aspect, density,
+                            ins, outs, corners))
     if best is None:
         return None, n, dbg
     return best[1], n, dbg
 
 
 class PaperTracker(object):
-    """候选 -> 尺寸闸门 -> 连续确认 -> 平滑（治“绿框乱飘”的那一套）。"""
+    """候选 -> 静态闸门(在 find_paper 里) -> 尺寸闸门 -> 连续确认 -> 平滑。
+
+      · 跟踪中：只在上一帧四边形附近搜，长边必须是上次的 0.55~1.45 倍；
+      · 丢靶后：全图搜索，候选要连续 CONFIRM_N 次位置(±35px)、尺寸(±60%)
+        都对得上才重新锁定（一次性的背景亮块过不了这一关）。
+    """
 
     def __init__(self):
         self.u = 0.0
@@ -449,10 +631,6 @@ class PaperTracker(object):
     def fresh(self):
         return self.have and (self.lost < HOLD_FRAMES)
 
-    def box(self):
-        return (int(self.u - self.w / 2.0), int(self.v - self.h / 2.0),
-                int(self.w), int(self.h))
-
     def _size_ok(self, long_side):
         if not self.have:
             return True
@@ -468,11 +646,11 @@ class PaperTracker(object):
                     self.pend = None
             return False
         cu, cv, lo = cand[1], cand[2], cand[3]
-        # 重新锁定也要过尺寸合理性（现场锁到 71px 背景块就是这么漏的）；
-        # 丢靶太久说明靶纸可能被搬远，就放开这个限制
-        if self.have and (self.lost < RELOCK_FREE_LOST):
+        # 重新锁定也要过尺寸合理性：纸不可能在半秒里变成 1/4 大。
+        # （现场日志里锁到背景 71px 亮块就是这个口子漏的）丢靶超过 3 秒才放开。
+        if self.have and (self.lost < 100):
             old = max(self.w, self.h)
-            if (lo < RELOCK_LO * old) or (lo > RELOCK_HI * old):
+            if (lo < 0.40 * old) or (lo > 2.5 * old):
                 self.pend = None
                 return False
         if self.pend is None:
@@ -481,13 +659,13 @@ class PaperTracker(object):
         if (abs(cu - self.pend[0]) <= CONFIRM_DXY) and \
                 (abs(cv - self.pend[1]) <= CONFIRM_DXY) and \
                 (abs(lo - self.pend[2]) <= CONFIRM_DSIZE * self.pend[2]):
-            k = self.pend[3] + 1
-            self.pend[0] += (cu - self.pend[0]) / float(k)
-            self.pend[1] += (cv - self.pend[1]) / float(k)
-            self.pend[2] += (lo - self.pend[2]) / float(k)
-            self.pend[3] = k
+            n = self.pend[3] + 1
+            self.pend[0] += (cu - self.pend[0]) / float(n)
+            self.pend[1] += (cv - self.pend[1]) / float(n)
+            self.pend[2] += (lo - self.pend[2]) / float(n)
+            self.pend[3] = n
             self.pend[4] = 0
-            if k >= CONFIRM_N:
+            if n >= CONFIRM_N:
                 self.pend = None
                 return True
         else:
@@ -513,29 +691,52 @@ class PaperTracker(object):
         self.lost = 0
         self.state = "锁定"
 
+    def box(self):
+        return (int(self.u - self.w / 2.0), int(self.v - self.h / 2.0),
+                int(self.w), int(self.h))
+
     def step(self, img, finder):
-        """跑一帧跟踪。返回本帧确认的候选或 None。"""
+        """跑一帧跟踪。finder = find_paper。返回本帧确认的候选或 None。"""
         self.frame += 1
         cand = None
         n = 0
         dbg = ""
         self.did_full = False
         if self.have and self.lost < LOST_FULL:
-            cand, n, dbg = finder(img, self.roi())
+            if ((self.frame % SEED_EVERY) == 0) or (self.meas is None):
+                cand, n, dbg = finder(img, self.roi(), PAPER_TH)
+            else:
+                # 隔帧只做四边形复测（省掉一次 find_blobs 的 ~13ms 固定开销），
+                # 靶心仍然每帧都是新的；复测失败就立刻补一次完整搜索。
+                cand, n, dbg = finder(img, self.roi(), PAPER_TH, False,
+                                      self.meas)
+                if cand is None:
+                    cand, n, dbg = finder(img, self.roi(), PAPER_TH)
             if (cand is not None) and (not self._size_ok(cand[3])):
                 dbg = "[尺寸闸门%.0fpx] " % cand[3] + dbg
                 cand = None
             if (cand is None) and ((self.frame % FULL_EVERY) == 0):
                 self.did_full = True
-                c2, n2, d2 = finder(img, (0, 0, IMG_W, IMG_H))
+                c2, n2, d2 = finder(img, (0, 0, IMG_W, IMG_H), PAPER_TH)
                 n += n2
                 dbg += d2
                 if self._confirm(c2):
                     cand = c2
+                elif c2 is None:
+                    c3, n3, d3 = finder(img, (0, 0, IMG_W, IMG_H),
+                                         PAPER_TH_ALT)
+                    n += n3
+                    dbg += d3
+                    if self._confirm(c3):
+                        cand = c3
         else:
             if (self.frame % FULL_EVERY) == 0:
                 self.did_full = True
-                c2, n2, d2 = finder(img, (0, 0, IMG_W, IMG_H), True)
+                c2, n2, d2 = finder(img, (0, 0, IMG_W, IMG_H), PAPER_TH, True)
+                if c2 is None:
+                    c3, n3, d3 = finder(img, (0, 0, IMG_W, IMG_H),
+                                         PAPER_TH_ALT, True)
+                    c2, n2, d2 = c3, n2 + n3, d2 + d3
                 n += n2
                 dbg = d2
                 if self._confirm(c2):
@@ -587,11 +788,7 @@ class SpotDetector(object):
                 continue
             if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
                 continue
-            bx, by = b[0], b[1]
-            if roi[0] or roi[1]:
-                if (bx + bw / 2.0) < roi[0] or (by + bh / 2.0) < roi[1]:
-                    bx += roi[0]
-                    by += roi[1]
+            bx, by = norm_bbox(b[0], b[1], bw, bh, roi)
             cu = bx + bw / 2.0
             cv = by + bh / 2.0
             d = abs(cu - self.u) + abs(cv - self.v)
@@ -622,8 +819,9 @@ class SpotDetector(object):
 
 
 def apply_flip(sensor):
-    """把上下/左右翻转设置尽量都试一遍（不同固件的 set_vflip 签名/是否分通道不同，
-    现场实测过 set_vflip(True) 有时不生效，所以这里连通道一起试）。"""
+    """上下/左右翻转尽量多试几种写法：不同固件的 set_vflip 签名/是否分通道不同，
+    现场实测 set_vflip(True) 不生效。如果最后还是倒的，就把摄像头模块整体转 180°
+    装（装完记得把 CAM_VFLIP 改回 False，否则又会被翻回去）。"""
     for kw in ({}, {"chn": 0}, {"chn": 1}):
         try:
             sensor.set_vflip(CAM_VFLIP, **kw)
@@ -635,7 +833,7 @@ def apply_flip(sensor):
             pass
 
 
-def print_l_diag(img):
+def print_l_diag(img, roi):
     """丢靶时的亮度诊断：自己按网格采样（这块固件 get_statistics 返回 None）。"""
     lo = 255
     hi = 0
@@ -673,11 +871,10 @@ def main():
     sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
-    apply_flip(sensor)                 # 先试一次（有的固件要求配置前设置）
+    apply_flip(sensor)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    # cv_lite 需要 RGB888（to_numpy_ref 拿到的就是它的数据）
-    sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
-    apply_flip(sensor)                 # 配置后再试一次
+    sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
+    apply_flip(sensor)
     Display.init(Display.ST7701, width=IMG_W, height=IMG_H,
                  to_ide=True, quality=DISPLAY_QUALITY)
     MediaManager.init()
@@ -704,15 +901,14 @@ def main():
     sum_n = 0
 
     print("=" * 68)
-    print("vision_check v17: 检测器=%s 画面VFLIP=%s HMIRROR=%s"
-          % ("cv_lite四边形" if HAVE_CV else "亮块兜底(!)", CAM_VFLIP,
-             CAM_HMIRROR))
-    print("  参数组自动扫(cannyLo/Hi,角度cos): %s  eps=%.3f 面积比>=%.4f 模糊%d"
-          % (str(CV_PARAM_SETS), APPROX_EPS, AREA_MIN_RATIO, BLUR_SIZE))
-    print("  长边%.0f~%.0f 比%.2f~%.2f 对比>=%d 暗边>=%.0f%%  跟踪窗=长边x%.2f+%d"
-          % (PAPER_MIN_LONG, PAPER_MAX_LONG, PAPER_ASPECT_MIN,
-             PAPER_ASPECT_MAX, PAPER_CONTRAST_MIN,
-             PAPER_DARK_FRAC_MIN * 100, TRACK_K, TRACK_PAD))
+    print("vision_check v19: 检测器=亮块+扫描四边形(已验证可用), 靶心=对角线交点")
+    print("  阈值%d 长边%.0f~%.0fpx 密度(四边)%.2f 对比%d 暗边>=%.0f%%"
+          % (PAPER_TH, PAPER_MIN_LONG, PAPER_MAX_LONG,
+             PAPER_DENSITY_QUAD_MIN, PAPER_CONTRAST_MIN,
+             PAPER_DARK_FRAC_MIN * 100))
+    print("  跟踪窗=长边x%.1f+%dpx 尺寸闸门[%.2f,%.2f]x 确认%d次 光斑每%d帧搜一次"
+          % (TRACK_K, TRACK_PAD, SIZE_GATE_LO, SIZE_GATE_HI, CONFIRM_N,
+             SPOT_EVERY))
     print("=" * 68)
 
     try:
@@ -787,8 +983,9 @@ def main():
             if spot is not None:
                 n_spot += 1
 
-            if tracker.lost == 8:
-                print_l_diag(img)
+            if tracker.lost == 8 or (tracker.lost > 30 and
+                                     tracker.lost % 90 == 0):
+                print_l_diag(img, (0, 0, IMG_W, IMG_H))
 
             # ---------- 画 ----------
             if tracker.fresh():
@@ -812,7 +1009,9 @@ def main():
                 img.draw_cross(int(spot[1]), int(spot[2]),
                                color=(255, 255, 0), size=6, thickness=1)
 
-            # 隔帧推画面（to_ide 传输比处理慢，追太紧会撕裂/花屏）
+            # 隔帧推画面：to_ide 的编码+USB 传输比处理慢，追太紧会在传输途中
+            # 改写同一块缓冲，IDE 里就显示成"几块拼接+颜色错乱"的撕裂画面
+            # （数据本身没问题，终端里的靶心/误差一直是对的）。
             t0 = time.ticks_ms()
             if (n_frame % SHOW_EVERY) == 0:
                 Display.show_image(img)
@@ -836,12 +1035,14 @@ def main():
                     px, cu, cv, long_side, aspect, density, ins, outs, c = \
                         tracker.meas
                     dist_m = FX_PX * PAPER_LONG_M / max(1.0, long_side)
-                    line += ("靶=纸(%s) 靶心=(%.0f,%.0f) 长边=%.0fpx 比%.2f "
-                             "对比=%.0f 距离≈%.2fm"
-                             % (tracker.state, tracker.u, tracker.v,
-                                long_side, aspect, ins - outs, dist_m))
+                    line += ("靶=纸(%s%s) 靶心=(%.0f,%.0f) 长边=%.0fpx 比%.2f "
+                             "密%.2f 对比=%.0f 距离≈%.2fm"
+                             % (tracker.state,
+                                "" if c is not None else "·框",
+                                tracker.u, tracker.v, long_side, aspect,
+                                density, ins - outs, dist_m))
                 else:
-                    line += "靶=%s%s 候选=%d %s" % (
+                    line += "靶=%s%s 亮块=%d %s" % (
                         tracker.state,
                         ("(全图)" if tracker.did_full else "(跟踪窗)"),
                         tracker.last_n, tracker.last_dbg)
