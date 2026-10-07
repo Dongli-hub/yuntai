@@ -73,9 +73,9 @@ QUAD_AREA_HI = 1.35
 # 四边形就被拉进纸里（现场截图里"不贴胶带"就是这么来的）。
 # 改成按纸面自身亮度 ins 的比例定：th_scan = ins*SCAN_TH_K，再夹在上下限之间。
 # 胶带(≈20~55)低于它、纸面阴影侧(≈90~130)高于它 → 边才落在胶带内沿。
-SCAN_TH_K = 0.50
-SCAN_TH_LO = 50
-SCAN_TH_HI = 88
+SCAN_TH_K = 0.68           # 现场实证：0.5 时柜子面(≈95)会时过时不过 -> 边飞出去
+SCAN_TH_LO = 65
+SCAN_TH_HI = 125
 QUAD_LIM_PAD = 18          # 扫描半径 = 中心到亮块该边的距离 + 这个余量
 
 # 跟踪 / 闸门
@@ -561,6 +561,16 @@ def find_paper(img, roi, th, dbg_on=False, seed=None):
             corners, ctr, long_side, short_side, qa = q
             if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
                 corners = None             # 拟合结果和亮块对不上，弃用
+            elif corners is not None:
+                # 角点不能跑到亮块外框太远（否则就是某条边越过胶带、摸到背景
+                # 亮边去了，现场"边飞出去"就是这种）。超了就退回外接框，
+                # 宁可要一个稳的正矩形，也不要一个乱跳的梯形。
+                lim = QUAD_LIM_PAD + 8
+                for p in corners:
+                    if (p[0] < x - lim) or (p[0] > x + w + lim) or \
+                            (p[1] < y - lim) or (p[1] > y + h + lim):
+                        corners = None
+                        break
         if corners is None:
             long_side = box_long
             short_side = w if w < h else h
