@@ -1,25 +1,20 @@
 # -*- coding: utf-8 -*-
-"""vision_check.py —— 视觉验证（靶心 + 激光光斑 + 误差 + 距离）
+"""vision_check.py —— 视觉验证（靶框 + 激光光斑 + 误差 + 距离）
 
-v5 换了检测思路（为了速度和斜视稳定性）：
+v6：回到"黑胶带框"方案，但**不再用慢的 find_rects**，改用 C 加速的
+     原生 find_blobs（连通域）——这是把国一方案的"固定阈值二值化 + 轮廓"
+     在本固件上等价实现（本固件没有 cv2）：
 
-  · **靶心 = 白纸块的中心**（不再去找黑胶带框）
-      白纸是个又大又亮的连通域，用 cv_lite 的 C 加速找块一次就出来，
-      快、稳、斜视也照样是一个完整白块；纸面同心圆本来就是以纸中心为圆心，
-      所以"纸块中心"就是靶心。
-  · **光斑 = ROI 内的小亮点**（同一套找块，按面积区分：纸是大块、光斑是小块）
-  · 黑胶带框只用来画个参考框（用矩形检测，可选，失败不影响瞄准）
+  · 靶框 = **黑胶带这个暗色连通域**（环）
+      用 LAB 暗阈值找块；黑胶带在纸/白瓷砖背景上都很暗，固定阈值很稳。
+      环的质心 = 框中心 = 靶心（对称结构，质心就是几何中心）。
+      再用国一那套几何校验：长宽比、对边比、内角（有 min_corners 时）。
+  · 光斑 = ROI 内的"暖色亮块"（R、B 都高于 G；打印的红圈是暗红、白纸是中性，
+            都被这个判据排除）。检不到就退回已锁定的光轴点。
+  · 距离 = FX_PX × 0.297m(纸长边) ÷ 框长边像素（用卷尺标定一次 FX_PX 即可，
+            与靶子远近无关，后面 1.2~2.2m 同样适用）。
 
-画面里只画三样：
-  绿框      = 白纸块（靶面）
-  红叉      = 靶心（纸块中心）
-  黄圈/黄叉 = 激光光斑
-
-终端每秒一行：FPS / 纸块面积% / 靶心 / 长边px / 比例 / 距离估算 / 光斑 / 误差(px,°)
-
-距离估算：白纸可见部分长边 ≈261mm（A4 297mm 减去上下各 18mm 胶带）
-    distance_m = FX_PX * 0.261 / 长边像素
-FX_PX 先用 440（0.6m 处胶带框长边≈219px 反推）。用卷尺核对后校准一次即可。
+画面里只画三样：绿框(靶框)、红叉(靶心)、黄圈/黄叉(光斑)。
 """
 import os
 import time
@@ -30,17 +25,20 @@ IMG_W = 640
 IMG_H = 480
 DISPLAY_QUALITY = 50       # IDE 画面质量（越小越流畅）
 
-# --- 白纸（靶面）：RGB 阈值 [Rmin,Rmax, Gmin,Gmax, Bmin,Bmax] ---
-# 白纸是"三通道都亮"的块。太亮/背景也白就把下限往上调。
-PAPER_THRESHOLD = [165, 255, 165, 255, 165, 255]
-PAPER_MIN_AREA_RATIO = 0.02     # 纸块至少占画面 2%
-PAPER_MAX_AREA_RATIO = 0.90     # 太大说明把背景也算进来了
-PAPER_ASPECT_MIN = 1.10         # 白纸可见部分 ≈174x261mm → 1.5
-PAPER_ASPECT_MAX = 2.20
-PAPER_KERNEL = 1
+# --- 黑胶带：暗色连通域（LAB）---
+TAPE_THRESHOLD = (0, 45, -60, 60, -60, 60)
+TAPE_MIN_AREA = 400        # 像素面积下限（太远时框会变小，可往下调）
+TAPE_MAX_AREA_RATIO = 0.60
+TAPE_ASPECT_MIN = 1.15     # 胶带框 297x180 → 1.65
+TAPE_ASPECT_MAX = 2.60
+TAPE_SIDE_RATIO_TOL = 0.45 # 对边长度相对差上限（国一用的 0.4）
+TAPE_ANGLE_TOL = 30.0      # 内角偏离 90° 的容差（国一用的 30°）
 
-# --- 激光光斑：更亮（过曝白芯）---
-SPOT_THRESHOLD = [235, 255, 200, 255, 200, 255]
+# --- 激光光斑：暖色亮块（LAB）---
+SPOT_THRESHOLDS = [
+    (55, 100, 8, 70, -20, 60),     # 暖色亮斑（主判据）
+    (85, 100, -20, 40, -20, 60),   # 过曝白芯
+]
 SPOT_MIN_AREA = 3
 SPOT_MAX_AREA = 3000
 SPOT_MAX_ASPECT = 3.0
@@ -50,9 +48,9 @@ SPOT_ROI_HALF = 90
 SPOT_LEARN_FRAMES = 15
 SPOT_NEAR_PX = 25
 
-# --- 距离估算 ---
-FX_PX = 440.0              # 像素焦距（640 宽）
-PAPER_LONG_M = 0.261       # 白纸可见部分长边（米）
+# --- 距离（标定一次 FX_PX 即可，与远近无关）---
+FX_PX = 440.0              # 像素焦距（640 宽）；用卷尺量一次距离校准
+PAPER_LONG_M = 0.297       # A4 长边 297mm（胶带贴在纸边，外边长≈297mm）
 
 UART_BAUD = 115200
 HEARTBEAT_MS = 200
@@ -144,27 +142,53 @@ class FrameParser(object):
         return out
 
 
-def blob_center(b):
-    """优先用最小外接矩形的四角交点（就是纸中心），没有就用质心。"""
-    try:
-        pts = b.min_corners()
-        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts
-        d1x, d1y = x2 - x0, y2 - y0
-        d2x, d2y = x3 - x1, y3 - y1
-        den = d1x * d2y - d1y * d2x
-        if abs(den) > 1e-6:
-            t = ((x1 - x0) * d2y - (y1 - y0) * d2x) / den
-            return (x0 + t * d1x, y0 + t * d1y)
-    except Exception:
-        pass
-    return (float(b[5]), float(b[6]))
+def dist2(ax, ay, bx, by):
+    return math.sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+
+
+def corners_geometry_ok(pts):
+    """国一那套几何校验：内角接近 90°、对边长度接近。"""
+    if len(pts) != 4:
+        return False
+    # 角度
+    for i in range(4):
+        p = pts[i]
+        a = pts[(i - 1) % 4]
+        b = pts[(i + 1) % 4]
+        v1x, v1y = a[0] - p[0], a[1] - p[1]
+        v2x, v2y = b[0] - p[0], b[1] - p[1]
+        n1 = math.sqrt(v1x * v1x + v1y * v1y)
+        n2 = math.sqrt(v2x * v2x + v2y * v2y)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return False
+        c = (v1x * v2x + v1y * v2y) / (n1 * n2)
+        if c > 1.0:
+            c = 1.0
+        elif c < -1.0:
+            c = -1.0
+        ang = math.acos(c) * 57.29578
+        if abs(ang - 90.0) > TAPE_ANGLE_TOL:
+            return False
+    # 对边长度
+    s = [dist2(pts[0][0], pts[0][1], pts[1][0], pts[1][1]),
+         dist2(pts[1][0], pts[1][1], pts[2][0], pts[2][1]),
+         dist2(pts[2][0], pts[2][1], pts[3][0], pts[3][1]),
+         dist2(pts[3][0], pts[3][1], pts[0][0], pts[0][1])]
+    for (a, b) in ((0, 2), (1, 3)):
+        m = max(s[a], s[b])
+        if m < 1e-6:
+            return False
+        if abs(s[a] - s[b]) / m > TAPE_SIDE_RATIO_TOL:
+            return False
+    if min(s) < 15:
+        return False
+    return True
 
 
 def main():
     from media.sensor import Sensor, CAM_CHN_ID_0
     from media.display import Display
     from media.media import MediaManager
-    import cv_lite
     import gc
 
     from ybUtils.YbUart import YbUart
@@ -172,12 +196,11 @@ def main():
     parser = FrameParser()
     print("串口: YbUart @%d" % UART_BAUD)
 
-    shape = [IMG_H, IMG_W]
     sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
+    sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
     Display.init(Display.ST7701, width=IMG_W, height=IMG_H,
                  to_ide=True, quality=DISPLAY_QUALITY)
     MediaManager.init()
@@ -203,12 +226,13 @@ def main():
     n_tgt = 0
     n_spot = 0
 
-    print("=" * 66)
-    print("vision_check v5: 靶心=白纸块中心(cv_lite找块) + 光斑=ROI内小亮点")
-    print("  纸阈值=%s  面积比=[%.2f,%.2f] 比例=[%.2f,%.2f]  FX=%.0f"
-          % (str(PAPER_THRESHOLD), PAPER_MIN_AREA_RATIO, PAPER_MAX_AREA_RATIO,
-             PAPER_ASPECT_MIN, PAPER_ASPECT_MAX, FX_PX))
-    print("=" * 66)
+    print("=" * 68)
+    print("vision_check v6: 黑胶带暗块(find_blobs, C加速) + 暖色光斑")
+    print("  胶带阈值=%s 面积≥%d 比例=[%.2f,%.2f]"
+          % (str(TAPE_THRESHOLD), TAPE_MIN_AREA, TAPE_ASPECT_MIN,
+             TAPE_ASPECT_MAX))
+    print("  距离 = %.0f × 0.297 ÷ 框长边像素" % FX_PX)
+    print("=" * 68)
 
     try:
         while True:
@@ -256,53 +280,72 @@ def main():
                 except Exception:
                     pass
 
-            # ---------- 一次找块，同时得到白纸和光斑 ----------
+            # ---------- 靶框：黑胶带暗块 ----------
             clock.tick()
             img = sensor.snapshot(chn=CAM_CHN_ID_0)
-            img_np = img.to_numpy_ref()
             n_frame += 1
 
-            paper = None
-            spot = None
-
-            # 白纸（大块）
-            blobs = cv_lite.rgb888_find_blobs(shape, img_np, PAPER_THRESHOLD,
-                                              int(PAPER_MIN_AREA_RATIO *
-                                                  img_area), PAPER_KERNEL)
-            for i in range(0, len(blobs), 4):
-                x, y, w, h = blobs[i], blobs[i + 1], blobs[i + 2], blobs[i + 3]
-                area = float(w * h)
-                if area < PAPER_MIN_AREA_RATIO * img_area:
+            best = None            # (area, cx, cy, long_side_px, aspect)
+            n_blob = 0
+            list_txt = ""
+            for b in img.find_blobs([TAPE_THRESHOLD], merge=True,
+                                    area_threshold=TAPE_MIN_AREA,
+                                    pixels_threshold=TAPE_MIN_AREA):
+                n_blob += 1
+                try:
+                    area = b.area()
+                except Exception:
+                    area = b[4]
+                if area < TAPE_MIN_AREA:
                     continue
-                if area > PAPER_MAX_AREA_RATIO * img_area:
+                if area > TAPE_MAX_AREA_RATIO * img_area:
                     continue
-                # 贴到画面边缘的大块多半是背景/墙，不要
+                x, y, w, h = b[0], b[1], b[2], b[3]
+                aspect = max(w, h) / max(1.0, min(w, h))
+                if n_blob <= 3:
+                    list_txt += " [%dpx %.1f%% 比=%.2f]" % (area,
+                                                            100.0 * area /
+                                                            img_area, aspect)
+                if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
+                    continue
+                # 贴边的大块多半是背景/阴影，不要
                 if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
                         (y + h >= IMG_H - 1):
                     continue
-                aspect = max(w, h) / max(1.0, min(w, h))
-                if aspect < PAPER_ASPECT_MIN or aspect > PAPER_ASPECT_MAX:
+                # 有 min_corners 就做国一那套几何校验
+                ok_geo = True
+                corners = None
+                try:
+                    corners = b.min_corners()
+                    ok_geo = corners_geometry_ok(corners)
+                except Exception:
+                    corners = None
+                if not ok_geo:
                     continue
-                if paper is None or area > paper[0]:
-                    paper = (area, x, y, w, h, aspect, max(w, h))
+                if best is None or area > best[0]:
+                    best = (area, b[5], b[6], max(w, h), aspect, corners)
 
-            # 光斑（很小、很亮的块，且必须落在锁定的 ROI 里）
-            sblobs = cv_lite.rgb888_find_blobs(shape, img_np, SPOT_THRESHOLD,
-                                               SPOT_MIN_AREA, 1)
-            for i in range(0, len(sblobs), 4):
-                x, y, w, h = (sblobs[i], sblobs[i + 1], sblobs[i + 2],
-                              sblobs[i + 3])
-                area = float(w * h)
-                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                    continue
-                if max(w, h) * 1.0 / max(1.0, min(w, h)) > SPOT_MAX_ASPECT:
-                    continue
-                ccx, ccy = x + w / 2.0, y + h / 2.0
-                if abs(ccx - spot_u) > SPOT_ROI_HALF or \
-                        abs(ccy - spot_v) > SPOT_ROI_HALF:
-                    continue
-                if spot is None or area > spot[0]:
-                    spot = (area, ccx, ccy, (x, y, w, h))
+            # ---------- 光斑：暖色亮块 ----------
+            spot = None
+            roi = (int(spot_u - SPOT_ROI_HALF), int(spot_v - SPOT_ROI_HALF),
+                   SPOT_ROI_HALF * 2, SPOT_ROI_HALF * 2)
+            for th in SPOT_THRESHOLDS:
+                for b in img.find_blobs([th], roi=roi, merge=True,
+                                        pixels_threshold=SPOT_MIN_AREA,
+                                        area_threshold=SPOT_MIN_AREA):
+                    try:
+                        area = b.area()
+                    except Exception:
+                        area = b[4]
+                    if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                        continue
+                    bw, bh = b[2], b[3]
+                    if bw < 1 or bh < 1:
+                        continue
+                    if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
+                        continue
+                    if spot is None or area > spot[0]:
+                        spot = (area, b[5], b[6], (b[0], b[1], bw, bh))
 
             if (spot is not None) and (not locked):
                 far = (abs(spot[1] - spot_u) > SPOT_NEAR_PX) or \
@@ -321,12 +364,22 @@ def main():
                 learn_n = 0
 
             # ---------- 画 ----------
-            if paper is not None:
-                _, x, y, w, h, _, _ = paper
-                img.draw_rectangle(x, y, w, h, color=(0, 255, 0), thickness=2)
-                cu, cv_ = x + w / 2.0, y + h / 2.0
-                img.draw_cross(int(cu), int(cv_), color=(255, 0, 0), size=14,
-                               thickness=2)
+            if best is not None:
+                if best[5] is not None:
+                    c = best[5]
+                    for i in range(4):
+                        a = c[i]
+                        d = c[(i + 1) % 4]
+                        img.draw_line(int(a[0]), int(a[1]), int(d[0]),
+                                      int(d[1]), color=(0, 255, 0), thickness=2)
+                else:
+                    bx, by, bw, bh = (int(best[1] - best[3] / 2),
+                                      int(best[2] - best[3] / 2),
+                                      int(best[3]), int(best[3]))
+                    img.draw_rectangle(bx, by, bw, bh, color=(0, 255, 0),
+                                       thickness=2)
+                img.draw_cross(int(best[1]), int(best[2]), color=(255, 0, 0),
+                               size=14, thickness=2)
             if spot is not None:
                 img.draw_circle(int(spot[1]), int(spot[2]), 8,
                                 color=(255, 255, 0), thickness=2)
@@ -336,20 +389,19 @@ def main():
             # ---------- 打印 ----------
             if time.ticks_diff(now, t_print) >= PRINT_MS:
                 t_print = now
-                line = "FPS=%.1f" % clock.fps()
-                if paper is None:
-                    line += "  白纸: 未检出"
+                line = "FPS=%.1f 暗块=%d%s" % (clock.fps(), n_blob, list_txt)
+                if best is None:
+                    line += "  靶框: 未检出"
                 else:
                     n_tgt += 1
-                    cu, cv_ = paper[1] + paper[3] / 2.0, paper[2] + paper[4] / 2.0
-                    dist_m = FX_PX * PAPER_LONG_M / max(1.0, paper[6])
-                    line += ("  纸块=%.1f%% 靶心=(%.0f,%.0f) 长边=%.0fpx "
-                             "比=%.2f 距离≈%.2fm"
-                             % (100.0 * paper[0] / img_area, cu, cv_,
-                                paper[6], paper[5], dist_m))
+                    dist_m = FX_PX * PAPER_LONG_M / max(1.0, best[3])
+                    line += ("  靶心=(%.0f,%.0f) 长边=%.0fpx 比=%.2f "
+                             "距离≈%.2fm 面积=%.0fpx"
+                             % (best[1], best[2], best[3], best[4], dist_m,
+                                best[0]))
                     if spot is not None:
                         n_spot += 1
-                        eu, ev = cu - spot[1], cv_ - spot[2]
+                        eu, ev = best[1] - spot[1], best[2] - spot[2]
                         err = math.sqrt(eu * eu + ev * ev)
                         line += ("  光斑=(%.0f,%.0f) 误差=(%.0f,%.0f)px "
                                  "=%.1fpx(%.2f°)"
@@ -361,7 +413,6 @@ def main():
                 print(line)
 
             Display.show_image(img)
-            del img_np
             del img
             if (n_frame % GC_EVERY) == 0:
                 gc.collect()
