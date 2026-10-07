@@ -443,7 +443,13 @@ void gimbal_link_init(void)
     s_rx_any_logged = 0u;
     memset(&s_cmd, 0, sizeof(s_cmd));
     memset(&s_telem, 0, sizeof(s_telem));
-    s_cmd.mode = GP_MODE_IDLE;
+    /* 上电默认模式：
+     *   原来的做法是 IDLE（电机不使能、云台是软的，能被手掰动），
+     *   必须等上位机发 MODE 才开始稳定。
+     *   现场需要"不接 K230 时先单独验证云台稳不稳"，所以改成默认 STAB：
+     *   一上电就自稳（激光仍然是关的，AIM 偏置恒为 0，不会乱动）。
+     *   上位机接上后照常可以切 IDLE/AIM/UNWIND/ESTOP，行为不变。 */
+    s_cmd.mode = GP_MODE_STAB;
     gp_parser_init(&s_parser);
 
 #if (GL_LINK_UART_SEL == 1)
