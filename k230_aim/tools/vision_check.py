@@ -30,10 +30,15 @@ TAPE_L_MAX = 0             # 0 = 自动（Otsu + 候选阈值）；>0 = 手动�
 TAPE_L_ABS_MIN = 25        # 自动阈值的下限，防止切得太狠
 TAPE_MIN_AREA = 400        # 像素面积下限（太远时框会变小，可往下调）
 TAPE_MAX_AREA_RATIO = 0.60
-TAPE_ASPECT_MIN = 1.15     # 胶带框 297x180 → 1.65
-TAPE_ASPECT_MAX = 2.60
+TAPE_ASPECT_MIN = 1.30     # 胶带框 297x180 → 1.65（收紧，挡掉木纹等 2.2+ 的条状块）
+TAPE_ASPECT_MAX = 2.10
+TAPE_DENSITY_MIN = 0.25    # 环状判据：块面积/外框面积（实心块≈0.7+，空心环≈0.3~0.55）
+TAPE_DENSITY_MAX = 0.62
+PAPER_LUMA_MIN = 140       # "框内是亮白纸"的亮度下限(0-255)
+TAPE_LUMA_MAX = 95         # "框边是暗胶带"的亮度上限(0-255)
 TAPE_SIDE_RATIO_TOL = 0.45 # 对边长度相对差上限（国一用的 0.4）
 TAPE_ANGLE_TOL = 30.0      # 内角偏离 90° 的容差（国一用的 30°）
+TAPE_LMAX_TRY = 2          # 最多试几档阈值（1=只用 Otsu，最快）
 
 # --- 激光光斑：暖色亮块（LAB）---
 SPOT_THRESHOLDS = [
@@ -145,6 +150,34 @@ class FrameParser(object):
 
 def dist2(ax, ay, bx, by):
     return math.sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+
+
+def luma(img, x, y):
+    """取某点亮度(0-255)。get_pixel 对 RGB565 返回 (r,g,b)。"""
+    try:
+        p = img.get_pixel(int(x), int(y))
+    except Exception:
+        return None
+    if p is None:
+        return None
+    try:
+        r, g, b = p[0], p[1], p[2]
+    except TypeError:
+        v = int(p)
+        r = (v >> 16) & 0xFF
+        g = (v >> 8) & 0xFF
+        b = v & 0xFF
+    return (r * 299 + g * 587 + b * 114) / 1000.0
+
+
+def mean_or_none(vals):
+    s = 0.0
+    n = 0
+    for v in vals:
+        if v is not None:
+            s += v
+            n += 1
+    return (s / n) if n else None
 
 
 def corners_geometry_ok(pts):
@@ -290,7 +323,7 @@ def main():
             stats_txt = ""
             try:
                 st = img.get_statistics()
-                stats_txt = " L均=%.0f 中=%.0f 小=%.0f 大=%.0f" % (
+                stats_txt = " L(0-100)均=%.0f 中=%.0f 小=%.0f 大=%.0f" % (
                     st.l_mean(), st.l_median(), st.l_min(), st.l_max())
             except Exception:
                 stats_txt = " (L统计不可用)"
@@ -306,11 +339,9 @@ def main():
                 if l_th > 0:
                     th_list.append(l_th)                       # Otsu
                     th_list.append(max(TAPE_L_ABS_MIN,
-                                       int(l_th * 0.60)))       # 更严
-                    th_list.append(max(TAPE_L_ABS_MIN,
-                                       int(l_th * 0.40)))       # 最严
+                                       int(l_th * 0.60)))       # 更严（备选）
                 th_list.append(60)                             # 兜底固定值
-                th_list.append(40)
+                th_list = th_list[:TAPE_LMAX_TRY]              # 限制档数=提速
 
             best = None            # (area, cx, cy, long_side_px, aspect, corners)
             n_blob = 0
@@ -336,9 +367,33 @@ def main():
                             th, area, 100.0 * area / img_area, aspect)
                     if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
                         continue
+                    # 环状判据：胶带是空心环，实心块（木纹/阴影）密度会很高
+                    try:
+                        density = b.density()
+                    except Exception:
+                        density = -1.0
+                    if density >= 0.0:
+                        if density < TAPE_DENSITY_MIN or \
+                                density > TAPE_DENSITY_MAX:
+                            continue
                     # 贴边的大块多半是背景/阴影，不要
                     if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
                             (y + h >= IMG_H - 1):
+                        continue
+                    # 内亮外暗：框中心是白纸、框边是黑胶带
+                    cu, cv_ = x + w / 2.0, y + h / 2.0
+                    inner = mean_or_none([luma(img, cu, cv_),
+                                          luma(img, cu + w * 0.15, cv_),
+                                          luma(img, cu - w * 0.15, cv_),
+                                          luma(img, cu, cv_ + h * 0.15),
+                                          luma(img, cu, cv_ - h * 0.15)])
+                    edge = mean_or_none([luma(img, x, cv_),
+                                         luma(img, x + w, cv_),
+                                         luma(img, cu, y),
+                                         luma(img, cu, y + h)])
+                    if (inner is not None) and (inner < PAPER_LUMA_MIN):
+                        continue
+                    if (edge is not None) and (edge > TAPE_LUMA_MAX):
                         continue
                     # 有 min_corners 就做国一那套几何校验
                     ok_geo = True
