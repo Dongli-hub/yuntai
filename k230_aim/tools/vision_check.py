@@ -676,18 +676,33 @@ class PaperTracker(object):
         cu, cv = cand[1], cand[2]
         w = max(1.0, cand[3])
         h = max(1.0, w / max(1.0, cand[4]))
+        c = cand[8]
         if not self.have:
             self.u, self.v = cu, cv
             self.have = True
+            self.corners = c
         else:
             if abs(cu - self.u) > DEADBAND_PX:
                 self.u += SMOOTH * (cu - self.u)
             if abs(cv - self.v) > DEADBAND_PX:
                 self.v += SMOOTH * (cv - self.v)
+            # 四边形四个角也做同样的平滑：现场日志里“比”在 1.26↔1.44 之间
+            # 逐帧来回跳（某条短边每帧在真边/偏出 24px 之间），画出来就抖；
+            # 平滑后绿框稳定，靶心(用 u,v，本来就平滑)也跟着稳。
+            if c is not None:
+                if self.corners is None:
+                    self.corners = c
+                else:
+                    sc = []
+                    for i in range(4):
+                        ax = self.corners[i][0]
+                        ay = self.corners[i][1]
+                        sc.append((ax + SMOOTH * (c[i][0] - ax),
+                                   ay + SMOOTH * (c[i][1] - ay)))
+                    self.corners = tuple(sc)
         self.w = w
         self.h = h
         self.meas = cand
-        self.corners = cand[8]
         self.lost = 0
         self.state = "锁定"
 
