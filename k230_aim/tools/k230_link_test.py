@@ -250,15 +250,22 @@ def main():
             n_bytes, n_frames = probe_device(d, PROBE_S)
             print("  %-22s 已打开：收到 %d 字节 / %d 帧"
                   % (label, n_bytes, n_frames))
-            if n_bytes > 0 and dev is None:
+            table.append((label, "已打开", "", n_bytes, n_frames))
+            if n_bytes > 0:
                 dev = d
                 uart_name = label
+                # ★ 关键：找到能收数据的后端就立刻停手！
+                #   继续试后面那些后端时，构造 Pin(9)/Pin(10) 会把 IO9/IO10
+                #   重新配成 GPIO，等于把刚配好的串口引脚"掀掉" ——
+                #   那样主循环里既发不出去也收不到（踩过这个坑）。
+                print("  -> 这个后端能收数据，直接用它，"
+                      "不再尝试其它后端（避免改动引脚配置）")
+                break
             else:
                 try:
                     d.deinit()
                 except Exception:
                     pass
-            table.append((label, "已打开", "", n_bytes, n_frames))
         if dev is None:
             # 谁都没数据：退回到第一个能打开的后端，继续跑，方便看实时状态
             for label, opener in candidates():
