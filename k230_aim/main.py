@@ -4,7 +4,7 @@
 整体上电即自动运行：把本文件保存到 K230 SD 卡根目录、命名 main.py 即可。
 
 它做的事（和地瓜派版一一对应）：
-   相机取图 -> 找黑胶带框(靶纸) -> 找激光光斑
+   相机取图 -> 找 A4 靶纸(白纸亮块 + 四周暗框校验) -> 找激光光斑
         -> 像素误差 -> 角度偏置 -> 串口发给 H723 -> 云台转过去
 
 和 H723 的约定（协议不变）：
@@ -13,12 +13,13 @@
    0x90 遥测 / 0x91 ACK / 0x93 调试文本
    H723 端: 0.5s 收不到 AIM 自动切 STAB 并关激光（安全看门狗）
 
-引脚（K230 EXPORT 排针 -> H723 UART7）：
-   IO9  (TXD) -> H723 UART7 RX
-   IO10 (RXD) -> H723 UART7 TX
-   GND        -> GND        （必须共地）
-   5V         -> 5V         （整机由 H723 侧供电时用）
-   如果接的是 12Pin GPIO 的 UART3，把 UART_UNIT/TX/RX 改成 3/32/33。
+接线（实测确认，别再改回去）：
+   K230 IO9 (TXD)  <-> H723 USART1 的 RX (PA10)
+   K230 IO10(RXD)  <-> H723 USART1 的 TX (PA9)
+   GND             <-> GND   （必须共地，否则一个字节都收不到）
+   5V              <-  H723 UART10 排针的 VCC（USART1 三针端子上没有电源脚）
+   H723 固件 gimbal_link.c: GL_LINK_UART_SEL = 0（走 USART1）
+   K230 侧串口固定用 ybUtils.YbUart（IO9/IO10 被固件预占，machine.UART 打不开）
 
 调参都在下面「配置区」。改完直接重新运行即可。
 """
@@ -46,25 +47,32 @@ DISPLAY_H = 480
 # --- 相机 ---
 IMG_W = 640
 IMG_H = 480
-TARGET_METHOD = "rects"    # rects(原生 find_rects, RGB565) | cv2(OpenCV, RGB888)
 
-# --- 靶纸（黑胶带框）检测 ---
-RECT_THRESHOLD = 20000     # find_rects 阈值，检不到就调小
-RECT_XGRAD = 8
-RECT_YGRAD = 8
-ADAPT_BLOCK = 31           # cv2 自适应阈值窗口（奇数）
-ADAPT_C = 7
-POLY_EPS = 0.02            # approxPolyDP 精度（周长比例）
-MIN_AREA_RATIO = 0.02      # 框面积 / 画面面积 下限
-ASPECT_MIN = 1.20          # 长边/短边（180x297 胶带框 = 1.65）
-ASPECT_MAX = 2.30
-PAPER_LONG_M = 0.297       # 胶带框长边实际长度（米），用于估距离
+# --- 靶纸检测：A4 白纸亮块 + “四周更暗”校验 ---
+# 实测 L(0~100): 白纸 60~70、木柜 25~35、墙 45、黑胶带 20 —— 固定阈值就能分开；
+# 黑胶带框正好提供“亮块四周更暗”的校验（白瓷砖地没有这圈暗框，不会误检）。
+# 详细说明见 tools/vision_check.py 顶部。
+PAPER_TH = 58              # 亮度阈值（0~100）
+PAPER_TH_ALT = 72          # 兜底阈值：全图第一遍失败时再试
+PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
+PAPER_B_MAX = 32           # |b| 上限
+PAPER_MIN_AREA = 450       # 最小像素面积（2.2m 处 A4 约 55x39px ≈ 2100px）
+PAPER_MAX_AREA_RATIO = 0.85
+PAPER_ASPECT_MIN = 1.05
+PAPER_ASPECT_MAX = 3.00
+PAPER_DENSITY_MIN = 0.50
+PAPER_CONTRAST_MIN = 22    # 内亮度 - 外亮度（0~255 量程）
+TRACK_PAD = 60             # 跟踪窗 = 上次方框 + 余量
+HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
+FULL_EVERY = 3             # 丢靶时每几帧做一次全图搜索
+SMOOTH = 0.55              # 检出平滑系数
+PAPER_LONG_M = 0.297       # A4 长边实际长度（米），用于估距离
 
 # --- 激光光斑检测 ---
-SPOT_ROI_HALF = 130        # 只在画面中心这块 ±130px 里找光斑（同轴 = 位置固定）
+SPOT_ROI_HALF = 55         # 光轴固定，只在学习到的点附近找光斑
 SPOT_THRESHOLDS = [        # LAB 阈值，可多组
-    (60, 100, 8, 60, -10, 60),     # 亮且偏暖（红激光边缘）
-    (85, 100, -20, 40, -20, 60),   # 过曝白芯
+    (50, 100, 6, 80, -30, 70),     # 亮且偏暖（红激光边缘）
+    (80, 100, -25, 70, -40, 80),   # 过曝白芯
 ]
 SPOT_MIN_AREA = 3
 SPOT_MAX_AREA = 3000
@@ -73,7 +81,7 @@ SPOT_ADAPT_GAIN = 0.06     # 光轴点慢速自适应（把误检拖跑的风险
 SPOT_ADAPT_LIMIT = 6.0     # 单次最多修正多少像素
 
 # --- 瞄准控制（积分型视觉伺服 + P 项挂在实测姿态上）---
-FX_PX = 430.0              # 像素焦距（640 宽）。见文件末尾校准说明
+FX_PX = 445.0              # 像素焦距（640 宽）。0.6m 处 A4 长边≈222px 反推
 SIGN_YAW = 1.0             # 偏置方向；若越转越远就把对应项改 -1
 SIGN_PITCH = 1.0
 KP_P_YAW = 0.75            # P 项：一次给出 75% 的偏差角度
@@ -322,147 +330,210 @@ class Link(object):
 # ============================================================================
 #  视觉：靶纸（黑胶带框）检测
 # ============================================================================
-def order_corners(pts):
-    cx = sum(p[0] for p in pts) / 4.0
-    cy = sum(p[1] for p in pts) / 4.0
+def luma(r, g, b):
+    return (r * 77 + g * 150 + b * 29) >> 8
+
+
+def px_luma(img, x, y):
+    """取某点亮度（0~255）。取不到返回 -1。"""
+    if x < 0:
+        x = 0
+    elif x >= IMG_W:
+        x = IMG_W - 1
+    if y < 0:
+        y = 0
+    elif y >= IMG_H:
+        y = IMG_H - 1
     try:
-        ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
-        ang.sort(key=lambda t: t[0])
-        return [list(t[1]) for t in ang]
-    except AttributeError:
-        # MicroPython 的 math 可能是裁剪版（例如没有 atan2）：
-        # 退化成"按 x 分左右、再按 y 分上下"。
-        s = sorted(pts, key=lambda p: p[0])
-        left = sorted(s[:2], key=lambda p: p[1])
-        right = sorted(s[2:], key=lambda p: p[1])
-        return [list(left[0]), list(right[0]), list(right[1]), list(left[1])]
+        p = img.get_pixel(int(x), int(y))
+    except Exception:
+        return -1
+    if p is None:
+        return -1
+    return luma(p[0], p[1], p[2])
 
 
-def quad_center_area_aspect(q):
-    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = q
-    d1x, d1y = x2 - x0, y2 - y0
-    d2x, d2y = x3 - x1, y3 - y1
-    den = d1x * d2y - d1y * d2x
-    if abs(den) < 1e-6:
-        cx, cy = (x0 + x2) / 2.0, (y0 + y2) / 2.0
-    else:
-        t = ((x1 - x0) * d2y - (y1 - y0) * d2x) / den
-        cx, cy = x0 + t * d1x, y0 + t * d1y
-    area = 0.5 * abs((x0 * y1 - x1 * y0) + (x1 * y2 - x2 * y1) +
-                     (x2 * y3 - x3 * y2) + (x3 * y0 - x0 * y3))
-    sides = [math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2),
-             math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2),
-             math.sqrt((x3 - x2) ** 2 + (y3 - y2) ** 2),
-             math.sqrt((x0 - x3) ** 2 + (y0 - y3) ** 2)]
-    a_len = (sides[0] + sides[2]) / 2.0
-    b_len = (sides[1] + sides[3]) / 2.0
-    long_side = max(a_len, b_len)
-    short_side = max(1.0, min(a_len, b_len))
-    return (cx, cy), area, long_side / short_side, long_side
+def paper_contrast(img, x, y, w, h):
+    """内亮外暗校验：返回 (内部平均亮度, 四周平均亮度)；取不到给 -1。"""
+    u = ((x + w * 0.30, y + h * 0.50), (x + w * 0.70, y + h * 0.50),
+         (x + w * 0.50, y + h * 0.30), (x + w * 0.50, y + h * 0.70),
+         (x + w * 0.50, y + h * 0.50))
+    o = ((x - 5, y + h * 0.50), (x + w + 5, y + h * 0.50),
+         (x + w * 0.50, y - 5), (x + w * 0.50, y + h + 5),
+         (x - 5, y - 5))
+    si = 0
+    so = 0
+    ni = 0
+    no = 0
+    for p in u:
+        v = px_luma(img, p[0], p[1])
+        if v >= 0:
+            si += v
+            ni += 1
+    for p in o:
+        v = px_luma(img, p[0], p[1])
+        if v >= 0:
+            so += v
+            no += 1
+    if ni < 3 or no < 3:
+        return -1, -1
+    return si / float(ni), so / float(no)
 
 
-class TargetDetector(object):
-    """两种实现：rects(原生) / cv2(OpenCV 移植版)。"""
+def norm_bbox(bx, by, bw, bh, roi):
+    """兼容 find_blobs 返回“相对 ROI”或“全图”两种坐标。"""
+    if roi[0] or roi[1]:
+        if (bx + bw / 2.0) < roi[0] or (by + bh / 2.0) < roi[1]:
+            return bx + roi[0], by + roi[1]
+    return bx, by
 
-    def __init__(self, method):
-        self.method = method
-        self.kernel = None
+
+class PaperDetector(object):
+    """A4 靶纸检测（C 加速 find_blobs）+ 跟踪窗/平滑/丢靶保持。
+
+    返回 dict: center/box/smooth/area/aspect/long_side/contrast/n
+    详细判据说明见 tools/vision_check.py 顶部注释。
+    """
+
+    def __init__(self):
+        self.u = IMG_W / 2.0
+        self.v = IMG_H / 2.0
+        self.w = 0.0
+        self.h = 0.0
+        self.have = False
+        self.lost = 0
+        self.meas = None
+        self.frame = 0
+        self.last_n = 0
+        self.last_dbg = ""
         self.err = 0
         self.err_msg = ""
-        self.last_n = 0
-        if method == "cv2":
-            import cv2
-            self.cv2 = cv2
-            self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-    def detect(self, img, img_area):
+    def roi(self):
+        r = int(max(self.w, self.h) * 0.75) + TRACK_PAD
+        x = int(self.u - r)
+        y = int(self.v - r)
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        w = 2 * r
+        h = 2 * r
+        if x + w > IMG_W:
+            w = IMG_W - x
+        if y + h > IMG_H:
+            h = IMG_H - y
+        return (x, y, w, h)
+
+    def fresh(self):
+        return self.have and (self.lost < HOLD_FRAMES)
+
+    def detect(self, img):
+        self.frame += 1
+        cand = None
+        n = 0
+        dbg = ""
         try:
-            if self.method == "cv2":
-                return self._detect_cv2(img, img_area)
-            return self._detect_rects(img, img_area)
+            if self.have and self.lost < 25:
+                cand, n, dbg = self._find(img, self.roi(), PAPER_TH)
+                if cand is None and (self.frame % FULL_EVERY) == 0:
+                    cand, n, dbg = self._find(img, (0, 0, IMG_W, IMG_H),
+                                              PAPER_TH)
+            elif (self.frame % FULL_EVERY) == 0:
+                cand, n, dbg = self._find(img, (0, 0, IMG_W, IMG_H),
+                                          PAPER_TH)
+                if cand is None:
+                    cand2, n2, dbg2 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                                 PAPER_TH_ALT)
+                    cand = cand2
+                    n += n2
+                    dbg = dbg + dbg2
         except Exception as e:
             self.err += 1
             if self.err_msg != str(e):
                 self.err_msg = str(e)
-                print("检测异常: %s" % e)
+                print("靶纸检测异常: %s" % e)
             return None
+        self.last_n = n
+        self.last_dbg = dbg
+        if cand is None:
+            self.lost += 1
+            return None
+        px, x, y, w, h, long_side, aspect, density, ins, outs = cand
+        cu = x + w / 2.0
+        cv = y + h / 2.0
+        if not self.have:
+            self.u, self.v, self.w, self.h = cu, cv, w, h
+            self.have = True
+        else:
+            self.u += SMOOTH * (cu - self.u)
+            self.v += SMOOTH * (cv - self.v)
+            self.w += SMOOTH * (w - self.w)
+            self.h += SMOOTH * (h - self.h)
+        self.lost = 0
+        self.meas = cand
+        return {"center": (self.u, self.v), "box": (x, y, w, h),
+                "area": px, "aspect": aspect, "density": density,
+                "long_side": long_side, "contrast": ins - outs, "n": n}
 
-    # ---------------------------------------------------------------
-    def _detect_rects(self, img, img_area):
+    def _find(self, img, roi, th):
+        """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。"""
         best = None
         n = 0
-        for r in img.find_rects(threshold=RECT_THRESHOLD,
-                                x_gradient=RECT_XGRAD,
-                                y_gradient=RECT_YGRAD):
+        dbg = ""
+        blobs = img.find_blobs(
+            [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
+              -PAPER_B_MAX, PAPER_B_MAX)],
+            roi=roi, merge=True, margin=6,
+            area_threshold=PAPER_MIN_AREA,
+            pixels_threshold=PAPER_MIN_AREA)
+        if not blobs:
+            return None, 0, ""
+        for b in blobs:
             n += 1
-            pts = [(int(p[0]), int(p[1])) for p in r.corners()]
-            q = order_corners(pts)
-            center, area, aspect, long_side = quad_center_area_aspect(q)
-            if area < MIN_AREA_RATIO * img_area:
+            x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
+            x, y = norm_bbox(x, y, w, h, roi)
+            if w < 8 or h < 8:
                 continue
-            if aspect < ASPECT_MIN or aspect > ASPECT_MAX:
+            long_side = w if w > h else h
+            short_side = w if w < h else h
+            aspect = long_side / float(short_side)
+            density = px / float(w * h)
+            ins, outs = paper_contrast(img, x, y, w, h)
+            if n <= 3:
+                dbg += "[%dpx 比%.2f 密%.2f 内%d 外%d] " % (
+                    px, aspect, density, ins, outs)
+            if px < PAPER_MIN_AREA:
                 continue
-            if best is None or area > best[1]:
-                best = (q, area, center, aspect, long_side)
-        self.last_n = n
+            if px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
+                continue
+            if aspect < PAPER_ASPECT_MIN or aspect > PAPER_ASPECT_MAX:
+                continue
+            if density < PAPER_DENSITY_MIN:
+                continue
+            if (x <= 1) or (y <= 1) or \
+                    ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1):
+                continue
+            if ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
+                continue
+            score = px * (0.5 + min(ins - outs, 80) / 80.0)
+            if best is None or score > best[0]:
+                best = (score, (px, x, y, w, h, long_side, aspect, density,
+                                ins, outs))
         if best is None:
-            return None
-        q, area, center, aspect, long_side = best
-        return {"quad": q, "center": center, "area": area, "aspect": aspect,
-                "long_side": long_side, "n": n}
-
-    # ---------------------------------------------------------------
-    def _detect_cv2(self, img, img_area):
-        cv2 = self.cv2
-        img_np = img.to_numpy_ref()
-        gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-        bin_img = cv2.adaptiveThreshold(gray, 255,
-                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY_INV,
-                                        ADAPT_BLOCK, ADAPT_C)
-        closed = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, self.kernel)
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        n = 0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < MIN_AREA_RATIO * img_area:
-                continue
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, POLY_EPS * peri, True)
-            if len(approx) != 4:
-                continue
-            n += 1
-            pts = [(int(p[0][0]), int(p[0][1])) for p in approx]
-            q = order_corners(pts)
-            center, qarea, aspect, long_side = quad_center_area_aspect(q)
-            if aspect < ASPECT_MIN or aspect > ASPECT_MAX:
-                continue
-            if best is None or qarea > best[1]:
-                best = (q, qarea, center, aspect, long_side)
-        self.last_n = n
-        if best is None:
-            return None
-        q, area, center, aspect, long_side = best
-        return {"quad": q, "center": center, "area": area, "aspect": aspect,
-                "long_side": long_side, "n": n}
+            return None, n, dbg
+        return best[1], n, dbg
 
 
 # ============================================================================
 #  视觉：激光光斑
 # ============================================================================
 class SpotDetector(object):
-    def __init__(self, method):
-        self.method = method
+    def __init__(self):
         self.u = IMG_W / 2.0
         self.v = IMG_H / 2.0
         self.learned = False
         self.err = 0
-        if method == "cv2":
-            import cv2
-            self.cv2 = cv2
-            self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
     def roi(self):
         x0 = int(max(0, self.u - SPOT_ROI_HALF))
@@ -478,8 +549,6 @@ class SpotDetector(object):
 
     def detect(self, img):
         try:
-            if self.method == "cv2":
-                return self._detect_cv2(img)
             return self._detect_blobs(img)
         except Exception as e:
             self.err += 1
@@ -506,10 +575,7 @@ class SpotDetector(object):
             for b in img.find_blobs([th], roi=(x0, y0, w, h), merge=True,
                                     pixels_threshold=SPOT_MIN_AREA,
                                     area_threshold=SPOT_MIN_AREA):
-                try:
-                    area = b.area()
-                except Exception:
-                    area = b[4]
+                area = b[4]
                 if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
                     continue
                 bw = b[2]
@@ -518,59 +584,16 @@ class SpotDetector(object):
                     continue
                 if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
                     continue
-                cx = b[5]
-                cy = b[6]
+                bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
                 if best is None or area > best[0]:
-                    best = (area, cx, cy, (b[0], b[1], bw, bh))
+                    best = (area, cx, cy, (bx, by, bw, bh))
         if best is None:
             return None
         area, cx, cy, rect = best
         self._adapt(cx, cy)
         return {"uv": (cx, cy), "area": area, "rect": rect}
-
-    # ---- OpenCV 版（RGB888）：暖色优势 + 亮度 ----
-    def _detect_cv2(self, img):
-        cv2 = self.cv2
-        img_np = img.to_numpy_ref()
-        x0, y0, w, h = self.roi()
-        # 只取 ROI（ulab 切片）
-        sub = img_np[y0:y0 + h, x0:x0 + w]
-        r = sub[:, :, 0]
-        g = sub[:, :, 1]
-        b = sub[:, :, 2]
-        # 暖色优势 = min(R-G, B-G) >= gap  （用两个饱和减法 + 与运算等价实现）
-        rg = cv2.subtract(r, g)
-        bg = cv2.subtract(b, g)
-        m1 = cv2.threshold(rg, 6, 255, cv2.THRESH_BINARY)[1]
-        m2 = cv2.threshold(bg, 6, 255, cv2.THRESH_BINARY)[1]
-        # 亮度下限（三个通道都要够亮）
-        m3 = cv2.threshold(g, 110, 255, cv2.THRESH_BINARY)[1]
-        m4 = cv2.threshold(r, 110, 255, cv2.THRESH_BINARY)[1]
-        m5 = cv2.threshold(b, 110, 255, cv2.THRESH_BINARY)[1]
-        mask = cv2.bitwise_and(cv2.bitwise_and(cv2.bitwise_and(m1, m2), m3),
-                               cv2.bitwise_and(m4, m5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                continue
-            x, y, bw, bh = cv2.boundingRect(c)
-            if bw < 1 or bh < 1:
-                continue
-            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                continue
-            if best is None or area > best[0]:
-                best = (area, x, y, bw, bh)
-        if best is None:
-            return None
-        area, x, y, bw, bh = best
-        cx = x0 + x + bw / 2.0
-        cy = y0 + y + bh / 2.0
-        self._adapt(cx, cy)
-        return {"uv": (cx, cy), "area": area, "rect": (x0 + x, y0 + y, bw, bh)}
 
 
 # ============================================================================
@@ -645,14 +668,11 @@ class AimCtrl(object):
 # ============================================================================
 def init_camera():
     from media.sensor import Sensor, CAM_CHN_ID_0
-    sensor = Sensor()
+    sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    if TARGET_METHOD == "cv2":
-        sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
-    else:
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
+    sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
     return sensor
 
 
@@ -721,8 +741,8 @@ def main():
     MediaManager.init()
     sensor.run()
 
-    target_det = TargetDetector(TARGET_METHOD)
-    spot_det = SpotDetector(TARGET_METHOD)
+    target_det = PaperDetector()
+    spot_det = SpotDetector()
     ctrl = AimCtrl()
 
     state = ST_WAIT_READY
@@ -744,8 +764,8 @@ def main():
     sent_mode = None
 
     print("=" * 60)
-    print("K230 瞄准程序启动  %dx%d  检测=%s  显示=%s"
-          % (IMG_W, IMG_H, TARGET_METHOD, DISPLAY_MODE))
+    print("K230 瞄准程序启动  %dx%d  靶纸=白纸亮块+暗框  显示=%s"
+          % (IMG_W, IMG_H, DISPLAY_MODE))
     print("=" * 60)
 
     try:
@@ -818,7 +838,7 @@ def main():
                 img = sensor.snapshot()
                 n_frames += 1
 
-                res = target_det.detect(img, float(IMG_W * IMG_H))
+                res = target_det.detect(img)
                 spot = spot_det.detect(img)
 
                 # 丢靶滑行：短时间内沿用最后一次误差继续闭环
@@ -856,11 +876,9 @@ def main():
                 # ---- 画到 IDE 画面 ----
                 if canvas is not None:
                     if res is not None:
-                        q = res["quad"]
-                        for i in range(4):
-                            a, b = q[i], q[(i + 1) % 4]
-                            img.draw_line(a[0], a[1], b[0], b[1],
-                                          color=(0, 255, 0), thickness=2)
+                        bx, by, bw, bh = res["box"]
+                        img.draw_rectangle(bx, by, bw, bh,
+                                           color=(0, 255, 0), thickness=2)
                         img.draw_cross(int(res["center"][0]),
                                        int(res["center"][1]),
                                        color=(255, 0, 0), size=12,
@@ -901,18 +919,24 @@ def main():
                        max(1, time.ticks_diff(now, t_print)))
                 n_frames_prev = n_frames
                 t_print = now
+                tgt_s = "无靶"
+                if target_det.meas is not None and target_det.lost == 0:
+                    tgt_s = "%.2fm" % (FX_PX * PAPER_LONG_M /
+                                       max(1.0, target_det.meas[5]))
                 if gz is not None:
                     print("[%s] %.1ffps gz(state=%d flags=0x%02X yaw=%.1f) "
-                          "tgt %d/%d spot %d/%d err=%.0f yaw=%.1f pit=%.1f "
+                          "靶=%s 命中%d/%d 光斑%d err=%.0f yaw=%.1f pit=%.1f "
                           "ok=%d crc=%d"
                           % (ST_NAME[state], fps, gz["state"], gz["flags"],
-                             gz["yaw"], n_hit, n_frames, n_spot, n_frames,
+                             gz["yaw"], tgt_s, n_hit, n_frames, n_spot,
                              ctrl.err_px, ctrl.yaw, ctrl.pitch,
                              parser.ok, parser.crc_err))
                 else:
-                    print("[%s] 等 H723 遥测... ok=%d crc=%d"
-                          % (ST_NAME[state], parser.ok, parser.crc_err))
-            gc.collect()
+                    print("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
+                          % (ST_NAME[state], tgt_s,
+                             parser.ok, parser.crc_err))
+            if (n_frames % 30) == 0:
+                gc.collect()
             time.sleep_ms(1)
     except KeyboardInterrupt:
         print("用户停止")
