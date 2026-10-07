@@ -29,16 +29,18 @@ DISPLAY_QUALITY = 50       # IDE 画面质量（越小越流畅）
 TAPE_L_MAX = 0             # 0 = 自动（Otsu + 候选阈值）；>0 = 手动固定阈值
 TAPE_L_ABS_MIN = 25        # 自动阈值的下限，防止切得太狠
 TAPE_MIN_AREA = 400        # 像素面积下限（太远时框会变小，可往下调）
-TAPE_MAX_AREA_RATIO = 0.60
+TAPE_MAX_AREA_RATIO = 0.20 # 超过画面 20% 的一律当背景
 TAPE_ASPECT_MIN = 1.30     # 胶带框 297x180 → 1.65（收紧，挡掉木纹等 2.2+ 的条状块）
 TAPE_ASPECT_MAX = 2.10
-TAPE_DENSITY_MIN = 0.25    # 环状判据：块面积/外框面积（实心块≈0.7+，空心环≈0.3~0.55）
-TAPE_DENSITY_MAX = 0.62
-PAPER_LUMA_MIN = 140       # "框内是亮白纸"的亮度下限(0-255)
-TAPE_LUMA_MAX = 95         # "框边是暗胶带"的亮度上限(0-255)
-TAPE_SIDE_RATIO_TOL = 0.45 # 对边长度相对差上限（国一用的 0.4）
-TAPE_ANGLE_TOL = 30.0      # 内角偏离 90° 的容差（国一用的 30°）
+TAPE_DENSITY_MIN = 0.10    # 环状判据：块面积/外框面积
+TAPE_DENSITY_MAX = 0.85
+PAPER_LUMA_MIN = 120       # "框内是亮白纸"的亮度下限(0-255)
+TAPE_LUMA_MAX = 110        # "框边是暗胶带"的亮度上限(0-255)
+TAPE_SIDE_RATIO_TOL = 0.60 # 对边长度相对差上限
+TAPE_ANGLE_TOL = 40.0      # 内角偏离 90° 的容差
 TAPE_LMAX_TRY = 2          # 最多试几档阈值（1=只用 Otsu，最快）
+TAPE_TRACK_HALF = 120      # 跟踪窗口半径（找到靶后只在这块里搜 → 大幅提速）
+TAPE_LOST_FULL = 8         # 连续丢靶多少帧后做一次全图搜索
 
 # --- 激光光斑：暖色亮块（LAB）---
 SPOT_THRESHOLDS = [
@@ -253,6 +255,9 @@ def main():
 
     ready = False
     armed = False
+    tgt_u, tgt_v = IMG_W / 2.0, IMG_H / 2.0
+    have_tgt = False
+    lost_n = 0
     t_hb = time.ticks_ms()
     t_aim = time.ticks_ms()
     t_print = time.ticks_ms()
@@ -346,9 +351,21 @@ def main():
             best = None            # (area, cx, cy, long_side_px, aspect, corners)
             n_blob = 0
             list_txt = ""
+
+            # ---- 跟踪窗：找到靶后只在这一小块里找（大幅提速）----
+            if have_tgt and (lost_n < TAPE_LOST_FULL):
+                sx = int(max(0, tgt_u - TAPE_TRACK_HALF))
+                sy = int(max(0, tgt_v - TAPE_TRACK_HALF))
+                sw = int(min(IMG_W, tgt_u + TAPE_TRACK_HALF)) - sx
+                sh = int(min(IMG_H, tgt_v + TAPE_TRACK_HALF)) - sy
+                search_roi = (sx, sy, sw, sh)
+            else:
+                sx, sy = 0, 0
+                search_roi = (0, 0, IMG_W, IMG_H)
+
             for th in th_list:
                 for b in img.find_blobs([(0, th, -60, 60, -60, 60)],
-                                        merge=True,
+                                        roi=search_roi, merge=True,
                                         area_threshold=TAPE_MIN_AREA,
                                         pixels_threshold=TAPE_MIN_AREA):
                     n_blob += 1
@@ -361,27 +378,20 @@ def main():
                     if area > TAPE_MAX_AREA_RATIO * img_area:
                         continue
                     x, y, w, h = b[0], b[1], b[2], b[3]
+                    # find_blobs 的坐标可能是"相对 ROI"，也可能已经是全图坐标：
+                    # 用"中心是否落在搜索窗里"来判断
+                    if search_roi != (0, 0, IMG_W, IMG_H):
+                        ccx0 = x + w / 2.0
+                        ccy0 = y + h / 2.0
+                        if not ((sx - 20) <= ccx0 <= (sx + sw + 20) and
+                                (sy - 20) <= ccy0 <= (sy + sh + 20)):
+                            x, y = x + sx, y + sy
                     aspect = max(w, h) / max(1.0, min(w, h))
-                    if n_blob <= 3:
-                        list_txt += " [th%d %dpx %.1f%% 比=%.2f]" % (
-                            th, area, 100.0 * area / img_area, aspect)
-                    if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
-                        continue
-                    # 环状判据：胶带是空心环，实心块（木纹/阴影）密度会很高
+                    cu, cv_ = x + w / 2.0, y + h / 2.0
                     try:
                         density = b.density()
                     except Exception:
                         density = -1.0
-                    if density >= 0.0:
-                        if density < TAPE_DENSITY_MIN or \
-                                density > TAPE_DENSITY_MAX:
-                            continue
-                    # 贴边的大块多半是背景/阴影，不要
-                    if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
-                            (y + h >= IMG_H - 1):
-                        continue
-                    # 内亮外暗：框中心是白纸、框边是黑胶带
-                    cu, cv_ = x + w / 2.0, y + h / 2.0
                     inner = mean_or_none([luma(img, cu, cv_),
                                           luma(img, cu + w * 0.15, cv_),
                                           luma(img, cu - w * 0.15, cv_),
@@ -391,6 +401,26 @@ def main():
                                          luma(img, x + w, cv_),
                                          luma(img, cu, y),
                                          luma(img, cu, y + h)])
+                    if n_blob <= 3:
+                        list_txt += (" [th%d %dpx %.1f%% 比%.2f 密%.2f "
+                                     "内%s 边%s]" % (
+                                         th, area, 100.0 * area / img_area,
+                                         aspect, density,
+                                         "?" if inner is None else
+                                         "%.0f" % inner,
+                                         "?" if edge is None else
+                                         "%.0f" % edge))
+                    if aspect < TAPE_ASPECT_MIN or aspect > TAPE_ASPECT_MAX:
+                        continue
+                    if density >= 0.0:
+                        if density < TAPE_DENSITY_MIN or \
+                                density > TAPE_DENSITY_MAX:
+                            continue
+                    # 贴边的大块多半是背景/阴影，不要
+                    if (x <= 1) or (y <= 1) or (x + w >= IMG_W - 1) or \
+                            (y + h >= IMG_H - 1):
+                        continue
+                    # 内亮外暗：框中心是白纸、框边是黑胶带
                     if (inner is not None) and (inner < PAPER_LUMA_MIN):
                         continue
                     if (edge is not None) and (edge > TAPE_LUMA_MAX):
@@ -447,6 +477,13 @@ def main():
                 learn_n = 0
 
             # ---------- 画 ----------
+            if best is not None:
+                tgt_u, tgt_v = best[1], best[2]
+                have_tgt = True
+                lost_n = 0
+            else:
+                lost_n += 1
+
             if best is not None:
                 if best[5] is not None:
                     c = best[5]
