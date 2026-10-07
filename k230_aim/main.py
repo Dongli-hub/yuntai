@@ -43,6 +43,8 @@ UART_BAUD = 115200
 DISPLAY_MODE = "VIRT"      # VIRT(只用 IDE 画面) | LCD(接了屏) | OFF
 DISPLAY_W = 640
 DISPLAY_H = 480
+DISPLAY_QUALITY = 40       # IDE 传输质量（越小越快）
+SHOW_EVERY = 2             # 每几帧推一次画面（识别/瞄准仍每帧都算）
 
 # --- 相机 ---
 IMG_W = 640
@@ -1288,7 +1290,8 @@ def main():
                         "%s err=%.0fpx yaw=%.1f pit=%.1f"
                         % (ST_NAME[state], ctrl.err_px, ctrl.yaw, ctrl.pitch),
                         color=(255, 220, 0))
-                    if _display is not None:
+                    # 隔帧推画面：to_ide 传输比处理慢，追太紧会出现撕裂/花屏
+                    if (_display is not None) and ((n_frames % SHOW_EVERY) == 0):
                         _display.show_image(img)
 
             # ---------- 5. 发 AIM（50Hz，保持链路活着）----------

@@ -42,7 +42,8 @@ import math
 # ============================ 画面 / 显示 ============================
 IMG_W = 640
 IMG_H = 480
-DISPLAY_QUALITY = 50
+DISPLAY_QUALITY = 40       # 越小传输越快（画面撕裂跟传输速度直接相关）
+SHOW_EVERY = 2             # 每几帧往 IDE 推一次画面（识别仍每帧都算）
 
 # ============================ 靶纸检测 ============================
 PAPER_TH = 58              # 亮度阈值（0~100）
@@ -982,8 +983,12 @@ def main():
                 img.draw_cross(int(spot[1]), int(spot[2]),
                                color=(255, 255, 0), size=6, thickness=1)
 
+            # 隔帧推画面：to_ide 的编码+USB 传输比处理慢，追太紧会在传输途中
+            # 改写同一块缓冲，IDE 里就显示成"几块拼接+颜色错乱"的撕裂画面
+            # （数据本身没问题，终端里的靶心/误差一直是对的）。
             t0 = time.ticks_ms()
-            Display.show_image(img)
+            if (n_frame % SHOW_EVERY) == 0:
+                Display.show_image(img)
             t_show = time.ticks_diff(time.ticks_ms(), t0)
             del img
 
