@@ -39,11 +39,12 @@
  *  三路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换；
  *  中断入口（USART1_IRQHandler / UART7_IRQHandler / USART10_IRQHandler）也都在。
  * ===================================================================== */
-/* ★ 2026-10-07 现场决定：
- *   · 数据线（TX/RX/GND）接 USART1 的 3 针端子（收发历史上都验证过）；
- *   · 5V 从 UART10 排针的 VCC 脚取（那一脚本来的用途就是给 K230 供电）。
- *   这样既满足"K230 靠板上 5V 供电"，又避开 UART10 接收脚收不到数据的问题。 */
-#define GL_LINK_UART_SEL     0
+/* ★ 2026-10-07 最终选择：链路走 UART10（RX=PE02 / TX=PE03, AF11）。
+ *   UART10 排针自带 VCC(5V)/GND/RX/TX，一根线就能把 K230 接上，
+ *   不再需要"数据走 USART1 + 5V 走 UART10"两根线接两个端子。
+ *   （之前判定它收不到，是因为 K230 侧脚本把 IO9/IO10 改成了 GPIO，
+ *     属于上位机代码问题，与 UART10 无关。） */
+#define GL_LINK_UART_SEL     2
 
 #if (GL_LINK_UART_SEL == 1)
 #define GL_HUART             huart7

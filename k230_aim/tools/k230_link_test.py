@@ -288,7 +288,8 @@ def main():
         print("!! 没有任何串口后端能打开——先解决这个")
         return
     print("=" * 56)
-    print("K230 通信自检")
+    print("K230 通信自检  [link_test v3 2026-10-07]")
+    print("  v3: 扫描器找到可用后端后立即停止，不再改动 IO9/IO10")
     print("使用串口: %s @ %d" % (uart_name, UART_BAUD))
     print_fpioa_state()
     print("=" * 56)
