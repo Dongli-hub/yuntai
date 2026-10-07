@@ -1387,6 +1387,11 @@ def main():
                     tgt_s = "%s %.2fm" % (
                         target_det.state,
                         FX_PX * PAPER_LONG_M / max(1.0, target_det.meas[5]))
+                else:
+                    # 没锁定时把"为什么没过闸门"一起写进日志（下次复盘要用）
+                    tgt_s = "无靶[%s 候选%d %s]" % (
+                        target_det.state, target_det.last_n,
+                        target_det.last_dbg)
                 if gz is not None:
                     log("[%s] %.1ffps gz(state=%d fault=%d flags=0x%02X "
                           "yaw=%.1f pit=%.1f roll=%.1f ymot=%.1f pmot=%.1f "
