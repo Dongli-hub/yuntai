@@ -25,6 +25,24 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ========================== 链路用哪一路串口 ==========================
+ *  GL_LINK_ON_UART7 = 1 : K230 链路走 UART7  →  TX=PE08 / RX=PE07
+ *                            （板上丝印写着 UART7 的那个 4 针接口）
+ *  GL_LINK_ON_UART7 = 0 : K230 链路走 USART1 →  TX=PA09 / RX=PA10
+ *                            （原来接地瓜派的那一路，历史上已验证可用）
+ *  两路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换，
+ *  中断入口（UART7_IRQHandler / USART1_IRQHandler）也都在。
+ * ===================================================================== */
+#define GL_LINK_ON_UART7     1
+
+#if GL_LINK_ON_UART7
+#define GL_HUART             huart7
+#define GL_LINK_IRQn         UART7_IRQn
+#else
+#define GL_HUART             huart1
+#define GL_LINK_IRQn         USART1_IRQn
+#endif
+
 /* ========================== 可调参数 ========================== */
 #define GL_TELEM_PERIOD_MS   20u     /* 遥测周期：20ms = 50Hz */
 #define GL_WATCHDOG_MS       500u    /* AIM 断流多久后自动降级到 STAB */
@@ -124,7 +142,7 @@ static void gl_tx_pump(void)
          * 然后继续从当前队列头发新的完整帧。 */
         if ((HAL_GetTick() - s_tx_busy_ms) > 100u)
         {
-            HAL_UART_AbortTransmit(&huart7);
+            HAL_UART_AbortTransmit(&GL_HUART);
             s_tx_tail     = s_tx_head;
             s_tx_busy_len = 0u;
             s_tx_drop++;
@@ -150,7 +168,7 @@ static void gl_tx_pump(void)
     {
         n = GL_TX_CHUNK;
     }
-    if (HAL_UART_Transmit_IT(&huart7, &s_tx_buf[s_tx_tail], n) == HAL_OK)
+    if (HAL_UART_Transmit_IT(&GL_HUART, &s_tx_buf[s_tx_tail], n) == HAL_OK)
     {
         s_tx_busy_len = n;
         s_tx_busy_ms  = HAL_GetTick();
@@ -160,7 +178,7 @@ static void gl_tx_pump(void)
 /* HAL 发送完成回调（中断上下文）：推进 tail */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart != &huart7)
+    if (huart != &GL_HUART)
     {
         return;
     }
@@ -175,13 +193,13 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 /* 出错时也要让发送通道恢复，否则一次错误就把遥测永久卡死 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart != &huart7)
+    if (huart != &GL_HUART)
     {
         return;
     }
     s_tx_busy_len = 0u;
-    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                    UART_CLEAR_NEF | UART_CLEAR_PEF);
+    __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
 }
 
 /* ========================== 发送封装 ========================== */
@@ -381,8 +399,10 @@ void gimbal_link_init(void)
     s_cmd.mode = GP_MODE_IDLE;
     gp_parser_init(&s_parser);
 
+#if GL_LINK_ON_UART7
     /* UART7 引脚：板子丝印已确认 RX=PE07 / TX=PE08，固定这一组 */
     UART7_BindPins(UART7_PAIR_PE);
+#endif
 
     /* ---- 上电信标 ----
      * 用阻塞方式先直发一串 ASCII。哪怕协议层还有别的问题，
@@ -393,9 +413,13 @@ void gimbal_link_init(void)
     if (UART7_InitError() == 0u)
     {
         static const char banner[] = "\r\nYUNTAI-UART7 PE7/PE8 alive\r\n";
-        HAL_UART_Transmit(&huart7, (uint8_t *)banner,
+        HAL_UART_Transmit(&GL_HUART, (uint8_t *)banner,
                           (uint16_t)(sizeof(banner) - 1u), 50u);
+#if GL_LINK_ON_UART7
         gimbal_link_log("[LINK] UART7(PE7/PE8) ready");
+#else
+        gimbal_link_log("[LINK] USART1(PA9/PA10) ready");
+#endif
     }
     else
     {
@@ -403,21 +427,21 @@ void gimbal_link_init(void)
     }
 
     /* 打开 UART7 的接收中断（接收只做"存字节"这一件事） */
-    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                    UART_CLEAR_NEF | UART_CLEAR_PEF);
-    __HAL_UART_ENABLE_IT(&huart7, UART_IT_RXNE);
-    HAL_NVIC_SetPriority(UART7_IRQn, 6u, 0u);
-    HAL_NVIC_EnableIRQ(UART7_IRQn);
+    __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
+    __HAL_UART_ENABLE_IT(&GL_HUART, UART_IT_RXNE);
+    HAL_NVIC_SetPriority(GL_LINK_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(GL_LINK_IRQn);
     s_ready = 1u;
 }
 
 void gimbal_link_rx_isr(void)
 {
-    uint32_t isr = huart7.Instance->ISR;
+    uint32_t isr = GL_HUART.Instance->ISR;
 
     if ((isr & USART_ISR_RXNE_RXFNE) != 0u)
     {
-        uint8_t  b = (uint8_t)(huart7.Instance->RDR & 0xFFu);
+        uint8_t  b = (uint8_t)(GL_HUART.Instance->RDR & 0xFFu);
         uint16_t next = (uint16_t)(s_rx_head + 1u);
         if (next >= GL_RX_BUF_SIZE)
         {
@@ -437,8 +461,8 @@ void gimbal_link_rx_isr(void)
     /* 溢出/帧错/噪声错误必须清掉，否则 RXNE 中断会被永久卡住 */
     if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) != 0u)
     {
-        __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                        UART_CLEAR_NEF | UART_CLEAR_PEF);
+        __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                         UART_CLEAR_NEF | UART_CLEAR_PEF);
     }
 }
 
