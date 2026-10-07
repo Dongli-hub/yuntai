@@ -33,7 +33,10 @@
  *  两路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换，
  *  中断入口（UART7_IRQHandler / USART1_IRQHandler）也都在。
  * ===================================================================== */
-#define GL_LINK_ON_UART7     1
+/* ★ 2026-10-07 实测：这块板子的 UART7(PE7/PE8) 怎么都发不出信号
+ *   （同一份代码、同一时刻，USART1(PA9) 用串口助手能收到完整数据），
+ *   所以链路切回历史上验证过的 USART1。 */
+#define GL_LINK_ON_UART7     0
 
 #if GL_LINK_ON_UART7
 #define GL_HUART             huart7
