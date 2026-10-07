@@ -51,30 +51,45 @@ IMG_H = 480
 # --- 靶纸检测：A4 白纸亮块 + “四周更暗”校验 ---
 # 实测 L(0~100): 白纸 60~70、木柜 25~35、墙 45、黑胶带 20 —— 固定阈值就能分开；
 # 黑胶带框正好提供“亮块四周更暗”的校验（白瓷砖地没有这圈暗框，不会误检）。
+# 现场日志：真靶纸 长边184~190px/密度0.83~0.96/对比90+；误检 密度0.51~0.73/对比22~67。
+# 所以下面加了长边范围、密度、对比三道静态闸门，外加尺寸/位置/连续确认三道时间闸门。
 # 详细说明见 tools/vision_check.py 顶部。
 PAPER_TH = 58              # 亮度阈值（0~100）
 PAPER_TH_ALT = 72          # 兜底阈值：全图第一遍失败时再试
 PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
 PAPER_B_MAX = 32           # |b| 上限
-PAPER_MIN_AREA = 450       # 最小像素面积（2.2m 处 A4 约 55x39px ≈ 2100px）
+PAPER_MIN_AREA = 900       # 最小像素面积（2.2m 处 A4 约 60x42px ≈ 2000px）
 PAPER_MAX_AREA_RATIO = 0.85
+PAPER_MIN_LONG = 60        # 长边下限 px（2.2m 处约 60px；再小就是背景小亮块）
+PAPER_MAX_LONG = 480       # 长边上限 px
 PAPER_ASPECT_MIN = 1.05
 PAPER_ASPECT_MAX = 3.00
-PAPER_DENSITY_MIN = 0.50
-PAPER_CONTRAST_MIN = 22    # 内亮度 - 外亮度（0~255 量程）
+PAPER_DENSITY_MIN = 0.70   # 外接框模式：实际像素/外接框面积
+PAPER_DENSITY_MIN_MR = 0.75  # 最小外接矩形模式（旋转不变，更准）
+PAPER_CONTRAST_MIN = 40    # 内亮度 - 外亮度（0~255 量程）
+PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
+PAPER_DARK_FRAC_MIN = 0.70  # 外侧 12 个点里至少这么多比例要比内部暗
 TRACK_PAD = 45             # 跟踪窗 = 上次方框 + 余量
 HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
-FULL_EVERY = 3             # 丢靶时每几帧做一次全图搜索
-SMOOTH = 0.55              # 检出平滑系数
+LOST_FULL = 18             # 丢这么多帧后放弃小窗，改全图搜索
+FULL_EVERY = 3             # 每几帧做一次全图搜索
+SMOOTH = 0.55              # 平滑系数
+DEADBAND_PX = 1.5          # 平滑死区（小于它不动，画面不抖）
+SIZE_GATE_LO = 0.55        # 跟踪时允许的长边变化范围（一帧内不可能变太多）
+SIZE_GATE_HI = 1.45
+CONFIRM_N = 3              # 全图候选连续确认几次才算重新锁定
+CONFIRM_DXY = 35           # 确认时的位置一致范围 px
+CONFIRM_DSIZE = 0.60       # 确认时的尺寸一致范围（±60%）
+PENDING_MISS = 3           # 确认过程中允许漏几次
 PAPER_LONG_M = 0.297       # A4 长边实际长度（米），用于估距离
 
 # --- 激光光斑检测 ---
-SPOT_ROI_HALF = 55         # 光轴固定，只在学习到的点附近找光斑
+SPOT_ROI_HALF = 45         # 光轴固定，只在学习到的点附近找光斑
 SPOT_THRESHOLDS = [        # LAB 阈值，可多组
     (50, 100, 6, 80, -30, 70),     # 亮且偏暖（红激光边缘）
     (80, 100, -25, 70, -40, 80),   # 过曝白芯
 ]
-SPOT_MIN_AREA = 3
+SPOT_MIN_AREA = 2
 SPOT_MAX_AREA = 3000
 SPOT_MAX_ASPECT = 3.0
 SPOT_ADAPT_GAIN = 0.06     # 光轴点慢速自适应（把误检拖跑的风险限制住）
@@ -354,13 +369,20 @@ def px_luma(img, x, y):
 
 
 def paper_contrast(img, x, y, w, h):
-    """内亮外暗校验：返回 (内部平均亮度, 四周平均亮度)；取不到给 -1。"""
+    """内亮外暗校验：返回 (内部平均亮度, 外侧平均亮度, 外侧合格比例)。
+
+    外侧取 12 个点（四边各 3 个），要求其中至少 PAPER_DARK_FRAC_MIN 的比例
+    明显比内部暗 —— 背景柜子那种“只有一边有暗边”的亮块因此过不了。
+    """
     u = ((x + w * 0.30, y + h * 0.50), (x + w * 0.70, y + h * 0.50),
          (x + w * 0.50, y + h * 0.30), (x + w * 0.50, y + h * 0.70),
          (x + w * 0.50, y + h * 0.50))
-    o = ((x - 5, y + h * 0.50), (x + w + 5, y + h * 0.50),
-         (x + w * 0.50, y - 5), (x + w * 0.50, y + h + 5),
-         (x - 5, y - 5))
+    o = ((x - 5, y + h * 0.25), (x - 5, y + h * 0.50), (x - 5, y + h * 0.75),
+         (x + w + 5, y + h * 0.25), (x + w + 5, y + h * 0.50),
+         (x + w + 5, y + h * 0.75),
+         (x + w * 0.25, y - 5), (x + w * 0.50, y - 5), (x + w * 0.75, y - 5),
+         (x + w * 0.25, y + h + 5), (x + w * 0.50, y + h + 5),
+         (x + w * 0.75, y + h + 5))
     si = 0
     so = 0
     ni = 0
@@ -375,9 +397,15 @@ def paper_contrast(img, x, y, w, h):
         if v >= 0:
             so += v
             no += 1
-    if ni < 3 or no < 3:
-        return -1, -1
-    return si / float(ni), so / float(no)
+    if ni < 3 or no < 6:
+        return -1, -1, 0.0
+    ins = si / float(ni)
+    ok = 0
+    for p in o:
+        v = px_luma(img, p[0], p[1])
+        if v >= 0 and v < (ins - PAPER_DARK_MARGIN):
+            ok += 1
+    return ins, so / float(no), ok / float(no)
 
 
 def norm_bbox(bx, by, bw, bh, roi):
@@ -388,11 +416,46 @@ def norm_bbox(bx, by, bw, bh, roi):
     return bx, by
 
 
-class PaperDetector(object):
-    """A4 靶纸检测（C 加速 find_blobs）+ 跟踪窗/平滑/丢靶保持。
+_MR = [0]                  # 0=没试过 1=可用 2=不可用（只探一次）
 
-    返回 dict: center/box/smooth/area/aspect/long_side/contrast/n
-    详细判据说明见 tools/vision_check.py 顶部注释。
+
+def blob_min_rect(b):
+    """blob 的最小外接矩形（旋转不变）：返回 (长边, 短边) 或 None。
+
+    斜视/旋转时外接框会变大、密度就不准；最小外接矩形没这个问题。
+    取不到就返回 None，调用方退回外接框。
+    """
+    if _MR[0] == 2:
+        return None
+    try:
+        cs = b.min_corners()
+    except Exception:
+        _MR[0] = 2
+        return None
+    _MR[0] = 1
+    try:
+        if (cs is None) or (len(cs) != 4):
+            return None
+        d = []
+        for i in range(4):
+            x1, y1 = cs[i][0], cs[i][1]
+            x2, y2 = cs[(i + 1) % 4][0], cs[(i + 1) % 4][1]
+            d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+        a = (d[0] + d[2]) / 2.0
+        c = (d[1] + d[3]) / 2.0
+        if a < 1.0 or c < 1.0:
+            return None
+        return (a, c) if a >= c else (c, a)
+    except Exception:
+        return None
+
+
+class PaperDetector(object):
+    """A4 靶纸检测（C 加速 find_blobs）+ 三道闸门 + 连续确认 + 平滑。
+
+    返回 dict: center/box/area/aspect/density/long_side/contrast/n/state
+    state: 锁定 / 确认x/3 / 搜索
+    详细判据与依据见 tools/vision_check.py 顶部注释。
     """
 
     def __init__(self):
@@ -403,9 +466,12 @@ class PaperDetector(object):
         self.have = False
         self.lost = 0
         self.meas = None
+        self.pend = None       # [cu, cv, long, cnt, miss]
         self.frame = 0
         self.last_n = 0
         self.last_dbg = ""
+        self.did_full = False
+        self.state = "搜索"
         self.err = 0
         self.err_msg = ""
 
@@ -428,26 +494,101 @@ class PaperDetector(object):
     def fresh(self):
         return self.have and (self.lost < HOLD_FRAMES)
 
+    def _size_ok(self, long_side):
+        if not self.have:
+            return True
+        old = max(self.w, self.h)
+        return (SIZE_GATE_LO * old) <= long_side <= (SIZE_GATE_HI * old)
+
+    def _confirm(self, cand):
+        """全图候选的连续确认。返回 True = 确认为目标。"""
+        if cand is None:
+            if self.pend is not None:
+                self.pend[4] += 1
+                if self.pend[4] > PENDING_MISS:
+                    self.pend = None
+            return False
+        cu = cand[1] + cand[3] / 2.0
+        cv = cand[2] + cand[4] / 2.0
+        lo = cand[5]
+        if self.pend is None:
+            self.pend = [cu, cv, lo, 1, 0]
+            return False
+        if (abs(cu - self.pend[0]) <= CONFIRM_DXY) and \
+                (abs(cv - self.pend[1]) <= CONFIRM_DXY) and \
+                (abs(lo - self.pend[2]) <= CONFIRM_DSIZE * self.pend[2]):
+            n = self.pend[3] + 1
+            self.pend[0] += (cu - self.pend[0]) / float(n)
+            self.pend[1] += (cv - self.pend[1]) / float(n)
+            self.pend[2] += (lo - self.pend[2]) / float(n)
+            self.pend[3] = n
+            self.pend[4] = 0
+            if n >= CONFIRM_N:
+                self.pend = None
+                return True
+        else:
+            self.pend = [cu, cv, lo, 1, 0]
+        return False
+
+    def _accept(self, cand):
+        x, y, w, h = cand[1], cand[2], cand[3], cand[4]
+        cu = x + w / 2.0
+        cv = y + h / 2.0
+        if not self.have:
+            self.u, self.v, self.w, self.h = cu, cv, w, h
+            self.have = True
+        else:
+            if abs(cu - self.u) > DEADBAND_PX:
+                self.u += SMOOTH * (cu - self.u)
+            if abs(cv - self.v) > DEADBAND_PX:
+                self.v += SMOOTH * (cv - self.v)
+            if abs(w - self.w) > 2 * DEADBAND_PX:
+                self.w += SMOOTH * (w - self.w)
+            if abs(h - self.h) > 2 * DEADBAND_PX:
+                self.h += SMOOTH * (h - self.h)
+        self.meas = cand
+        self.lost = 0
+        self.state = "锁定"
+
     def detect(self, img):
         self.frame += 1
         cand = None
         n = 0
         dbg = ""
+        self.did_full = False
         try:
-            if self.have and self.lost < 25:
+            if self.have and self.lost < LOST_FULL:
                 cand, n, dbg = self._find(img, self.roi(), PAPER_TH)
-                if cand is None and (self.frame % FULL_EVERY) == 0:
-                    cand, n, dbg = self._find(img, (0, 0, IMG_W, IMG_H),
-                                              PAPER_TH)
-            elif (self.frame % FULL_EVERY) == 0:
-                cand, n, dbg = self._find(img, (0, 0, IMG_W, IMG_H),
-                                          PAPER_TH)
-                if cand is None:
-                    cand2, n2, dbg2 = self._find(img, (0, 0, IMG_W, IMG_H),
-                                                 PAPER_TH_ALT)
-                    cand = cand2
+                if (cand is not None) and (not self._size_ok(cand[5])):
+                    dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
+                    cand = None
+                if (cand is None) and ((self.frame % FULL_EVERY) == 0):
+                    self.did_full = True
+                    c2, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                            PAPER_TH)
                     n += n2
-                    dbg = dbg + dbg2
+                    dbg += d2
+                    if self._confirm(c2):
+                        cand = c2
+                    elif c2 is None:
+                        c3, n3, d3 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                                PAPER_TH_ALT)
+                        n += n3
+                        dbg += d3
+                        if self._confirm(c3):
+                            cand = c3
+            elif (self.frame % FULL_EVERY) == 0:
+                self.did_full = True
+                c2, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                        PAPER_TH)
+                if c2 is None:
+                    c3, n3, d3 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                            PAPER_TH_ALT)
+                    c2, n2, d2 = c3, n2 + n3, d2 + d3
+                n += n2
+                dbg = d2
+                if self._confirm(c2):
+                    cand = c2
         except Exception as e:
             self.err += 1
             if self.err_msg != str(e):
@@ -456,25 +597,23 @@ class PaperDetector(object):
             return None
         self.last_n = n
         self.last_dbg = dbg
-        if cand is None:
-            self.lost += 1
-            return None
-        px, x, y, w, h, long_side, aspect, density, ins, outs = cand
-        cu = x + w / 2.0
-        cv = y + h / 2.0
-        if not self.have:
-            self.u, self.v, self.w, self.h = cu, cv, w, h
-            self.have = True
+        if cand is not None:
+            self._accept(cand)
         else:
-            self.u += SMOOTH * (cu - self.u)
-            self.v += SMOOTH * (cv - self.v)
-            self.w += SMOOTH * (w - self.w)
-            self.h += SMOOTH * (h - self.h)
-        self.lost = 0
-        self.meas = cand
+            self.lost += 1
+            if self.pend is not None:
+                self.state = "确认%d/%d" % (self.pend[3], CONFIRM_N)
+            elif (not self.have) or (self.lost >= LOST_FULL):
+                self.state = "搜索"
+            else:
+                self.state = "搜索"
+        if cand is None:
+            return None
+        px, x, y, w, h, long_side, aspect, density, ins, outs = self.meas
         return {"center": (self.u, self.v), "box": (x, y, w, h),
                 "area": px, "aspect": aspect, "density": density,
-                "long_side": long_side, "contrast": ins - outs, "n": n}
+                "long_side": long_side, "contrast": ins - outs, "n": n,
+                "state": self.state}
 
     def _find(self, img, roi, th):
         """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。"""
@@ -495,26 +634,41 @@ class PaperDetector(object):
             x, y = norm_bbox(x, y, w, h, roi)
             if w < 8 or h < 8:
                 continue
-            long_side = w if w > h else h
-            short_side = w if w < h else h
-            aspect = long_side / float(short_side)
-            density = px / float(w * h)
-            ins, outs = paper_contrast(img, x, y, w, h)
+            box_long = w if w > h else h
+            mr = blob_min_rect(b)
+            if mr is not None:
+                if (mr[0] > 1.75 * box_long) or (mr[0] < 0.35 * box_long):
+                    mr = None
+            if mr is not None:
+                long_side, short_side = mr[0], mr[1]
+                density = px / float(long_side * short_side)
+                dens_min = PAPER_DENSITY_MIN_MR
+            else:
+                long_side = box_long
+                short_side = w if w < h else h
+                density = px / float(w * h)
+                dens_min = PAPER_DENSITY_MIN
+            aspect = long_side / max(1.0, float(short_side))
+            ins, outs, frac = paper_contrast(img, x, y, w, h)
             if n <= 3:
-                dbg += "[%dpx 比%.2f 密%.2f 内%d 外%d] " % (
-                    px, aspect, density, ins, outs)
+                dbg += "[%dpx 长%.0f 比%.2f 密%.2f 内%d 外%d 暗边%.0f%%] " % (
+                    px, long_side, aspect, density, ins, outs, frac * 100.0)
             if px < PAPER_MIN_AREA:
                 continue
             if px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
                 continue
+            if long_side < PAPER_MIN_LONG or long_side > PAPER_MAX_LONG:
+                continue
             if aspect < PAPER_ASPECT_MIN or aspect > PAPER_ASPECT_MAX:
                 continue
-            if density < PAPER_DENSITY_MIN:
+            if density < dens_min:
                 continue
             if (x <= 1) or (y <= 1) or \
                     ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1):
                 continue
             if ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
+                continue
+            if frac < PAPER_DARK_FRAC_MIN:
                 continue
             score = px * (0.5 + min(ins - outs, 80) / 80.0)
             if best is None or score > best[0]:
@@ -571,24 +725,25 @@ class SpotDetector(object):
     def _detect_blobs(self, img):
         x0, y0, w, h = self.roi()
         best = None
-        for th in SPOT_THRESHOLDS:
-            for b in img.find_blobs([th], roi=(x0, y0, w, h), merge=True,
-                                    pixels_threshold=SPOT_MIN_AREA,
-                                    area_threshold=SPOT_MIN_AREA):
-                area = b[4]
-                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                    continue
-                bw = b[2]
-                bh = b[3]
-                if bw < 1 or bh < 1:
-                    continue
-                if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                    continue
-                bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
-                cx = bx + bw / 2.0
-                cy = by + bh / 2.0
-                if best is None or area > best[0]:
-                    best = (area, cx, cy, (bx, by, bw, bh))
+        # 两个阈值放一次调用（find_blobs 每次约 10ms 固定开销，能省则省）
+        for b in img.find_blobs(SPOT_THRESHOLDS, roi=(x0, y0, w, h),
+                                merge=True,
+                                pixels_threshold=SPOT_MIN_AREA,
+                                area_threshold=SPOT_MIN_AREA):
+            area = b[4]
+            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                continue
+            bw = b[2]
+            bh = b[3]
+            if bw < 1 or bh < 1:
+                continue
+            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
+                continue
+            bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
+            cx = bx + bw / 2.0
+            cy = by + bh / 2.0
+            if best is None or area > best[0]:
+                best = (area, cx, cy, (bx, by, bw, bh))
         if best is None:
             return None
         area, cx, cy, rect = best
@@ -921,8 +1076,9 @@ def main():
                 t_print = now
                 tgt_s = "无靶"
                 if target_det.meas is not None and target_det.lost == 0:
-                    tgt_s = "%.2fm" % (FX_PX * PAPER_LONG_M /
-                                       max(1.0, target_det.meas[5]))
+                    tgt_s = "%s %.2fm" % (
+                        target_det.state,
+                        FX_PX * PAPER_LONG_M / max(1.0, target_det.meas[5]))
                 if gz is not None:
                     print("[%s] %.1ffps gz(state=%d flags=0x%02X yaw=%.1f) "
                           "靶=%s 命中%d/%d 光斑%d err=%.0f yaw=%.1f pit=%.1f "
