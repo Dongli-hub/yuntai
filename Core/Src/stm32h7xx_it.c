@@ -284,8 +284,13 @@ void FDCAN2_IT1_IRQHandler(void)
   */
 void USART1_IRQHandler(void)
 {
-  /* 1) 接收：直接读 RDR 存进环形缓冲（短、快、不解析） */
-  gimbal_link_rx_isr();
+  /* 1) 接收：直接读 RDR 存进环形缓冲（短、快、不解析）
+   *    ⚠ 只有 USART1 是"当前接收串口"时才收，否则会把别的串口的
+   *      寄存器当成本串口的读（拆分模式 TX/RX 用不同串口）。 */
+  if (gimbal_link_is_rx_uart(&huart1) != 0u)
+  {
+    gimbal_link_rx_isr();
+  }
   /* 2) 发送与错误：必须交给 HAL，否则 TXE 中断会被永久重复触发 */
   HAL_UART_IRQHandler(&huart1);
 }
@@ -303,7 +308,10 @@ void USART1_IRQHandler(void)
   */
 void UART7_IRQHandler(void)
 {
-  gimbal_link_rx_isr();
+  if (gimbal_link_is_rx_uart(&huart7) != 0u)
+  {
+    gimbal_link_rx_isr();
+  }
   HAL_UART_IRQHandler(&huart7);
 }
 
@@ -316,7 +324,10 @@ void UART7_IRQHandler(void)
   */
 void USART10_IRQHandler(void)
 {
-  gimbal_link_rx_isr();
+  if (gimbal_link_is_rx_uart(&huart10) != 0u)
+  {
+    gimbal_link_rx_isr();
+  }
   HAL_UART_IRQHandler(&huart10);
 }
 

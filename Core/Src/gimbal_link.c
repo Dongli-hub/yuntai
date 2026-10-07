@@ -39,26 +39,47 @@
  *  三路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换；
  *  中断入口（USART1_IRQHandler / UART7_IRQHandler / USART10_IRQHandler）也都在。
  * ===================================================================== */
-/* ★ 2026-10-07 最终选择：链路走 UART10（RX=PE02 / TX=PE03, AF11）。
- *   UART10 排针自带 VCC(5V)/GND/RX/TX，一根线就能把 K230 接上，
- *   不再需要"数据走 USART1 + 5V 走 UART10"两根线接两个端子。
- *   （之前判定它收不到，是因为 K230 侧脚本把 IO9/IO10 改成了 GPIO，
- *     属于上位机代码问题，与 UART10 无关。） */
-#define GL_LINK_UART_SEL     2
+/* ===================== 链路用哪一路串口 =====================
+ *  0 = USART1  : TX=PA09 / RX=PA10 （收发都正常，但端子没有电源脚）
+ *  1 = UART7   : TX=PE08 / RX=PE07 （实测该排针数据线不通）
+ *  2 = USART10 : TX=PE03 / RX=PE02 （★实测：TX 好、RX 一个字节都收不到）
+ *  3 = 拆分    : TX 用 USART10(PE03)，RX 用 USART1(PA10)   ★当前
+ *                发给 K230 的数据走 UART10 排针（它自带 5V/GND），
+ *                K230 发回来的数据走 USART1 端子的 RX 脚（多接一根线）。
+ * ========================================================== */
+#define GL_LINK_UART_SEL     3
 
 #if (GL_LINK_UART_SEL == 1)
-#define GL_HUART             huart7
-#define GL_LINK_IRQn         UART7_IRQn
+#define GL_TX_HUART          huart7
+#define GL_RX_HUART          huart7
+#define GL_TX_IRQn           UART7_IRQn
+#define GL_RX_IRQn           UART7_IRQn
 #define GL_LINK_NAME         "UART7(PE7/PE8)"
 #elif (GL_LINK_UART_SEL == 2)
-#define GL_HUART             huart10
-#define GL_LINK_IRQn         USART10_IRQn
+#define GL_TX_HUART          huart10
+#define GL_RX_HUART          huart10
+#define GL_TX_IRQn           USART10_IRQn
+#define GL_RX_IRQn           USART10_IRQn
 #define GL_LINK_NAME         "USART10(PE2/PE3, AF11)"
+#elif (GL_LINK_UART_SEL == 3)
+#define GL_TX_HUART          huart10
+#define GL_RX_HUART          huart1
+#define GL_TX_IRQn           USART10_IRQn
+#define GL_RX_IRQn           USART1_IRQn
+#define GL_LINK_NAME         "TX=USART10(PE03) / RX=USART1(PA10)"
 #else
-#define GL_HUART             huart1
-#define GL_LINK_IRQn         USART1_IRQn
+#define GL_TX_HUART          huart1
+#define GL_RX_HUART          huart1
+#define GL_TX_IRQn           USART1_IRQn
+#define GL_RX_IRQn           USART1_IRQn
 #define GL_LINK_NAME         "USART1(PA9/PA10)"
 #endif
+
+/* stm32h7xx_it.c 用这个判断某个串口是不是当前的接收串口 */
+uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
+{
+    return (huart == &GL_RX_HUART) ? 1u : 0u;
+}
 
 /* ========================== 可调参数 ========================== */
 #define GL_TELEM_PERIOD_MS   20u     /* 遥测周期：20ms = 50Hz */
@@ -161,7 +182,7 @@ static void gl_tx_pump(void)
          * 然后继续从当前队列头发新的完整帧。 */
         if ((HAL_GetTick() - s_tx_busy_ms) > 100u)
         {
-            HAL_UART_AbortTransmit(&GL_HUART);
+            HAL_UART_AbortTransmit(&GL_TX_HUART);
             s_tx_tail     = s_tx_head;
             s_tx_busy_len = 0u;
             s_tx_drop++;
@@ -187,7 +208,7 @@ static void gl_tx_pump(void)
     {
         n = GL_TX_CHUNK;
     }
-    if (HAL_UART_Transmit_IT(&GL_HUART, &s_tx_buf[s_tx_tail], n) == HAL_OK)
+    if (HAL_UART_Transmit_IT(&GL_TX_HUART, &s_tx_buf[s_tx_tail], n) == HAL_OK)
     {
         s_tx_busy_len = n;
         s_tx_busy_ms  = HAL_GetTick();
@@ -197,7 +218,7 @@ static void gl_tx_pump(void)
 /* HAL 发送完成回调（中断上下文）：推进 tail */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart != &GL_HUART)
+    if (huart != &GL_TX_HUART)
     {
         return;
     }
@@ -212,13 +233,13 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 /* 出错时也要让发送通道恢复，否则一次错误就把遥测永久卡死 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart != &GL_HUART)
+    if ((huart != &GL_TX_HUART) && (huart != &GL_RX_HUART))
     {
         return;
     }
     s_tx_busy_len = 0u;
-    __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
+    __HAL_UART_CLEAR_FLAG(&GL_TX_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                      UART_CLEAR_NEF | UART_CLEAR_PEF);
 }
 
 /* ========================== 发送封装 ========================== */
@@ -434,17 +455,21 @@ void gimbal_link_init(void)
     {
         static const char banner[] =
             "\r\nYUNTAI LINK BANNER 115200 8N1\r\n";
-        HAL_UART_Transmit(&GL_HUART, (uint8_t *)banner,
+        HAL_UART_Transmit(&GL_TX_HUART, (uint8_t *)banner,
                           (uint16_t)(sizeof(banner) - 1u), 50u);
         gimbal_link_log("[LINK] " GL_LINK_NAME " ready");
     }
 
     /* 打开链路串口的接收中断（接收只做"存字节"这一件事） */
-    __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+    /* 接收串口：清标志 + 打开 RXNE 中断 + 开 NVIC */
+    __HAL_UART_CLEAR_FLAG(&GL_RX_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
                                      UART_CLEAR_NEF | UART_CLEAR_PEF);
-    __HAL_UART_ENABLE_IT(&GL_HUART, UART_IT_RXNE);
-    HAL_NVIC_SetPriority(GL_LINK_IRQn, 6u, 0u);
-    HAL_NVIC_EnableIRQ(GL_LINK_IRQn);
+    __HAL_UART_ENABLE_IT(&GL_RX_HUART, UART_IT_RXNE);
+    HAL_NVIC_SetPriority(GL_RX_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(GL_RX_IRQn);
+    /* 发送串口：HAL_UART_Transmit_IT 需要它自己的中断入口 */
+    HAL_NVIC_SetPriority(GL_TX_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(GL_TX_IRQn);
     s_ready = 1u;
 }
 
@@ -470,19 +495,19 @@ static void gl_rx_push(uint8_t b)
 
 void gimbal_link_rx_isr(void)
 {
-    uint32_t isr = GL_HUART.Instance->ISR;
+    uint32_t isr = GL_RX_HUART.Instance->ISR;
 
     if ((isr & USART_ISR_RXNE_RXFNE) != 0u)
     {
-        uint8_t  b = (uint8_t)(GL_HUART.Instance->RDR & 0xFFu);
+        uint8_t  b = (uint8_t)(GL_RX_HUART.Instance->RDR & 0xFFu);
         gl_rx_push(b);
     }
 
     /* 溢出/帧错/噪声错误必须清掉，否则 RXNE 中断会被永久卡住 */
     if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) != 0u)
     {
-        __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
-                                         UART_CLEAR_NEF | UART_CLEAR_PEF);
+        __HAL_UART_CLEAR_FLAG(&GL_RX_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                          UART_CLEAR_NEF | UART_CLEAR_PEF);
     }
 }
 
@@ -496,16 +521,16 @@ void gimbal_link_poll(uint32_t now_ms)
      *   · 把当前 RX 寄存器里的字节全部取完
      *   · 再打开中断，恢复正常的中断接收
      * 这样即使 NVIC/优先级那边有问题，接收也照样能工作。 */
-    __HAL_UART_DISABLE_IT(&GL_HUART, UART_IT_RXNE);
-    while (__HAL_UART_GET_FLAG(&GL_HUART, UART_FLAG_RXNE) != 0u)
+    __HAL_UART_DISABLE_IT(&GL_RX_HUART, UART_IT_RXNE);
+    while (__HAL_UART_GET_FLAG(&GL_RX_HUART, UART_FLAG_RXNE) != 0u)
     {
-        gl_rx_push((uint8_t)(GL_HUART.Instance->RDR & 0xFFu));
+        gl_rx_push((uint8_t)(GL_RX_HUART.Instance->RDR & 0xFFu));
     }
-    if (__HAL_UART_GET_FLAG(&GL_HUART, UART_FLAG_ORE) != 0u)
+    if (__HAL_UART_GET_FLAG(&GL_RX_HUART, UART_FLAG_ORE) != 0u)
     {
-        __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF);
+        __HAL_UART_CLEAR_FLAG(&GL_RX_HUART, UART_CLEAR_OREF);
     }
-    __HAL_UART_ENABLE_IT(&GL_HUART, UART_IT_RXNE);
+    __HAL_UART_ENABLE_IT(&GL_RX_HUART, UART_IT_RXNE);
 
     /* ---- 1. 把接收缓冲里的字节喂给解析器 ---- */
     while (s_rx_tail != s_rx_head)

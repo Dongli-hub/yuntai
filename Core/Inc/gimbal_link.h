@@ -59,6 +59,8 @@ typedef struct
 void               gimbal_link_init(void);
 void               gimbal_link_poll(uint32_t now_ms);
 void               gimbal_link_rx_isr(void);          /* 在 UART7_IRQHandler 里调用 */
+/* 判断某个串口是不是"当前接收串口"（拆分模式下 TX/RX 可能是两个串口） */
+uint8_t            gimbal_link_is_rx_uart(UART_HandleTypeDef *huart);
 void               gimbal_link_set_telem(const GimbalTelem_t *t);
 const GimbalCmd_t *gimbal_link_cmd(void);
 uint8_t            gimbal_link_alive(void);           /* 1 = 最近 0.5s 收到过 AIM */
