@@ -19,6 +19,8 @@ import time
 import math
 
 # ============================ 参数 ============================
+# 分辨率：640x480 看得清但 find_rects 慢（实测 ~4FPS）；
+# 如果帧率太低，把这里改成 320 / 240（帧率约 4 倍，精度略降）
 IMG_W = 640
 IMG_H = 480
 DISPLAY_MODE = "LCD"       # LCD(ST7701+to_ide，IDE 里有画面) | VIRT | OFF
