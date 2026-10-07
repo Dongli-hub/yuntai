@@ -1,45 +1,53 @@
 # -*- coding: utf-8 -*-
 """vision_check.py —— 视觉验证（靶框 + 激光光斑 + 误差），只检测不追靶
 
-这块板子的固件是**精简版**：没有 cv2、math 里连 hypot 都没有，
-所以本脚本只用原生 image 模块：find_rects / find_blobs / draw_*。
+这一版是按亚博例程（cv_lite / 07.Face）的做法重写的：
+  · cv_lite 的 C 加速算子：rgb888_find_rectangles / rgb888_find_blobs
+    （比原生 find_rects 快得多，人脸检测那个例程之所以流畅就是靠这套）
+  · Display.init(..., to_ide=True, quality=50)：IDE 画面流畅的关键参数
+  · cv_lite.rgb888_adjust_exposure_fast(...)：软件调曝光，gain<1 变暗
 
 画面里：
-  蓝框       = find_rects 找到的所有候选（用于调阈值）
+  蓝框       = 所有候选矩形
   绿框/红叉  = 通过筛选的靶框与靶心
-  白框       = 光斑搜索 ROI（同轴激光位置固定，只在这一小块里找）
+  白框       = 光斑搜索 ROI
   黄圈/黄叉  = 检出的激光光斑
 
-终端每秒一行：FPS / 候选数 / 靶心 / 尺寸比例 / 光斑 / 误差(px, °)
-
-激光由脚本通过 H723 打开（AIM 模式 + LASER_ON，偏置恒 0 → 云台只保持稳定）。
+终端每秒一行：FPS / 候选数 / 靶心 / 长边px / 比例 / 光斑 / 误差(px, °)
+激光由脚本通过 H723 打开（AIM + LASER_ON，偏置恒 0 → 云台只保持稳定）
 """
 import os
 import time
 import math
 
 # ============================ 参数 ============================
-# 分辨率：640x480 看得清但 find_rects 慢（实测 ~4FPS）；
-# 如果帧率太低，把这里改成 320 / 240（帧率约 4 倍，精度略降）
 IMG_W = 640
 IMG_H = 480
-DISPLAY_MODE = "LCD"       # LCD(ST7701+to_ide，IDE 里有画面) | VIRT | OFF
+DISPLAY_QUALITY = 50       # IDE 画面质量：越小越流畅（例程用的就是 50）
 
-RECT_THRESHOLD = 20000     # find_rects 阈值：找不到就把数往小调，误检多就往大调
-RECT_XGRAD = 8
-RECT_YGRAD = 8
-MIN_AREA_RATIO = 0.015     # 框面积 / 画面面积 下限
-ASPECT_MIN = 1.20          # 靶纸 297x180 的长短边比 ≈1.65
+# --- 曝光（软件增益）：画面太亮/光斑检不到就调小，比如 0.6 ---
+EXPOSURE_GAIN = 1.0        # <1 变暗，>1 变亮
+
+# --- 矩形检测（cv_lite，C 加速）---
+CANNY1 = 50
+CANNY2 = 150
+APPROX_EPS = 0.03          # 多边形拟合精度
+AREA_MIN_RATIO = 0.01      # 最小面积比例
+MAX_ANGLE_COS = 0.5        # 越小越"像矩形"
+GAUSS_BLUR = 5
+ASPECT_MIN = 1.20          # 靶纸 297x180 → 长短边比 ≈1.65
 ASPECT_MAX = 2.40
 
-SPOT_ROI_HALF = 130        # 光斑搜索半径
-SPOT_THRESHOLDS = [        # LAB 阈值（可多组）：亮且偏暖
-    (60, 100, 8, 60, -10, 60),
-    (85, 100, -20, 40, -20, 60),
-]
+# --- 光斑检测（cv_lite 色块，阈值为 [Rmin,Rmax, Gmin,Gmax, Bmin,Bmax]）---
+# 用"很亮"作为主判据：激光光斑中心过曝成白芯，比白纸更亮；
+# 如果画面整体偏亮导致白纸也被算进来，把 EXPOSURE_GAIN 调小（0.6~0.8）。
+SPOT_THRESHOLD = [230, 255, 200, 255, 200, 255]
 SPOT_MIN_AREA = 3
 SPOT_MAX_AREA = 3000
 SPOT_MAX_ASPECT = 3.0
+SPOT_KERNEL = 1
+
+SPOT_ROI_HALF = 130        # 光斑搜索半径（同轴激光位置固定）
 
 FX_PX = 430.0              # 像素焦距（640 宽时的估计；标定后改实测值）
 
@@ -47,6 +55,7 @@ UART_BAUD = 115200
 HEARTBEAT_MS = 200
 AIM_MS = 20
 PRINT_MS = 1000
+GC_EVERY = 10
 # ==============================================================
 
 SOF = b"\xAA\x55"
@@ -107,7 +116,7 @@ class FrameParser(object):
             i = self.buf.find(SOF)
             if i < 0:
                 if len(self.buf) > 1:
-                    self.buf = self.buf[-1:]        # 不能用 del 切片
+                    self.buf = self.buf[-1:]        # bytearray 不能 del 切片
                 break
             if i > 0:
                 self.buf = self.buf[i:]
@@ -132,80 +141,30 @@ class FrameParser(object):
         return out
 
 
-def open_uart():
-    from ybUtils.YbUart import YbUart
-    return YbUart(baudrate=UART_BAUD)
-
-
-def order_corners(pts):
-    cx = sum(p[0] for p in pts) / 4.0
-    cy = sum(p[1] for p in pts) / 4.0
-    try:
-        ang = [(math.atan2(p[1] - cy, p[0] - cx), p) for p in pts]
-        ang.sort(key=lambda t: t[0])
-        return [list(t[1]) for t in ang]
-    except AttributeError:
-        s = sorted(pts, key=lambda p: p[0])
-        left = sorted(s[:2], key=lambda p: p[1])
-        right = sorted(s[2:], key=lambda p: p[1])
-        return [list(left[0]), list(right[0]), list(right[1]), list(left[1])]
-
-
-def quad_metrics(q):
-    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = q
-    d1x, d1y = x2 - x0, y2 - y0
-    d2x, d2y = x3 - x1, y3 - y1
-    den = d1x * d2y - d1y * d2x
-    if abs(den) < 1e-6:
-        cx, cy = (x0 + x2) / 2.0, (y0 + y2) / 2.0
-    else:
-        t = ((x1 - x0) * d2y - (y1 - y0) * d2x) / den
-        cx, cy = x0 + t * d1x, y0 + t * d1y
-    area = 0.5 * abs((x0 * y1 - x1 * y0) + (x1 * y2 - x2 * y1) +
-                     (x2 * y3 - x3 * y2) + (x3 * y0 - x0 * y3))
-
-    def dist(ax, ay, bx, by):                    # 没有 math.hypot
-        return math.sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
-
-    sides = [dist(x1, y1, x0, y0), dist(x2, y2, x1, y1),
-             dist(x3, y3, x2, y2), dist(x0, y0, x3, y3)]
-    a_len = (sides[0] + sides[2]) / 2.0
-    b_len = (sides[1] + sides[3]) / 2.0
-    long_side = max(a_len, b_len)
-    return (cx, cy), area, \
-        long_side / max(1.0, min(a_len, b_len)), long_side
-
-
 def main():
     from media.sensor import Sensor, CAM_CHN_ID_0
     from media.display import Display
     from media.media import MediaManager
+    import cv_lite
+    import gc
 
-    uart = open_uart()
+    from ybUtils.YbUart import YbUart
+    uart = YbUart(baudrate=UART_BAUD)
     parser = FrameParser()
     print("串口: YbUart @%d" % UART_BAUD)
 
-    sensor = Sensor()
+    shape = [IMG_H, IMG_W]
+    sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
-
-    display_ok = True
-    try:
-        if DISPLAY_MODE == "LCD":
-            Display.init(Display.ST7701, width=IMG_W, height=IMG_H,
-                         to_ide=True)
-        elif DISPLAY_MODE == "VIRT":
-            Display.init(Display.VIRT, width=IMG_W, height=IMG_H, fps=30)
-        else:
-            display_ok = False
-    except Exception as e:
-        print("显示初始化失败(%s)，继续无显示运行" % e)
-        display_ok = False
+    sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
+    Display.init(Display.ST7701, width=IMG_W, height=IMG_H,
+                 to_ide=True, quality=DISPLAY_QUALITY)
     MediaManager.init()
     sensor.run()
     clock = time.clock()
+    import image as image_mod
 
     img_area = float(IMG_W * IMG_H)
     spot_u = IMG_W / 2.0
@@ -220,10 +179,13 @@ def main():
     n_tgt = 0
     n_spot = 0
 
-    print("=" * 62)
-    print("vision_check: 靶框+光斑检测（不追靶）  阈值=%d  比例=[%.2f,%.2f]"
-          % (RECT_THRESHOLD, ASPECT_MIN, ASPECT_MAX))
-    print("=" * 62)
+    print("=" * 64)
+    print("vision_check(cv_lite版): 靶框+光斑  曝光增益=%.2f  显示质量=%d"
+          % (EXPOSURE_GAIN, DISPLAY_QUALITY))
+    print("  靶框参数: canny=%d/%d eps=%.2f 比例=[%.2f,%.2f]"
+          % (CANNY1, CANNY2, APPROX_EPS, ASPECT_MIN, ASPECT_MAX))
+    print("  光斑阈值: %s" % str(SPOT_THRESHOLD))
+    print("=" * 64)
 
     try:
         while True:
@@ -271,76 +233,76 @@ def main():
                 except Exception:
                     pass
 
-            # ---------- 视觉 ----------
+            # ---------- 取图 + 曝光 ----------
             clock.tick()
             img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            img_np = img.to_numpy_ref()
             n_frame += 1
 
+            if EXPOSURE_GAIN != 1.0:
+                img_np = cv_lite.rgb888_adjust_exposure_fast(
+                    shape, img_np, EXPOSURE_GAIN)
+                img = image_mod.Image(IMG_W, IMG_H, image_mod.RGB888,
+                                      alloc=image_mod.ALLOC_REF,
+                                      data=img_np)
+
+            # ---------- 找黑胶带框 ----------
             best = None
             n_rect = 0
             list_txt = ""
-            for r in img.find_rects(threshold=RECT_THRESHOLD,
-                                    x_gradient=RECT_XGRAD,
-                                    y_gradient=RECT_YGRAD):
+            rects = cv_lite.rgb888_find_rectangles(shape, img_np, CANNY1,
+                                                   CANNY2, APPROX_EPS,
+                                                   AREA_MIN_RATIO,
+                                                   MAX_ANGLE_COS, GAUSS_BLUR)
+            for i in range(0, len(rects), 4):
+                x, y, w, h = rects[i], rects[i + 1], rects[i + 2], rects[i + 3]
                 n_rect += 1
-                pts = []
-                for p in r.corners():
-                    pts.append((int(p[0]), int(p[1])))
-                q = order_corners(pts)
-                center, area, aspect, long_side = quad_metrics(q)
-                # 所有候选都画出来（蓝色），方便调阈值
-                img.draw_rectangle(r.rect(), color=(80, 80, 255), thickness=1)
+                area = w * h
+                aspect = max(w, h) / max(1.0, min(w, h))
+                img.draw_rectangle(x, y, w, h, color=(80, 80, 255), thickness=1)
                 if n_rect <= 3:
                     list_txt += " [%.1f%% 比=%.2f]" % (100.0 * area / img_area,
                                                        aspect)
-                if area < MIN_AREA_RATIO * img_area:
+                if area < AREA_MIN_RATIO * img_area:
                     continue
                 if aspect < ASPECT_MIN or aspect > ASPECT_MAX:
                     continue
-                if best is None or area > best[1]:
-                    best = (q, area, center, aspect, long_side)
+                if best is None or area > best[0]:
+                    best = (area, x + w / 2.0, y + h / 2.0, aspect,
+                            max(w, h), (x, y, w, h))
 
+            # ---------- 找激光光斑（ROI 内最亮的块）----------
             spot = None
-            for th in SPOT_THRESHOLDS:
-                for b in img.find_blobs([th],
-                                        roi=(int(spot_u - SPOT_ROI_HALF),
-                                             int(spot_v - SPOT_ROI_HALF),
-                                             SPOT_ROI_HALF * 2,
-                                             SPOT_ROI_HALF * 2),
-                                        merge=True,
-                                        pixels_threshold=SPOT_MIN_AREA,
-                                        area_threshold=SPOT_MIN_AREA):
-                    try:
-                        area = b.area()
-                    except Exception:
-                        area = b[4]
-                    if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                        continue
-                    bw, bh = b[2], b[3]
-                    if bw < 1 or bh < 1:
-                        continue
-                    if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                        continue
-                    if spot is None or area > spot[0]:
-                        spot = (area, b[5], b[6], (b[0], b[1], bw, bh))
+            blobs = cv_lite.rgb888_find_blobs(shape, img_np, SPOT_THRESHOLD,
+                                              SPOT_MIN_AREA, SPOT_KERNEL)
+            for i in range(0, len(blobs), 4):
+                x, y, w, h = blobs[i], blobs[i + 1], blobs[i + 2], blobs[i + 3]
+                area = w * h
+                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                    continue
+                if max(w, h) * 1.0 / max(1.0, min(w, h)) > SPOT_MAX_ASPECT:
+                    continue
+                ccx = x + w / 2.0
+                ccy = y + h / 2.0
+                if abs(ccx - spot_u) > SPOT_ROI_HALF or \
+                        abs(ccy - spot_v) > SPOT_ROI_HALF:
+                    continue
+                if spot is None or area > spot[0]:
+                    spot = (area, ccx, ccy, (x, y, w, h))
             if spot is not None:
-                su, sv = spot[1], spot[2]
                 if not learned:
-                    spot_u, spot_v = su, sv
+                    spot_u, spot_v = spot[1], spot[2]
                     learned = True
                 else:
-                    spot_u += max(-4.0, min(4.0, (su - spot_u) * 0.05))
-                    spot_v += max(-4.0, min(4.0, (sv - spot_v) * 0.05))
+                    spot_u += max(-4.0, min(4.0, (spot[1] - spot_u) * 0.05))
+                    spot_v += max(-4.0, min(4.0, (spot[2] - spot_v) * 0.05))
 
             # ---------- 画 ----------
             if best is not None:
-                q = best[0]
-                for i in range(4):
-                    a, b = q[i], q[(i + 1) % 4]
-                    img.draw_line(a[0], a[1], b[0], b[1],
-                                  color=(0, 255, 0), thickness=2)
-                img.draw_cross(int(best[2][0]), int(best[2][1]),
-                               color=(255, 0, 0), size=14, thickness=2)
+                bx, by = best[1], best[2]
+                img.draw_rectangle(best[5], color=(0, 255, 0), thickness=2)
+                img.draw_cross(int(bx), int(by), color=(255, 0, 0), size=14,
+                               thickness=2)
             img.draw_rectangle(int(spot_u - SPOT_ROI_HALF),
                                int(spot_v - SPOT_ROI_HALF),
                                SPOT_ROI_HALF * 2, SPOT_ROI_HALF * 2,
@@ -358,12 +320,11 @@ def main():
                     line += "  靶框: 未检出"
                 else:
                     n_tgt += 1
-                    cu, cv = best[2]
                     line += "  靶心=(%.0f,%.0f) 长边=%.0fpx 比=%.2f" % (
-                        cu, cv, best[4], best[3])
+                        best[1], best[2], best[4], best[3])
                     if spot is not None:
                         n_spot += 1
-                        eu, ev = cu - spot[1], cv - spot[2]
+                        eu, ev = best[1] - spot[1], best[2] - spot[2]
                         err = math.sqrt(eu * eu + ev * ev)
                         line += ("  光斑=(%.0f,%.0f) 误差=(%.0f,%.0f)px "
                                  "=%.1fpx(%.2f°)" % (spot[1], spot[2], eu, ev,
@@ -374,8 +335,11 @@ def main():
                 line += "  [靶%d/%d 斑%d]" % (n_tgt, n_frame, n_spot)
                 print(line)
 
-            if display_ok:
-                Display.show_image(img)
+            Display.show_image(img)
+            del img_np
+            del img
+            if (n_frame % GC_EVERY) == 0:
+                gc.collect()
             time.sleep_ms(2)
     except KeyboardInterrupt:
         print("用户停止")
@@ -393,14 +357,13 @@ def main():
             sensor.stop()
         except Exception:
             pass
-        if display_ok:
-            try:
-                Display.deinit()
-                os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-                time.sleep_ms(100)
-                MediaManager.deinit()
-            except Exception:
-                pass
+        try:
+            Display.deinit()
+            os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+            time.sleep_ms(100)
+            MediaManager.deinit()
+        except Exception:
+            pass
         print("已退出（激光已关闭）")
 
 
