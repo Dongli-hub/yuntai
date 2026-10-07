@@ -64,7 +64,8 @@ static void MPU_Config(void);
 /* ===========================================================================
  *  串口自检开关（排障用）
  *
- *  0 = 正常云台程序（链路走哪个串口由 gimbal_link.c 的 GL_LINK_ON_UART7 决定）
+ *  0 = 正常云台程序（链路走哪一路由 gimbal_link.c 的 GL_LINK_UART_SEL 决定：
+ *      0=USART1 / 1=UART7 / 2=USART10，当前是 2 = USART10）
  *  1 = UART7 引脚扫描：PE7/PE8 → PB3/PA15 → PA8/PB4 每 1.5s 轮换，
  *      分别发 U / V / W，用来定位那个排针实际连到哪组脚。
  *  2 = USART10 复用号扫描：AF4 / AF11 每 1.5s 轮换，分别发 A / B，
