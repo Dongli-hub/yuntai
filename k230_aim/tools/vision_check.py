@@ -39,15 +39,22 @@ ASPECT_MIN = 1.20          # 靶纸 297x180 → 长短边比 ≈1.65
 ASPECT_MAX = 2.40
 
 # --- 光斑检测（cv_lite 色块，阈值为 [Rmin,Rmax, Gmin,Gmax, Bmin,Bmax]）---
-# 用"很亮"作为主判据：激光光斑中心过曝成白芯，比白纸更亮；
-# 如果画面整体偏亮导致白纸也被算进来，把 EXPOSURE_GAIN 调小（0.6~0.8）。
-SPOT_THRESHOLD = [230, 255, 200, 255, 200, 255]
+# 判据 = "很亮"（激光中心过曝成白芯，比白纸亮）。
+# 如果画面整体偏亮导致连白纸都算进来，把 EXPOSURE_GAIN 调小（0.6~0.8）。
+SPOT_THRESHOLD = [220, 255, 150, 255, 150, 255]
 SPOT_MIN_AREA = 3
 SPOT_MAX_AREA = 3000
 SPOT_MAX_ASPECT = 3.0
 SPOT_KERNEL = 1
 
-SPOT_ROI_HALF = 130        # 光斑搜索半径（同轴激光位置固定）
+# 光斑位置是**刚性固定**的（同轴激光），所以：
+#   先自动学习一次 → 连续稳定 SPOT_LEARN_FRAMES 帧就"锁定"，
+#   之后 ROI 再也不动（避免被误检拖走 —— 之前飘到角落里就是这么来的）。
+SPOT_CX = -1               # 想手动指定就填像素坐标（-1 = 自动学习）
+SPOT_CY = -1
+SPOT_ROI_HALF = 90         # ROI 半径（锁死后就这么大，足够覆盖视差漂移）
+SPOT_LEARN_FRAMES = 15     # 学习期：连续多少帧稳定就锁定
+SPOT_NEAR_PX = 25          # 学习期只接受"离当前中心这么近"的检测
 
 FX_PX = 430.0              # 像素焦距（640 宽时的估计；标定后改实测值）
 
@@ -167,9 +174,14 @@ def main():
     import image as image_mod
 
     img_area = float(IMG_W * IMG_H)
-    spot_u = IMG_W / 2.0
-    spot_v = IMG_H / 2.0
-    learned = False
+    if (SPOT_CX >= 0) and (SPOT_CY >= 0):
+        spot_u, spot_v = float(SPOT_CX), float(SPOT_CY)
+        locked = True
+        print("光斑 ROI 由参数指定: (%.0f, %.0f)" % (spot_u, spot_v))
+    else:
+        spot_u, spot_v = IMG_W / 2.0, IMG_H / 2.0
+        locked = False
+    learn_u, learn_v, learn_n = spot_u, spot_v, 0
     ready = False
     armed = False
     t_hb = time.ticks_ms()
@@ -273,6 +285,7 @@ def main():
 
             # ---------- 找激光光斑（ROI 内最亮的块）----------
             spot = None
+            raw_n = 0                      # 通过亮度阈值、面积/形状筛选的块数
             blobs = cv_lite.rgb888_find_blobs(shape, img_np, SPOT_THRESHOLD,
                                               SPOT_MIN_AREA, SPOT_KERNEL)
             for i in range(0, len(blobs), 4):
@@ -282,20 +295,33 @@ def main():
                     continue
                 if max(w, h) * 1.0 / max(1.0, min(w, h)) > SPOT_MAX_ASPECT:
                     continue
-                ccx = x + w / 2.0
-                ccy = y + h / 2.0
-                if abs(ccx - spot_u) > SPOT_ROI_HALF or \
-                        abs(ccy - spot_v) > SPOT_ROI_HALF:
+                # 要求整块都落在 ROI 内（只要中心在 ROI 里的话，
+                # 整张白纸这种大块的"中心"也可能落进 ROI，会造成误检）
+                if (x < spot_u - SPOT_ROI_HALF) or \
+                        (x + w > spot_u + SPOT_ROI_HALF) or \
+                        (y < spot_v - SPOT_ROI_HALF) or \
+                        (y + h > spot_v + SPOT_ROI_HALF):
                     continue
+                raw_n += 1
                 if spot is None or area > spot[0]:
-                    spot = (area, ccx, ccy, (x, y, w, h))
-            if spot is not None:
-                if not learned:
-                    spot_u, spot_v = spot[1], spot[2]
-                    learned = True
+                    spot = (area, x + w / 2.0, y + h / 2.0, (x, y, w, h))
+
+            # ---- 学习 / 锁定：锁定之后 ROI 绝不再动 ----
+            if spot is not None and not locked:
+                far = (abs(spot[1] - spot_u) > SPOT_NEAR_PX) or \
+                      (abs(spot[2] - spot_v) > SPOT_NEAR_PX)
+                if far:
+                    learn_n = 0                      # 跳太远，重新数
                 else:
-                    spot_u += max(-4.0, min(4.0, (spot[1] - spot_u) * 0.05))
-                    spot_v += max(-4.0, min(4.0, (spot[2] - spot_v) * 0.05))
+                    learn_n += 1
+                    learn_u += (spot[1] - learn_u) / float(learn_n)
+                    learn_v += (spot[2] - learn_v) / float(learn_n)
+                    if learn_n >= SPOT_LEARN_FRAMES:
+                        spot_u, spot_v = learn_u, learn_v
+                        locked = True
+                        print("光斑位置已锁定: (%.1f, %.1f)" % (spot_u, spot_v))
+            elif spot is None:
+                learn_n = 0
 
             # ---------- 画 ----------
             if best is not None:
@@ -306,7 +332,8 @@ def main():
             img.draw_rectangle(int(spot_u - SPOT_ROI_HALF),
                                int(spot_v - SPOT_ROI_HALF),
                                SPOT_ROI_HALF * 2, SPOT_ROI_HALF * 2,
-                               color=(255, 255, 255), thickness=1)
+                               color=(255, 255, 255),
+                               thickness=2 if locked else 1)
             if spot is not None:
                 img.draw_rectangle(spot[3], color=(0, 255, 0), thickness=2)
                 img.draw_circle(int(spot[1]), int(spot[2]), 8,
