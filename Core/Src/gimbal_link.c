@@ -96,6 +96,8 @@ static uint8_t           s_seq;
 static uint8_t           s_ready;
 static uint32_t          s_last_hb_ack_ms;
 static uint32_t          s_log_dropped;
+static uint32_t          s_rx_bytes;        /* 链路上收到的原始字节数 */
+static uint8_t           s_rx_any_logged;   /* 是否已经打过"收到第一个字节" */
 
 /* ========================== TX 环形缓冲 ========================== */
 
@@ -406,6 +408,8 @@ void gimbal_link_init(void)
     s_seq = 0u;
     s_log_dropped = 0u;
     s_last_hb_ack_ms = 0u;
+    s_rx_bytes = 0u;
+    s_rx_any_logged = 0u;
     memset(&s_cmd, 0, sizeof(s_cmd));
     memset(&s_telem, 0, sizeof(s_telem));
     s_cmd.mode = GP_MODE_IDLE;
@@ -446,6 +450,7 @@ void gimbal_link_rx_isr(void)
     if ((isr & USART_ISR_RXNE_RXFNE) != 0u)
     {
         uint8_t  b = (uint8_t)(GL_HUART.Instance->RDR & 0xFFu);
+        s_rx_bytes++;
         uint16_t next = (uint16_t)(s_rx_head + 1u);
         if (next >= GL_RX_BUF_SIZE)
         {
@@ -485,6 +490,18 @@ void gimbal_link_poll(uint32_t now_ms)
         {
             gl_handle_frame(now_ms);
         }
+    }
+
+    /* ---- 1.2 第一次收到字节时报一声 ----
+     * 现场排障用：有没有这一行，直接区分"对面完全没发/没接上"和
+     * "对面在发但帧解析不对"。 */
+    if ((s_rx_bytes > 0u) && (s_rx_any_logged == 0u))
+    {
+        char buf[48];
+        s_rx_any_logged = 1u;
+        snprintf(buf, sizeof(buf), "[LINK] RX alive (%lu bytes)",
+                 (unsigned long)s_rx_bytes);
+        gimbal_link_log_force(buf);
     }
 
     /* ---- 2. 看门狗：断流 -> 安全模式 ---- */
@@ -548,11 +565,11 @@ const char *gimbal_link_stats(void)
     /* 保持在一行 60 字节以内，才发得进一条 TEXT 消息 */
     static char s_buf[64];
     snprintf(s_buf, sizeof(s_buf),
-             "[STAT] rx=%lu crc=%lu ovf=%lu rsv=%lu txdrop=%lu",
-             (unsigned long)s_parser.frames,   /* rx：收到多少帧 */
+             "[STAT] rx=%lu B=%lu crc=%lu ovf=%lu txd=%lu",
+             (unsigned long)s_parser.frames,   /* rx：解出多少帧 */
+             (unsigned long)s_rx_bytes,        /* B：收到的原始字节数 */
              (unsigned long)s_parser.crc_err,  /* crc：CRC 错帧数 */
              (unsigned long)s_rx_ovf,          /* ovf：接收缓冲溢出 */
-             (unsigned long)s_parser.resync,   /* rsv：重同步次数 */
-             (unsigned long)s_tx_drop);        /* txdrop：发送丢帧 */
+             (unsigned long)s_tx_drop);        /* txd：发送丢帧 */
     return s_buf;
 }
