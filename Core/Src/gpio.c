@@ -30,6 +30,33 @@
 /*----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
 
+/* ---------------------------------------------------------------------------
+ * 板子电源输出使能（CtrBoard-H7，与官方例程 CtrBoard-H7_WS2812 一致）
+ *
+ *   POWER_OUT2  = PC13
+ *   POWER_OUT1  = PC14
+ *   POWER_OUT5V = PC15   ← 各排针上的 5V（含 UART7/UART10 的 VCC）
+ *
+ * 官方例程是"上电就置高"，而本工程一开始没配这三个脚 ——
+ * 结果所有 5V 排针都没电、K230 接上也不亮。
+ * 这里做成独立函数，放在 USER CODE 区里：CubeMX 重新生成代码也不会丢。
+ * ------------------------------------------------------------------------- */
+void Board_PowerEnable(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* 先把输出锁存器置高，再配成推挽输出（避免上电瞬间拉低） */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+                    GPIO_PIN_SET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
 /* USER CODE END 1 */
 
 /** Configure pins as
@@ -74,24 +101,5 @@ void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 2 */
-
-  /* ---------------------------------------------------------------------
-   * 板子电源输出使能（CtrBoard-H7：跟官方例程 CtrBoard-H7_WS2812 一致）
-   *
-   *   POWER_OUT1  = PC14
-   *   POWER_OUT2  = PC13
-   *   POWER_OUT5V = PC15   ← 就是各排针上的 5V（含 UART7/UART10 的 VCC）
-   *
-   * 官方例程是"上电就置高"，本工程之前一直没配这三个脚 ——
-   * 结果所有 5V 排针都没电、K230 接上也不亮。加上这段之后，
-   * 上电 5V 就会出来（PC13/PC14/PC15 是纯输出，不占用其它功能）。
-   * ------------------------------------------------------------------- */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
-                    GPIO_PIN_SET);
-  GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
-  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull  = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 /* USER CODE END 2 */

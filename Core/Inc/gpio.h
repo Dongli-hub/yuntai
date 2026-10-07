@@ -40,6 +40,10 @@ void MX_GPIO_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* 打开板上三路电源输出（PC13/PC14/PC15 = POWER_OUT2/1/5V），
+ * 必须在用串口/传感器之前调用，否则 5V 排针没电。 */
+void Board_PowerEnable(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

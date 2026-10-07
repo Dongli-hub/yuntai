@@ -117,6 +117,10 @@ int main(void)
   MX_UART7_UART_Init();          /* K230 链路（原来在 USART1 上） */
   MX_USART10_UART_Init();        /* UART10 排针（RX=PE02 / TX=PE03） */
   /* USER CODE BEGIN 2 */
+  /* 先打开板上电源输出（PC13/PC14/PC15）：各排针的 5V 都靠它，
+   * K230 也是从这里取电的，所以必须最早打开。 */
+  Board_PowerEnable();
+
 #if (UART_TX_TEST_MODE == 1)
   /* 自检 1：UART7 引脚扫描（不会返回） */
   UART7_TxTest();
