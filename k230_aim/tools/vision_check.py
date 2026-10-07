@@ -73,8 +73,7 @@ QUAD_AREA_HI = 1.35
 SCAN_TH_K = 0.50
 SCAN_TH_LO = 50
 SCAN_TH_HI = 88
-QUAD_LIM_K = 0.62          # 扫描半径 = 亮块边长x这个系数（超出亮块才能摸到真边）
-QUAD_LIM_PAD = 12
+QUAD_LIM_PAD = 18          # 扫描半径 = 中心到亮块该边的距离 + 这个余量
 
 # 跟踪 / 闸门
 # 跟踪窗必须**大于整张纸**（四边形扫描要摸到纸的四条边，窗口小了亮块会被裁掉）
@@ -95,15 +94,17 @@ PENDING_MISS = 3           # 确认过程中允许漏几次
 
 # ============================ 激光光斑 ============================
 SPOT_THRESHOLDS = [
-    (50, 100, 6, 80, -30, 70),     # 暖色亮块（红激光边缘）
-    (80, 100, -25, 70, -40, 80),   # 过曝白芯
+    # 过曝白芯：纸面 LAB-L≈78 到不了 88，只有激光点会这么亮
+    (88, 100, -40, 90, -50, 90),
+    # 红边：a>=25 才算明显偏红（原来 a>=6 太松，纸面暖色区也进来了）
+    (58, 100, 25, 90, -20, 70),
 ]
 SPOT_MIN_AREA = 2
 SPOT_MAX_AREA = 2500
 SPOT_MAX_ASPECT = 3.0
 SPOT_ROI_HALF = 45         # 只在学习到的光轴点附近找
-SPOT_LEARN_FRAMES = 12
-SPOT_NEAR_PX = 30
+SPOT_LEARN_FRAMES = 10
+SPOT_NEAR_PX = 12          # 学习时位置一致性要求（松了会锁到误检上）
 SPOT_EVERY = 4             # 每几帧搜一次光斑（光轴固定，中间帧复用）
 
 # ============================ 距离 ============================
@@ -342,23 +343,28 @@ def quad_from_blob(img, bx, by, bw, bh, th):
     """
     icx = int(bx + bw / 2.0)
     icy = int(by + bh / 2.0)
-    lim_x = int(bw * QUAD_LIM_K) + QUAD_LIM_PAD
-    lim_y = int(bh * QUAD_LIM_K) + QUAD_LIM_PAD
+    # 每条边的扫描半径 = 中心到亮块该边的距离 + QUAD_LIM_PAD。
+    # 不能放太远：越过黑胶带后会摸到背景亮边，那一条边就会“跳”出去
+    # （现场截图里上边飞到柜顶就是这个原因）。
+    lim_l = icx - int(bx) + QUAD_LIM_PAD
+    lim_r = int(bx + bw) - icx + QUAD_LIM_PAD
+    lim_u = icy - int(by) + QUAD_LIM_PAD
+    lim_d = int(by + bh) - icy + QUAD_LIM_PAD
     left = []
     right = []
     top = []
     bot = []
     for k in range(1, QUAD_SCAN_N + 1):
         yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
-        dl = _edge(img, icx, yy, -1, 0, lim_x, th)
-        dr = _edge(img, icx, yy, 1, 0, lim_x, th)
+        dl = _edge(img, icx, yy, -1, 0, lim_l, th)
+        dr = _edge(img, icx, yy, 1, 0, lim_r, th)
         if dl >= 0:
             left.append((yy, icx - dl))
         if dr >= 0:
             right.append((yy, icx + dr))
         xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
-        du = _edge(img, xx, icy, 0, -1, lim_y, th)
-        dd = _edge(img, xx, icy, 0, 1, lim_y, th)
+        du = _edge(img, xx, icy, 0, -1, lim_u, th)
+        dd = _edge(img, xx, icy, 0, 1, lim_d, th)
         if du >= 0:
             top.append((xx, icy - du))
         if dd >= 0:
@@ -637,6 +643,13 @@ class PaperTracker(object):
                     self.pend = None
             return False
         cu, cv, lo = cand[1], cand[2], cand[3]
+        # 重新锁定也要过尺寸合理性：纸不可能在半秒里变成 1/4 大。
+        # （现场日志里锁到背景 71px 亮块就是这个口子漏的）丢靶超过 3 秒才放开。
+        if self.have and (self.lost < 100):
+            old = max(self.w, self.h)
+            if (lo < 0.40 * old) or (lo > 2.5 * old):
+                self.pend = None
+                return False
         if self.pend is None:
             self.pend = [cu, cv, lo, 1, 0]
             return False
@@ -935,7 +948,7 @@ def main():
 
             # ---------- 光斑（每 SPOT_EVERY 帧搜一次）----------
             t0 = time.ticks_ms()
-            if (n_frame % SPOT_EVERY) == 0 or (not spot_det.locked):
+            if (n_frame % SPOT_EVERY) == 0:
                 spot = spot_det.detect(img)
             else:
                 spot = spot_det.meas
