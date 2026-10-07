@@ -58,9 +58,9 @@ IMG_H = 480
 # 现场日志：真靶纸 长边184~190px/密度0.83~0.96/对比90+；误检 密度0.51~0.73/对比22~67。
 # 所以下面加了长边范围、密度、对比三道静态闸门，外加尺寸/位置/连续确认三道时间闸门。
 # 详细说明见 tools/vision_check.py 顶部。
-PAPER_TH = 50              # 亮度阈值（0~100）。整机日志里"候选0"占绝大多数
-                           # （只有偶尔出现 32071px 框219 对比87 暗边75% 的真靶纸），
-                           # 说明这个阈值在整机光照下偏高 -> 58 降到 50
+PAPER_TH = 42              # 亮度阈值（0~100）。整机日志里"候选0"仍占绝大多数
+                           # （云台视角下画面里有亮天花板/背景，自动曝光把整幅压暗，
+                           #  纸的 LAB-L 掉到 50 以下）-> 58->50->42
 PAPER_TH_ALT = 72          # 兜底阈值：全图第一遍失败时再试
 PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
 PAPER_B_MAX = 32           # |b| 上限
@@ -1202,6 +1202,8 @@ def main():
     t_last_frame = time.ticks_ms()
     last_tgt = None
     last_tgt_t = 0
+    lock_run = 0
+    last_err = None
     last_spot = None
     n_frames = 0
     n_frames_prev = 0
@@ -1320,13 +1322,31 @@ def main():
                 else:
                     su, sv = spot_det.u, spot_det.v
 
-                if tgt_uv is not None and spot is not None:
+                # 只有"连续 N 帧都锁定"且"误差和上次不突跳"才允许闭环纠偏。
+                # 整机日志里的教训：视觉大部分时间是瞎的、偶尔锁到的还是背景块，
+                # 误差在 30/161/194 之间乱跳，闭环照着垃圾误差积分，云台就会
+                # 一个劲往一个方向转（偏置被推到 12° 再冻住）。加了这道门，
+                # 宁可不纠偏，也不跟着误检出方向。
+                if (tgt_uv is not None) and (spot is not None) and \
+                        (target_det.lost == 0):
+                    lock_run += 1
+                else:
+                    lock_run = 0
+                err_u = (tgt_uv[0] - su) if tgt_uv is not None else 0.0
+                err_v = (tgt_uv[1] - sv) if tgt_uv is not None else 0.0
+                jumped = (last_err is not None) and \
+                    ((abs(err_u - last_err[0]) > 60.0) or
+                     (abs(err_v - last_err[1]) > 60.0))
+                if (lock_run >= 3) and (not jumped) and \
+                        (tgt_uv is not None) and (spot is not None):
                     ctrl.valid = True
-                    ctrl.update(max(dt, 1e-3), tgt_uv[0] - su, tgt_uv[1] - sv,
-                                att_rel)
+                    ctrl.update(max(dt, 1e-3), err_u, err_v, att_rel)
+                    last_err = (err_u, err_v)
                 else:
                     ctrl.valid = False
                     ctrl.locked = False
+                    if jumped:
+                        last_err = None
 
                 # ---- 画到 IDE 画面 ----
                 if canvas is not None:
