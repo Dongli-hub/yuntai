@@ -62,7 +62,7 @@ PAPER_ASPECT_MIN = 1.05
 PAPER_ASPECT_MAX = 3.00
 PAPER_DENSITY_MIN = 0.50
 PAPER_CONTRAST_MIN = 22    # 内亮度 - 外亮度（0~255 量程）
-TRACK_PAD = 60             # 跟踪窗 = 上次方框 + 余量
+TRACK_PAD = 45             # 跟踪窗 = 上次方框 + 余量
 HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
 FULL_EVERY = 3             # 丢靶时每几帧做一次全图搜索
 SMOOTH = 0.55              # 检出平滑系数
@@ -410,7 +410,7 @@ class PaperDetector(object):
         self.err_msg = ""
 
     def roi(self):
-        r = int(max(self.w, self.h) * 0.75) + TRACK_PAD
+        r = int(max(self.w, self.h) * 0.6) + TRACK_PAD
         x = int(self.u - r)
         y = int(self.v - r)
         if x < 0:

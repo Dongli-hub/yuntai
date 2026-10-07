@@ -48,7 +48,7 @@ PAPER_DENSITY_MIN = 0.50   # 实际像素 / 外接框面积
 PAPER_CONTRAST_MIN = 22    # 内亮度 - 外亮度（0~255 量程）
 
 # 跟踪窗 / 保持
-TRACK_PAD = 60             # 跟踪窗 = 上次方框 + 这个余量
+TRACK_PAD = 45             # 跟踪窗 = 上次方框 + 这个余量
 HOLD_FRAMES = 15           # 丢靶后还画/还用多少帧
 FULL_EVERY = 3             # 丢靶时每几帧做一次全图搜索
 SMOOTH = 0.55              # 平滑系数（1.0=不平滑）
@@ -278,7 +278,7 @@ class PaperTracker(object):
                                #  density, ins, outs)
 
     def roi(self):
-        r = int(max(self.w, self.h) * 0.75) + TRACK_PAD
+        r = int(max(self.w, self.h) * 0.6) + TRACK_PAD
         x = int(self.u - r)
         y = int(self.v - r)
         if x < 0:
@@ -429,6 +429,7 @@ def main():
     t_aim = time.ticks_ms()
     t_print = time.ticks_ms()
     n_frame = 0
+    n_frame_prev = 0
     n_tgt = 0
     n_spot = 0
     sum_tgt = 0
@@ -562,8 +563,11 @@ def main():
 
             # ---------- 打印 ----------
             if time.ticks_diff(now, t_print) >= PRINT_MS:
+                fps = ((n_frame - n_frame_prev) * 1000.0 /
+                       max(1, time.ticks_diff(now, t_print)))
+                n_frame_prev = n_frame
                 t_print = now
-                line = "FPS=%.1f " % clock.fps()
+                line = "FPS=%.1f " % fps
                 if tracker.meas is not None and tracker.lost == 0:
                     px, x, y, w, h, long_side, aspect, density, ins, outs = \
                         tracker.meas
