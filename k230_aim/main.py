@@ -45,6 +45,8 @@ DISPLAY_W = 640
 DISPLAY_H = 480
 DISPLAY_QUALITY = 40       # IDE 传输质量（越小越快）
 SHOW_EVERY = 2             # 每几帧推一次画面（识别/瞄准仍每帧都算）
+CAM_VFLIP = True           # 画面上下颠倒 -> True
+CAM_HMIRROR = False        # 画面左右镜像 -> True
 
 # --- 相机 ---
 IMG_W = 640
@@ -1057,6 +1059,11 @@ def init_camera():
     time.sleep_ms(100)
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
     sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
+    try:
+        sensor.set_vflip(CAM_VFLIP)
+        sensor.set_hmirror(CAM_HMIRROR)
+    except Exception as e:
+        print("翻转设置失败(可忽略): %s" % e)
     return sensor
 
 
