@@ -1235,7 +1235,7 @@ def main():
                             last_gz_t = now
                     elif msg_id == MSG_TEXT:
                         try:
-                            print("H723: %s" % payload.decode("utf-8"))
+                            log("H723: %s" % payload.decode("utf-8"))
                         except Exception:
                             pass
                     elif msg_id == MSG_ACK:
@@ -1388,13 +1388,16 @@ def main():
                         target_det.state,
                         FX_PX * PAPER_LONG_M / max(1.0, target_det.meas[5]))
                 if gz is not None:
-                    log("[%s] %.1ffps gz(state=%d flags=0x%02X yaw=%.1f) "
-                          "靶=%s 命中%d/%d 光斑%d err=%.0f yaw=%.1f pit=%.1f "
-                          "ok=%d crc=%d"
-                          % (ST_NAME[state], fps, gz["state"], gz["flags"],
-                             gz["yaw"], tgt_s, n_hit, n_frames, n_spot,
-                             ctrl.err_px, ctrl.yaw, ctrl.pitch,
-                             parser.ok, parser.crc_err))
+                    log("[%s] %.1ffps gz(state=%d fault=%d flags=0x%02X "
+                          "yaw=%.1f pit=%.1f roll=%.1f ymot=%.1f pmot=%.1f "
+                          "gz=%.1f/%.1f up=%dms) 靶=%s 命中%d/%d 光斑%d "
+                          "err=%.0f 偏置 yaw=%.1f pit=%.1f ok=%d crc=%d"
+                          % (ST_NAME[state], fps, gz["state"], gz["fault"],
+                             gz["flags"], gz["yaw"], gz["pitch"], gz["roll"],
+                             gz["ymotor"], gz["pmotor"], gz["gyro_y"],
+                             gz["gyro_z"], gz["up_ms"], tgt_s,
+                             n_hit, n_frames, n_spot, ctrl.err_px,
+                             ctrl.yaw, ctrl.pitch, parser.ok, parser.crc_err))
                 else:
                     log("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
                         % (ST_NAME[state], tgt_s,
