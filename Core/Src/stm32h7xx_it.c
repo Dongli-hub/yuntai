@@ -307,4 +307,17 @@ void UART7_IRQHandler(void)
   HAL_UART_IRQHandler(&huart7);
 }
 
+/**
+  * @brief This function handles USART10 global interrupt.
+  *
+  * 2026-10-07：K230 链路最终定在 USART10（排针 UART10，RX=PE02 / TX=PE03，
+  * 复用号 AF11）。道理和上面两段完全一样：
+  *   gimbal_link_rx_isr() 先用 RDR 清掉 RXNE，再把中断交给 HAL 处理发送。
+  */
+void USART10_IRQHandler(void)
+{
+  gimbal_link_rx_isr();
+  HAL_UART_IRQHandler(&huart10);
+}
+
 /* USER CODE END 1 */

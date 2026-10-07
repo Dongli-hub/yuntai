@@ -74,7 +74,7 @@ static void MPU_Config(void);
  *  接法：USB-TTL 的 RX 接被测排针的 TX 脚，GND 必须共地，
  *        串口助手 115200 / 8 / N / 1。
  * ========================================================================= */
-#define UART_TX_TEST_MODE    2
+#define UART_TX_TEST_MODE    0
 
 /* USER CODE END 0 */
 

@@ -26,29 +26,33 @@
 #include <stdio.h>
 
 /* ========================== 链路用哪一路串口 ==========================
- *  GL_LINK_ON_UART7 = 1 : K230 链路走 UART7  →  TX=PE08 / RX=PE07
- *                            （板上丝印写着 UART7 的那个 4 针接口）
- *  GL_LINK_ON_UART7 = 0 : K230 链路走 USART1 →  TX=PA09 / RX=PA10
- *                            （原来接地瓜派的那一路，历史上已验证可用）
- *  两路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换，
- *  中断入口（UART7_IRQHandler / USART1_IRQHandler）也都在。
- * ===================================================================== */
-/* ★ 2026-10-07 实测结论：
- *   同一份代码同时往两个口发，USART1(PA9) 串口助手能收到完整的
- *   U/V/W 扫描数据，而 UART7 的排针上（PE8/PA15/PB4 三组候选全试过）
- *   只有零星噪声 —— 说明该排针的 TX 脚根本没接到 UART7 的输出脚，
- *   属于板级走线/焊接问题（不是软件配置）。
+ *  GL_LINK_UART_SEL :  0 = USART1  → TX=PA09 / RX=PA10   （3 针端子，无电源）
+ *                      1 = UART7   → TX=PE08 / RX=PE07   （实测数据线不通）
+ *                      2 = USART10 → TX=PE03 / RX=PE02   （★当前使用）
  *
- *   因此：数据走 USART1（3 针端子），5V 仍然从 UART7 排针的 VCC 取
- *   （那一脚本来的用途就是给 K230 供电），两者互不影响。 */
-#define GL_LINK_ON_UART7     0
+ *  2026-10-07 实测：
+ *   · USART1 收发都正常，但那个端子没有电源脚，给不了 K230 供电；
+ *   · UART7 的排针（PE8/PA15/PB4 三组候选全试过）只有噪声，数据线不通；
+ *   · USART10 的排针收到了完整数据，且**复用号是 AF11**（AF4 无输出），
+ *     它的 4 针里有 VCC(5V)，正好能给 K230 供电 —— 所以链路走这一路。
+ *
+ *  三路都在 main 里初始化好了，改这一个数字 + 重新编译烧写即可切换；
+ *  中断入口（USART1_IRQHandler / UART7_IRQHandler / USART10_IRQHandler）也都在。
+ * ===================================================================== */
+#define GL_LINK_UART_SEL     2
 
-#if GL_LINK_ON_UART7
+#if (GL_LINK_UART_SEL == 1)
 #define GL_HUART             huart7
 #define GL_LINK_IRQn         UART7_IRQn
+#define GL_LINK_NAME         "UART7(PE7/PE8)"
+#elif (GL_LINK_UART_SEL == 2)
+#define GL_HUART             huart10
+#define GL_LINK_IRQn         USART10_IRQn
+#define GL_LINK_NAME         "USART10(PE2/PE3, AF11)"
 #else
 #define GL_HUART             huart1
 #define GL_LINK_IRQn         USART1_IRQn
+#define GL_LINK_NAME         "USART1(PA9/PA10)"
 #endif
 
 /* ========================== 可调参数 ========================== */
@@ -407,7 +411,7 @@ void gimbal_link_init(void)
     s_cmd.mode = GP_MODE_IDLE;
     gp_parser_init(&s_parser);
 
-#if GL_LINK_ON_UART7
+#if (GL_LINK_UART_SEL == 1)
     /* UART7 引脚：板子丝印已确认 RX=PE07 / TX=PE08，固定这一组 */
     UART7_BindPins(UART7_PAIR_PE);
 #endif
@@ -418,23 +422,15 @@ void gimbal_link_init(void)
      *   看到字  = 物理链路 + UART7 都好，只是帧解析的问题
      *   没看到  = H723 没在跑，或者线/引脚不对
      */
-    if (UART7_InitError() == 0u)
     {
-        static const char banner[] = "\r\nYUNTAI-UART7 PE7/PE8 alive\r\n";
+        static const char banner[] =
+            "\r\nYUNTAI LINK BANNER 115200 8N1\r\n";
         HAL_UART_Transmit(&GL_HUART, (uint8_t *)banner,
                           (uint16_t)(sizeof(banner) - 1u), 50u);
-#if GL_LINK_ON_UART7
-        gimbal_link_log("[LINK] UART7(PE7/PE8) ready");
-#else
-        gimbal_link_log("[LINK] USART1(PA9/PA10) ready");
-#endif
-    }
-    else
-    {
-        gimbal_link_log("[LINK] UART7 init FAIL !!");
+        gimbal_link_log("[LINK] " GL_LINK_NAME " ready");
     }
 
-    /* 打开 UART7 的接收中断（接收只做"存字节"这一件事） */
+    /* 打开链路串口的接收中断（接收只做"存字节"这一件事） */
     __HAL_UART_CLEAR_FLAG(&GL_HUART, UART_CLEAR_OREF | UART_CLEAR_FEF |
                                      UART_CLEAR_NEF | UART_CLEAR_PEF);
     __HAL_UART_ENABLE_IT(&GL_HUART, UART_IT_RXNE);

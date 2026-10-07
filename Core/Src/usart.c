@@ -28,8 +28,9 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart7;
 UART_HandleTypeDef huart10;
 
-/* USART10（UART10 排针：RX=PE02 / TX=PE03）的复用号与状态 */
-static uint8_t s_uart10_af = UART10_AF4;
+/* USART10（UART10 排针：RX=PE02 / TX=PE03）的复用号与状态。
+ * 2026-10-07 实测：AF11 才有输出（AF4 那半轮串口助手收不到），所以默认 AF11。 */
+static uint8_t s_uart10_af = UART10_AF11;
 static uint8_t s_uart10_err;
 
 uint8_t UART10_InitError(void)
