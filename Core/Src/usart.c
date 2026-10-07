@@ -307,19 +307,23 @@ void UART7_TxTest(void)
         " TX SELF TEST     115200 8N1\r\n"
         " sending on BOTH:  UART7 TX=PE08   USART1 TX=PA09\r\n"
         " USB-TTL RX -> one of those TX pins, GND common\r\n"
-        " expect 64 x 'U' (HEX 55), then one line / 200ms\r\n"
+        " EVERY 200ms: 128 x 'U' (HEX 55) + one count line\r\n"
         "==================================================\r\n";
 
     /* 按板上丝印固定引脚：RX=PE7, TX=PE8 */
     UART7_BindPins(UART7_PAIR_PE);
 
-    /* 先来一串 0x55：ASCII 是 UUUU...，HEX 是 55 55 55 ...，
-       收到这个就说明这条线通了（收不到就是线/脚/波特率的问题） */
-    uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
     uart_tx_both(head, (uint16_t)(sizeof(head) - 1u));
 
     while (1)
     {
+        /* 每轮都连发两串 0x55（共 128 个）：
+           ASCII 视图是 UUUU...，HEX 视图是 55 55 55 ...。
+           持续发送的好处是：在串口助手里反复换波特率，
+           哪个波特率能读出一整串 U，就说明实际波特率是那个。 */
+        uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
+        uart_tx_both(burst, (uint16_t)(sizeof(burst) - 1u));
+
         int len = snprintf(line, sizeof(line),
                            "SELFTEST count=%lu   U7=PE08  U1=PA09\r\n",
                            (unsigned long)n);
