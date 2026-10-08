@@ -96,7 +96,7 @@
  *   · 电机仍然匀速转 -> 命令已经是 0，问题在【电机驱动器/CAN 速度模式零偏】
  *   · 电机停住        -> 是【环路在推】，去查 yaw 反馈链（IMU 轴/量程/极性）
  * 判定完请改回 0。 */
-#define YAW_DEBUG_FORCE_ZERO       1
+#define YAW_DEBUG_FORCE_ZERO       0
 #define MOTOR_BOOT_DELAY_MS     2000u    /* 等驱动器上电自检：纯延时，不要改小 */
 #define CLOSED_LOOP_DELAY_MS     500u    /* 进闭环后等 0.5s */
 #define SET_MODE_DELAY_MS        500u    /* 切速度模式后等 0.5s */
@@ -1137,9 +1137,14 @@ static void yuntai_debug(uint32_t now)
         /* 偏航电机角也打出来：现场判断"还在不在飘"就看这个数有没有匀速爬
          * （实测飘的时候它以 0.245°/s 匀速增长，肉眼看不出来但日志里很明显） */
         fmt_f(b7, sizeof(b7), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
+        /* 2026-10-08：把下发的 yaw 速度指令也打出来，用来一次定死自转方向：
+         *   cmd 与 yaw(IMU) 同号变化 -> 正反馈（环推错方向）-> 翻误差符号；
+         *   cmd 与 yaw 反号变化      -> 负反馈（方向对）-> 是静摩擦补偿/积分太凶。 */
+        char b8[16];
+        fmt_f(b8, sizeof(b8), g_yaw_cmd_rpm, 1);
         snprintf(buf, sizeof(buf),
-                 "[DBG] P p=%s t=%s o=%s | Y o=%s ym=%s%s | off=%s %s | c=%s | fb=%ums",
-                 b0, b1, b2, b3, b7, (g_yaw_stiction_on ? " S" : ""),
+                 "[DBG] P p=%s t=%s o=%s | Y cmd=%s o=%s ym=%s%s | off=%s %s | c=%s | fb=%ums",
+                 b0, b1, b2, b8, b3, b7, (g_yaw_stiction_on ? " S" : ""),
                  b4, b5, b6, (unsigned)fb_age);
     }
     gimbal_link_log(buf);
