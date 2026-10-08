@@ -82,7 +82,14 @@
  *       control.kp 大约减半来匹配（否则视觉环增益翻倍）。这一步我在
  *       RDK 侧已经改好（yaw 专用缩放），见 docs/06。
  */
-#define AHRS_LEGACY_HALF_RATE      1
+/* ⚠ 2026-10-08 现场实测（不接上位机、只上电）：yaw 轴朝一个方向匀速转。
+ * 根因就是这里 =1：AHRS 按 1000Hz 积分，而实际只有 500Hz 调用 ->
+ * 四元数步长只有真实的一半 -> **姿态角"走一半"**，显示 1° 实际转了 2°。
+ * 对 yaw 环来说等于把等效环路增益放大近 2 倍（角度环 + 前馈一起放大），
+ * 叠加残余零偏/静摩擦补偿就变成"朝一个方向匀速爬"，且视觉环也会过冲。
+ * 改回 0：姿态与真实 1:1，各环增益回到设计值。
+ * （=1 只是当年为了复现老版行为留的 A/B 开关，别再打开。） */
+#define AHRS_LEGACY_HALF_RATE      0
 #define MOTOR_BOOT_DELAY_MS     2000u    /* 等驱动器上电自检：纯延时，不要改小 */
 #define CLOSED_LOOP_DELAY_MS     500u    /* 进闭环后等 0.5s */
 #define SET_MODE_DELAY_MS        500u    /* 切速度模式后等 0.5s */
@@ -928,7 +935,21 @@ static void yuntai_control(uint32_t now)
         PID_Update(&g_yaw_pid, err, 0.0f, dt);
         /* 前馈：车体怎么转，前馈就让电机反向跟多少。
          * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。 */
-        yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * gyro_c[2] * g_yaw_ff_gain;
+        /* ⚠ 2026-10-08：前馈对"残余陀螺零偏"极其敏感 —— 前馈增益是 66.85
+         * rpm/(rad/s)（约 7 倍过量），残余零偏 0.3°/s 就会被翻译成约 0.4rpm
+         * 的**恒定**指令，和静摩擦补偿合起来正好把轴推着朝一个方向匀速爬
+         * （现场现象："靶子静止，水平电机自己慢慢转，方向每次一样"）。
+         * 陀螺零偏跟踪（gyro_bias_track）本身有残余，所以这里再加一道死区：
+         * 只有明显在转动（>0.5°/s）时才让前馈出力。 */
+        {
+            float wz = gyro_c[2];
+            const float ff_dead = 0.0087f;        /* 0.5°/s */
+            if (fabsf(wz) < ff_dead)
+            {
+                wz = 0.0f;
+            }
+            yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * wz * g_yaw_ff_gain;
+        }
 
         /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
         g_yaw_err_rad = err;                  /* 给零偏自校准的"静止判据"用 */
