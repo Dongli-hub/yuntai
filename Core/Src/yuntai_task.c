@@ -90,6 +90,13 @@
  * 改回 0：姿态与真实 1:1，各环增益回到设计值。
  * （=1 只是当年为了复现老版行为留的 A/B 开关，别再打开。） */
 #define AHRS_LEGACY_HALF_RATE      0
+/* 诊断开关（2026-10-08 现场"yaw 只上电就匀速朝一个方向转"）：
+ *   =1 -> yaw 输出恒为 0（角度环、前馈、静摩擦补偿全部不发出力）
+ * 测法：烧本版、只上电进 STAB、不接上位机，观察 1 分钟
+ *   · 电机仍然匀速转 -> 命令已经是 0，问题在【电机驱动器/CAN 速度模式零偏】
+ *   · 电机停住        -> 是【环路在推】，去查 yaw 反馈链（IMU 轴/量程/极性）
+ * 判定完请改回 0。 */
+#define YAW_DEBUG_FORCE_ZERO       1
 #define MOTOR_BOOT_DELAY_MS     2000u    /* 等驱动器上电自检：纯延时，不要改小 */
 #define CLOSED_LOOP_DELAY_MS     500u    /* 进闭环后等 0.5s */
 #define SET_MODE_DELAY_MS        500u    /* 切速度模式后等 0.5s */
@@ -971,6 +978,11 @@ static void yuntai_control(uint32_t now)
         }
     }
     g_yaw_cmd_rpm = clampf(yaw_rpm, -YAW_OUT_RPM, YAW_OUT_RPM);
+#if YAW_DEBUG_FORCE_ZERO
+    /* 诊断：强制 yaw 输出 0（见文件顶部 YAW_DEBUG_FORCE_ZERO 说明） */
+    g_yaw_cmd_rpm = 0.0f;
+    g_yaw_stiction_on = 0u;
+#endif
     yuntai_set_yaw(g_yaw_cmd_rpm);
 
     /* ======================================================================
