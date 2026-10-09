@@ -58,9 +58,10 @@ IMG_H = 480
 # 现场日志：真靶纸 长边184~190px/密度0.83~0.96/对比90+；误检 密度0.51~0.73/对比22~67。
 # 所以下面加了长边范围、密度、对比三道静态闸门，外加尺寸/位置/连续确认三道时间闸门。
 # 详细说明见 tools/vision_check.py 顶部。
-PAPER_TH = 42              # 亮度阈值（0~100）。整机日志里"候选0"仍占绝大多数
-                           # （云台视角下画面里有亮天花板/背景，自动曝光把整幅压暗，
-                           #  纸的 LAB-L 掉到 50 以下）-> 58->50->42
+# ⚠ 2026-10-08 改回 vision-v1（"视觉初版识别"，你验证过的那版）的值：
+#   之前为追"候选0"把 58 降到 50/42，但那次"候选0"的真因是相机没照到靶纸，
+#   不是阈值太高；降阈值反而把墙/柜面（内125~172）也放进来 -> 误检、云台乱跟。
+PAPER_TH = 58              # 亮度阈值（0~100）—— 与 vision_check 完全一致
 PAPER_TH_ALT = 72          # 兜底阈值：全图第一遍失败时再试
 PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
 PAPER_B_MAX = 32           # |b| 上限
@@ -72,7 +73,11 @@ PAPER_ASPECT_MIN = 0.70    # A4=1.41；斜视透视下会缩到接近 1
 PAPER_ASPECT_MAX = 3.00
 PAPER_DENSITY_MIN = 0.70   # 兜底（没拟合出四边形时）：像素/外接框面积
 PAPER_DENSITY_QUAD_MIN = 0.72  # 拟合出四边形后：像素/四边形面积
-PAPER_CONTRAST_MIN = 40    # 内亮度 - 外亮度（0~255 量程）
+# ⚠ 2026-10-09 现场实测修正：真靶纸在 0.5m 时的"内−外"只有 54
+#   （日志：候选 [45286px 框272 内192 外138 暗边67%] = 真纸，被 60 的门槛挡掉
+#    -> 靶纸忽锁忽丢 -> 偏置被冻住）。所以不能提到 60，回到 45：
+#   45 仍比"墙/柜面"那种（内−外 常 <30）高，防误检靠暗边比例 + 面积 + 确认次数。
+PAPER_CONTRAST_MIN = 45    # 内亮度 - 外亮度（0~255 量程）
 PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
 PAPER_DARK_FRAC_MIN = 0.70  # 外侧 12 个点里至少这么多比例要比内部暗
 # --- 四边形拟合（斜视时画出来是梯形，靶心=对角线交点=透视中心）---
@@ -96,12 +101,10 @@ SMOOTH = 0.55              # 平滑系数
 DEADBAND_PX = 1.5          # 平滑死区（小于它不动，画面不抖）
 SIZE_GATE_LO = 0.55        # 跟踪时允许的长边变化范围（一帧内不可能变太多）
 SIZE_GATE_HI = 1.45
-CONFIRM_N = 2              # 连续确认几次才算重新锁定。日志(3)里真靶纸已经能稳定
-                           # 出现（框218~225px 内187~194 外105 暗边75~92%），
-                           # 但它一闪一闪，卡在"确认2/3"永远到不了3 -> 降到2
+CONFIRM_N = 3              # 连续确认几次才算重新锁定（vision-v1 的值，防误检）
 CONFIRM_DXY = 35           # 确认时的位置一致范围 px
 CONFIRM_DSIZE = 0.60       # 确认时的尺寸一致范围（±60%）
-PENDING_MISS = 6           # 确认过程中允许漏几次（整机下纸会闪，放宽到6）
+PENDING_MISS = 3           # 确认过程中允许漏几次（vision-v1 的值）
 PAPER_LONG_M = 0.297       # A4 长边实际长度（米），用于估距离
 
 # --- 激光光斑检测 ---
@@ -119,17 +122,70 @@ SPOT_ADAPT_LIMIT = 6.0     # 单次最多修正多少像素
 
 # --- 瞄准控制（积分型视觉伺服 + P 项挂在实测姿态上）---
 FX_PX = 445.0              # 像素焦距（640 宽）。0.6m 处 A4 长边≈222px 反推
-SIGN_YAW = 1.0             # 偏置方向；若越转越远就把对应项改 -1
-SIGN_PITCH = 1.0
-KP_P_YAW = 0.75            # P 项：一次给出 75% 的偏差角度
+# ⚠ 2026-10-09 方向符号【固定】（用户要求：硬件与场地都不再变，不必每次开机自检）
+#   依据：连续 5 次整机测试的开机自检结果完全一致
+#     log(8)(9)(10)(11)(12):  SIGN_YAW=-1   SIGN_PITCH=-1
+#   以后如果换了相机安装方向 / 换了云台机械结构，把这两项改回 1.0 或
+#   临时把 AUTO_SIGN_CAL 设成 True 重新自检即可。
+SIGN_YAW = -1.0             # 固定方向：yaw 偏置为正 -> 靶心在图像里向负方向跑
+SIGN_PITCH = -1.0           # 固定方向：pitch 偏置为正 -> 靶心在图像里向负方向跑
+AUTO_SIGN_CAL = False       # 关闭开机方向自检（符号已固定，开机更快）
+CAL_STEP_DEG = 4.0          # 仅当 AUTO_SIGN_CAL=True 时才用到
+_SIGN = [SIGN_YAW, SIGN_PITCH]   # AimCtrl 实际使用的符号（固定值）
+# ⚠ 2026-10-09 按用户意见"减小 I、增大 P"：P 0.50 -> 0.70，I 0.015 -> 0.008。
+#   偏置基准改成"纯增量"之后不再有双重计数，P 大一点才跟得上移动目标。
+KP_P_YAW = 0.70            # P 项
 KP_P_PITCH = 0.50
-KI = 0.015                 # I 项：只抹静差
-KI_BAND_PX = 40.0          # 误差小于这么多像素才允许积分
-I_LIMIT_DEG = 3.0          # 积分限幅
-DEADBAND_PX = 2.0          # 误差死区（640x480 下 1px≈3.5mm@1.5m；1280x720 用 6）
-RATE_LIMIT_DPS = 8.0       # 偏置变化率限幅（防甩）
-MAX_YAW_DEG = 170.0
-MAX_PITCH_DEG = 60.0
+KP_D_YAW = 0.20            # D 项（秒）：跟随阻尼（0.35 -> 0.20，压掉小振荡）
+KP_D_PITCH = 0.0           # 俯仰不需要（地瓜派 config: kp_d_pitch = 0.0）
+D_LIMIT_DEG = 5.0          # D 项限幅（防噪声放大）
+# ⚠ 2026-10-08 用【本机实测】的 yaw 增益，不再照抄任何人：
+#   开机 [CAL] 自检时给 +4° 偏置，实测 err_u 只变化 13~37px
+#   => 这台云台 yaw 轴的真实灵敏度 ≈ 6 px/度（取中值 25px/4°）。
+#   而按相机视场算出来是 445×2.5/57.3 ≈ 19.4 px/度 —— 差 3 倍多，
+#   控制器"以为"1°能修 19px，实际只能修 6px，于是每次只肯给 1/3 偏置，
+#   稳态永远差 50~66px（≈5~6cm，正好落在 A4 边缘），小偏置还推不动轴。
+#   所以：像素→角度 直接用实测值，环路增益回到 0.75 的健康水平。
+PX_PER_DEG_YAW = 6.0       # yaw：实测 6 px/度（CAL 自检数据）
+PX_PER_DEG_PITCH = 7.8     # pitch：按 fx 折算（暂时用视场值，等 pitch 自检数据再校准）
+# ⚠ 2026-10-09 模型+现场双重结论：**这个环路不要积分**。
+#   用实测参数（增益 6px/度、轴滞后 0.5~1.2s）做的模型扫描：
+#     KI=0.004 时，小增益(0.02~0.03)反而发散（积分攒成自激）；
+#     KI=0    时，增益 0.05~0.20 + 滞后 0.3~1.2s **全部稳定收敛到 err≈0**。
+#   用户也明确要求" I 尽量不要"。静差的活儿交给 H723 自己的轴内环。
+KI = 0.0                   # I 项关闭（置 0 后积分不再累加）
+# 积分要在"剩下几十像素静差"时把它吃掉（现场实测稳态剩 50~66px），所以：
+KI_BAND_PX = 150.0         # 误差小于这么多像素才允许积分（40 -> 150）
+I_LIMIT_DEG = 15.0         # 积分限幅（3 -> 15）：要能补出 10° 量级的偏置
+DEADBAND_PX = 8.0          # 误差死区（2 -> 8px）：抑制"到位后来回小抖"
+ERR_FILTER = 0.5           # 误差 EMA 滤波系数：越大越信当帧（0.5 = 一半平滑）
+# --- 自适应增益/方向（2026-10-09 新增）---
+# 为什么必须自适应：这台云台"偏置→像素"的响应既慢（0.5~1s）又粘（静摩擦），
+# 固定增益只有两种结局——大了自激（±25° 来回甩）、小了追不上。
+# 做法：每 TUNE_PERIOD_S 量一次"误差比上次大还是小"：
+#   变大 -> 方向翻转 + 增益减半      （说明方向或增益不对）
+#   变小 -> 保持方向 + 增益微增      （方向对，可以更积极）
+#   几乎不变 -> 增益放大一点          （被静摩擦/死区卡住）
+# 初始值用之前 5 次自检一致的 -1/-1，但它会自己纠。
+GAIN_MIN = 0.05            # 允许的最小增益（模型：0.05 起就稳）
+GAIN_MAX = 0.15            # 允许的最大增益（模型：0.15 在 1.2s 滞后下仍稳）
+TUNE_PERIOD_S = 0.30       # 多久评估一次
+# ⚠ 2026-10-08 现场实测：整机下陀螺 5~12°/s（人手平移云台），限幅 8°/s 比目标
+#   移动还慢 -> 跟随严重滞后、停下才慢慢回正、稳态还差 ~40px（≈5°，在 0.65m
+#   就是 5~6cm，正好落在 A4 靶纸边缘）。地瓜派整定后的原值是 60°/s：
+#   rdk_aim/configs/default.yaml "偏置加速度限幅（220 -> 60°/s）"。
+RATE_LIMIT_DPS = 60.0      # 偏置变化率限幅（°/s），与地瓜派整定值一致
+MAX_STEP_DEG = 0.6         # 单帧偏置最大变化（度）——防"延迟造成的一次跳很多"
+# 丢靶后的安全返回：丢靶这么久之后，偏置以 LOST_RETURN_DPS 缓慢回到 0
+# （上电基准姿态一般就是对着靶子的方向，慢慢回去比"冻在错位置"安全得多；
+#   这条不是"扫掠找靶"，只是回到参考位。）
+LOST_RETURN_MS = 2000
+LOST_RETURN_DPS = 5.0
+# ⚠ 2026-10-08 首次闭环测试用的小限幅：万一方向符号反了，云台只会小幅偏一下，
+#   不会甩到 170°。确认 err 收敛、方向正确后再放开（yaw 170 / pitch 60）。
+#   （2026-10-09：pitch 从 25 收到 12 —— 防止偏置把靶纸推出竖直视野）
+MAX_YAW_DEG = 40.0
+MAX_PITCH_DEG = 12.0
 LOST_COAST_S = 1.0         # 丢靶后还能沿用最后误差多久
 
 # --- 时序 / 安全 ---
@@ -141,6 +197,11 @@ LASER_ENABLE = True        # 是否让 H723 点激光（AIM 模式下才有效�
 DEBUG_PRINT_MS = 1000      # 终端打印周期
 LOG_TO_FILE = True         # 整机跑（没接电脑）时把日志写进 SD 卡，跑完插回电脑看
 LOG_PATH = "/sdcard/k230_log.txt"
+LOG_ONLY = False           # ⚠ 只监听模式（云台单独测试用）：
+                           #   True  = 只收 H723 日志并写进上面的日志文件，**不发
+                           #           SET_ZERO / MODE(AIM) / AIM 帧**，H723 会一直停在
+                           #           上电默认的 STAB —— 等价于"没接 K230"的独立测试；
+                           #   False = 正常瞄准（改完这一个字即可，不用换文件）。
 
 # ============================================================================
 #  协议
@@ -404,6 +465,34 @@ def px_luma(img, x, y):
     if p is None:
         return -1
     return luma(p[0], p[1], p[2])
+
+
+def log_scene(img):
+    """每 5 秒打一行"画面亮度"（6x8 网格自己采样），用来判断为什么没锁到靶：
+      · 均/大 都很小（均<60 且 大<90）-> 画面太暗 / 镜头被挡 / 对着暗墙
+      · 有大亮块（大>=200）但没靶     -> 靶纸不在视野里，或太远太小
+      · 均 100+ 且有大亮块            -> 视野正常，那是靶纸判据/阈值的问题
+    以前没有这行时，"候选0"（一个亮块都没有）只能靠猜。"""
+    lo = 255
+    hi = 0
+    s = 0
+    k = 0
+    for gy in range(6):
+        y = int(IMG_H * (gy + 0.5) / 6)
+        for gx in range(8):
+            x = int(IMG_W * (gx + 0.5) / 8)
+            v = px_luma(img, x, y)
+            if v < 0:
+                continue
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+            s += v
+            k += 1
+    if k:
+        log("[SCENE] 画面亮度 均=%.0f 小=%d 大=%d (0~255)  靶=无靶时看这行"
+            % (s / float(k), lo, hi))
 
 
 def paper_contrast(img, x, y, w, h):
@@ -1029,12 +1118,106 @@ class SpotDetector(object):
 # ============================================================================
 #  瞄准控制
 # ============================================================================
+class SignCal(object):
+    """开机方向自检（治"云台朝反方向跑"）：
+
+    步骤：① 稳稳锁住靶后，先测 0.4s 的基准误差(基准=平均 err_u/err_v)；
+          ② 只给 yaw 一个 +CAL_STEP_DEG 的小偏置，0.7s 后再测平均误差 —— 误差
+             变小说明这个方向对（保持 SIGN_YAW），变大说明反了（取反）；
+          ③ 对 pitch 做同样的事。
+    全程只动 ±4°，靶不会跑出视野；中途丢靶就放弃自检、保持原符号并打日志。
+    phase: 0 等目标 / 1 测基准 / 2 测 yaw / 3 测 pitch / 4 完成
+    """
+
+    def __init__(self):
+        self.phase = 0
+        self.t = 0
+        self.n = 0
+        self.su = 0.0
+        self.sv = 0.0
+        self.base_u = 0.0
+        self.base_v = 0.0
+        self.yaw_bias = 0.0
+        self.pit_bias = 0.0
+
+    def done(self):
+        return self.phase >= 4
+
+    def step(self, now, eu, ev, ok):
+        """返回 (yaw偏置, pitch偏置, 是否正在自检)。"""
+        if self.phase >= 4:
+            return 0.0, 0.0, False
+        if not ok:                       # 丢靶/不稳 -> 这一帧不参与，稍后继续
+            return self.yaw_bias, self.pit_bias, (self.phase != 0)
+        if self.phase == 0:
+            self.phase = 1
+            self.t = now
+            self.n = 0
+            self.su = 0.0
+            self.sv = 0.0
+            log("[CAL] 方向自检开始（约 2 秒，请让靶纸保持在画面里）")
+        self.su += eu
+        self.sv += ev
+        self.n += 1
+        d = time.ticks_diff(now, self.t)
+        if self.phase == 1:
+            self.yaw_bias = 0.0
+            self.pit_bias = 0.0
+            if d >= 400:
+                self.base_u = self.su / max(1, self.n)
+                self.base_v = self.sv / max(1, self.n)
+                self.phase = 2
+                self.t = now
+                self.n = 0
+                self.su = 0.0
+                self.sv = 0.0
+                log("[CAL] 基准: err_u=%.0f err_v=%.0f" % (self.base_u,
+                                                           self.base_v))
+        elif self.phase == 2:
+            self.yaw_bias = CAL_STEP_DEG
+            self.pit_bias = 0.0
+            if d >= 700:
+                mu = self.su / max(1, self.n)
+                _SIGN[0] = SIGN_YAW if abs(mu) < abs(self.base_u) else -SIGN_YAW
+                log("[CAL] yaw +%.0f度: err_u %.0f -> %.0f  => SIGN_YAW=%+d"
+                    % (CAL_STEP_DEG, self.base_u, mu, int(_SIGN[0])))
+                self.phase = 3
+                self.t = now
+                self.n = 0
+                self.su = 0.0
+                self.sv = 0.0
+        elif self.phase == 3:
+            self.yaw_bias = 0.0
+            self.pit_bias = CAL_STEP_DEG
+            if d >= 700:
+                mv = self.sv / max(1, self.n)
+                _SIGN[1] = SIGN_PITCH if abs(mv) < abs(self.base_v) else -SIGN_PITCH
+                log("[CAL] pitch +%.0f度: err_v %.0f -> %.0f => SIGN_PITCH=%+d"
+                    % (CAL_STEP_DEG, self.base_v, mv, int(_SIGN[1])))
+                log("[CAL] 自检完成，进入闭环瞄准")
+                self.phase = 4
+                self.yaw_bias = 0.0
+                self.pit_bias = 0.0
+        return self.yaw_bias, self.pit_bias, (self.phase < 4)
+
+
 class AimCtrl(object):
     def __init__(self):
         self.yaw = 0.0
         self.pitch = 0.0
         self.i_u = 0.0
         self.i_v = 0.0
+        self.prev_eu = 0.0
+        self.last_eu = 0.0
+        self.last_ev = 0.0
+        self.f_u = 0.0
+        self.f_v = 0.0
+        self.f_init = False
+        # 自适应增益/方向：g[i]=增益, sg[i]=方向(±1), la[i]=上次评估的|误差|
+        self.g = [0.08, 0.06]      # 初值取模型稳定带中间（自适应会微调）
+        self.sg = [_SIGN[0], _SIGN[1]]
+        self.la = [None, None]
+        self.t_acc = 0.0
         self.err_px = 0.0
         self.valid = False
         self.locked = False
@@ -1042,10 +1225,23 @@ class AimCtrl(object):
     def reset(self):
         self.i_u = 0.0
         self.i_v = 0.0
+        self.f_init = False
 
     def update(self, dt, err_u, err_v, att_rel):
         """err_u/err_v = 靶心 - 光斑（像素）；att_rel = 相对锁零基准的实测姿态"""
         self.err_px = math.sqrt(err_u * err_u + err_v * err_v)
+        self.last_eu = err_u
+        self.last_ev = err_v
+        # 误差 EMA 滤波（治"检测抖动 -> 环路被抖动带着抖"）：
+        # 用滤波后的值去算角度，原始值只用于日志显示。
+        if not self.f_init:
+            self.f_u, self.f_v = err_u, err_v
+            self.f_init = True
+        else:
+            self.f_u += ERR_FILTER * (err_u - self.f_u)
+            self.f_v += ERR_FILTER * (err_v - self.f_v)
+        err_u = self.f_u
+        err_v = self.f_v
         eu, ev = err_u, err_v
         if abs(eu) < DEADBAND_PX:
             eu = 0.0
@@ -1054,30 +1250,74 @@ class AimCtrl(object):
 
         # I 项用"没进死区前"的原始误差：死区只用来抑制 P 项抖动，
         # 不能让积分也停住，否则最后几像素的静差永远消不掉。
-        e_deg_u_raw = err_u / FX_PX * 57.29578
-        e_deg_v_raw = err_v / FX_PX * 57.29578
-        e_deg_u = eu / FX_PX * 57.29578
-        e_deg_v = ev / FX_PX * 57.29578
+        # 像素→角度：直接用【本机实测灵敏度】（见文件顶部 PX_PER_DEG_YAW 说明）。
+        # 这样"控制器认为的角度"和"云台实际要转的角度"一致，环路增益才正确。
+        e_deg_u_raw = err_u / PX_PER_DEG_YAW
+        e_deg_v_raw = err_v / PX_PER_DEG_PITCH
+        e_deg_u = eu / PX_PER_DEG_YAW
+        e_deg_v = ev / PX_PER_DEG_PITCH
+
+        # D 项：误差变化率阻尼（地瓜派 kp_d=0.35）。跟随移动目标时靠它压住滞后。
+        d_u = 0.0
+        if dt > 1e-4:
+            d_u = (e_deg_u - self.prev_eu) / dt
+            d_u = max(-D_LIMIT_DEG, min(D_LIMIT_DEG, d_u))
+        self.prev_eu = e_deg_u
 
         # 条件积分：误差小才累加，避免"攒过头再冲出去"
         if self.err_px <= KI_BAND_PX and dt > 1e-4:
-            self.i_u += KI * e_deg_u_raw
-            self.i_v += KI * e_deg_v_raw
+            # ⚠ 2026-10-09 现场抓到的硬 bug：这里原来写的是
+            #     i_u += KI * e_deg_u_raw        （与误差同号）
+            #   而比例项是  base + sg * g * e_deg  （sg=-1，与误差反号）
+            #   => **积分一直在往比例项的反方向拉**，越积越大，把云台推到
+            #   偏置限幅（现场日志：ev=-43 -> pit 却被推到 -12° 限幅），
+            #   表现就是"无论怎么调 P 都不收敛 / 直接脱靶"。
+            #   正确：积分必须与比例项同方向，乘上自适应方向 sg。
+            self.i_u += self.sg[0] * KI * e_deg_u_raw
+            self.i_v += self.sg[1] * KI * e_deg_v_raw
             self.i_u = max(-I_LIMIT_DEG, min(I_LIMIT_DEG, self.i_u))
             self.i_v = max(-I_LIMIT_DEG, min(I_LIMIT_DEG, self.i_v))
 
-        if att_rel is not None:
-            base_u = att_rel[0] + self.i_u
-            base_v = att_rel[1] + self.i_v
-        else:
-            base_u = self.yaw + self.i_u
-            base_v = self.pitch + self.i_v
+        # ⚠ 2026-10-09 重要修正（用户指出）：这里过去写的是
+        #     base_u = att_rel[0] + i_u   ← att_rel 是【当前实测姿态】
+        #   于是 want_u = 当前姿态 + Kp×误差，再当成"偏置"发给 H723；
+        #   而 H723 的用法是 target = 上电基准 + 偏置 —— 当前姿态被重复
+        #   计入了一次（双重计数），所以怎么调都收敛不好。
+        #   正确做法：K230 只负责【增量修正量】，也就是在它自己累积的偏置
+        #   self.yaw/self.pitch 上继续加修正；当前姿态由 H723 自己的稳定环
+        #   负责（它 200Hz 在跑，比我们快得多）。att_rel 只用于日志/调试。
+        base_u = self.yaw + self.i_u
+        base_v = self.pitch + self.i_v
 
-        want_u = base_u + SIGN_YAW * KP_P_YAW * e_deg_u
-        want_v = base_v + SIGN_PITCH * KP_P_PITCH * e_deg_v
+        # ---- 自适应：每 TUNE_PERIOD_S 评估一次"误差是变大还是变小" ----
+        self.t_acc += dt
+        if self.t_acc >= TUNE_PERIOD_S:
+            self.t_acc = 0.0
+            for i in (0, 1):
+                cur = abs(e_deg_u) if i == 0 else abs(e_deg_v)
+                last = self.la[i]
+                if (last is not None) and (last > 1e-3):
+                    if cur > last * 1.05:
+                        # ⚠ 2026-10-09 现场教训：这里原来"误差变大就翻转方向"，
+                        #   但这台云台轴响应要 0.5~1s，误差变大常常只是"上一条
+                        #   指令还没转到位"-> 自适应误判成方向反了、把 pitch 推到
+                        #   -22.8°、靶纸被推出画面。所以现在【只减增益、不翻方向】，
+                        #   方向固定用上面 SIGN_YAW/SIGN_PITCH（5 次自检一致）。
+                        self.g[i] = max(GAIN_MIN, self.g[i] * 0.6)
+                    elif cur < last * 0.95:        # 在收敛 -> 保持并微增
+                        self.g[i] = min(GAIN_MAX, self.g[i] * 1.15)
+                    else:                          # 卡住(静摩擦) -> 加大步长
+                        self.g[i] = min(GAIN_MAX, self.g[i] * 1.25)
+                self.la[i] = cur
+
+        want_u = base_u + self.sg[0] * (self.g[0] * e_deg_u + KP_D_YAW * d_u)
+        want_v = base_v + self.sg[1] * self.g[1] * e_deg_v
 
         # 变化率限幅（防甩） + 绝对限幅
+        # 每帧偏置变化量双限幅：既限速度，也限单帧步长（防"延迟导致的大跳"）
         step = RATE_LIMIT_DPS * max(dt, 1e-3)
+        if step > MAX_STEP_DEG:
+            step = MAX_STEP_DEG
         du = want_u - self.yaw
         dv = want_v - self.pitch
         if du > step:
@@ -1191,6 +1431,10 @@ def main():
     target_det = PaperDetector()
     spot_det = SpotDetector()
     ctrl = AimCtrl()
+    sign_cal = SignCal()
+    cal_active = False
+    cal_yaw = 0.0
+    cal_pit = 0.0
 
     state = ST_WAIT_READY
     state_t = time.ticks_ms()
@@ -1201,6 +1445,7 @@ def main():
     t_aim = time.ticks_ms()
     t_mode = time.ticks_ms()
     t_print = time.ticks_ms()
+    t_diag = time.ticks_ms()
     t_last_frame = time.ticks_ms()
     last_tgt = None
     last_tgt_t = 0
@@ -1222,6 +1467,11 @@ def main():
         try:
             _log_f = open(LOG_PATH, "w")
             log("(日志同时写入 %s；整机跑完把 SD 卡插回电脑看这个文件)" % LOG_PATH)
+            log("[CFG] 方向符号已固定: SIGN_YAW=%+.0f SIGN_PITCH=%+.0f "
+                "(自检%s)  偏置限幅 yaw=%.0f° pitch=%.0f°"
+                % (SIGN_YAW, SIGN_PITCH,
+                   "开" if AUTO_SIGN_CAL else "关", MAX_YAW_DEG,
+                   MAX_PITCH_DEG))
         except Exception as e:
             print("日志文件打不开(继续运行, 只是不写文件): %s" % e)
 
@@ -1269,7 +1519,13 @@ def main():
 
             # ---------- 4. 状态机 ----------
             if state == ST_WAIT_READY:
-                if ready:
+                if ready and LOG_ONLY:
+                    # 只监听模式：不切模式、不发 SET_ZERO，H723 保持 STAB。
+                    # 电压/日志照收，SD 卡日志照写。
+                    state = ST_TRACK
+                    state_t = now
+                    log("LOG_ONLY=1 只监听：保持 H723 的 STAB，不发送 SET_ZERO/AIM")
+                elif ready:
                     link.send(build_frame(MSG_MODE, pack_mode(MODE_STAB)))
                     sent_mode = MODE_STAB
                     link.send(build_frame(MSG_SET_ZERO))
@@ -1286,7 +1542,8 @@ def main():
                     print("进入 AIM，开始闭环瞄准")
             elif state == ST_TRACK:
                 # 周期重发 MODE：H723 被看门狗切回 STAB 后自动拉回来
-                if time.ticks_diff(now, t_mode) >= MODE_REASSERT_MS:
+                if (not LOG_ONLY) and \
+                        (time.ticks_diff(now, t_mode) >= MODE_REASSERT_MS):
                     t_mode = now
                     link.send(build_frame(MSG_MODE, pack_mode(MODE_AIM)))
 
@@ -1294,6 +1551,12 @@ def main():
                 t_last_frame = now
                 img = sensor.snapshot()
                 n_frames += 1
+
+                # 每 5 秒打一次画面亮度：无靶时用它判断"是没看到靶还是判据问题"
+                if (target_det.lost > 0) and \
+                        (time.ticks_diff(now, t_diag) >= 5000):
+                    t_diag = now
+                    log_scene(img)
 
                 res = target_det.detect(img)
                 if (n_frames % SPOT_EVERY) == 0:
@@ -1332,23 +1595,60 @@ def main():
                 if (tgt_uv is not None) and (spot is not None) and \
                         (target_det.lost == 0):
                     lock_run += 1
+                    if lock_run > 5:
+                        lock_run = 5
                 else:
-                    lock_run = 0
+                    # ⚠ 2026-10-09：原来这里直接清零，而靶纸会闪断（忽锁忽丢），
+                    #   结果"连续 3 帧锁定"永远凑不齐 -> 偏置被冻住，云台停在
+                    #   不相干的位置。改成"缓慢衰减"：闪一两帧不影响闭环。
+                    if lock_run > 0:
+                        lock_run -= 1
                 err_u = (tgt_uv[0] - su) if tgt_uv is not None else 0.0
                 err_v = (tgt_uv[1] - sv) if tgt_uv is not None else 0.0
-                jumped = (last_err is not None) and \
-                    ((abs(err_u - last_err[0]) > 60.0) or
-                     (abs(err_v - last_err[1]) > 60.0))
-                if (lock_run >= 3) and (not jumped) and \
-                        (tgt_uv is not None) and (spot is not None):
+                # ⚠ 2026-10-08 删掉原来的"误差突跳>60px 就跳过更新"闸门：
+                #   它和 last_err 的刷新时机组合起来会死锁（抖动 -> 一直被挡 ->
+                #   last_err 永不刷新 -> 永远被挡），现场表现是"偏置冻在小值、
+                #   激光停在靶纸边缘"。现在改成在 AimCtrl 里做 EMA 滤波来抗抖，
+                #   不再用"跳过更新"这种会自锁的办法。
+                ok_now = (lock_run >= 2) and \
+                    (tgt_uv is not None) and (spot is not None)
+                if AUTO_SIGN_CAL and (not sign_cal.done()):
+                    # 开机先做方向自检：只动 ±4°，由它自己把 SIGN 定对，
+                    # 自检期间不让闭环积分（免得带错方向）。
+                    cy, cp, cal_on = sign_cal.step(now, err_u, err_v, ok_now)
+                    cal_yaw, cal_pit = cy, cp
+                    cal_active = cal_on
+                    ctrl.valid = False
+                    ctrl.locked = False
+                    if ok_now:
+                        last_err = (err_u, err_v)
+                elif ok_now:
+                    cal_active = False
                     ctrl.valid = True
                     ctrl.update(max(dt, 1e-3), err_u, err_v, att_rel)
                     last_err = (err_u, err_v)
                 else:
+                    cal_active = False
                     ctrl.valid = False
                     ctrl.locked = False
-                    if jumped:
-                        last_err = None
+                # ---- 丢靶安全返回：丢靶久了把偏置缓慢收回参考位 ----
+                if (not cal_active) and (target_det.lost > 0):
+                    if (target_det.lost * 40) >= LOST_RETURN_MS:   # ≈40ms/帧
+                        d_back = LOST_RETURN_DPS * max(dt, 1e-3)
+                        if ctrl.yaw > d_back:
+                            ctrl.yaw -= d_back
+                        elif ctrl.yaw < -d_back:
+                            ctrl.yaw += d_back
+                        else:
+                            ctrl.yaw = 0.0
+                        if ctrl.pitch > d_back:
+                            ctrl.pitch -= d_back
+                        elif ctrl.pitch < -d_back:
+                            ctrl.pitch += d_back
+                        else:
+                            ctrl.pitch = 0.0
+                        ctrl.i_u = 0.0
+                        ctrl.i_v = 0.0
 
                 # ---- 画到 IDE 画面 ----
                 if canvas is not None:
@@ -1385,7 +1685,7 @@ def main():
                         _display.show_image(img)
 
             # ---------- 5. 发 AIM（50Hz，保持链路活着）----------
-            if state in (ST_SET_ZERO, ST_TRACK) and \
+            if (not LOG_ONLY) and (state in (ST_SET_ZERO, ST_TRACK)) and \
                     time.ticks_diff(now, t_aim) >= (1000 // AIM_HZ):
                 t_aim = now
                 flags = 0
@@ -1396,9 +1696,16 @@ def main():
                 if state == ST_TRACK and LASER_ENABLE:
                     flags |= FLAG_LASER_ON
                 quality = 200 if ctrl.valid else 0
-                link.send(build_frame(MSG_AIM,
-                                      pack_aim(ctrl.yaw, ctrl.pitch,
-                                               flags, quality)))
+                if cal_active:
+                    # 方向自检中：直接下发试探偏置（±4°），并让 H723 应用它
+                    link.send(build_frame(
+                        MSG_AIM, pack_aim(cal_yaw, cal_pit,
+                                          FLAG_AIM_VALID | FLAG_LASER_ON,
+                                          200)))
+                else:
+                    link.send(build_frame(MSG_AIM,
+                                          pack_aim(ctrl.yaw, ctrl.pitch,
+                                                   flags, quality)))
 
             # ---------- 6. 终端打印 ----------
             if time.ticks_diff(now, t_print) >= DEBUG_PRINT_MS:
@@ -1420,13 +1727,17 @@ def main():
                     log("[%s] %.1ffps gz(state=%d fault=%d flags=0x%02X "
                           "yaw=%.1f pit=%.1f roll=%.1f ymot=%.1f pmot=%.1f "
                           "gz=%.1f/%.1f up=%dms) 靶=%s 命中%d/%d 光斑%d "
-                          "err=%.0f 偏置 yaw=%.1f pit=%.1f ok=%d crc=%d"
+                          "err=%.0f(eu=%.0f ev=%.0f) 偏置 yaw=%.1f pit=%.1f "
+                          "自适应[g=%.2f/%.2f s=%+.0f/%+.0f] ok=%d crc=%d"
                           % (ST_NAME[state], fps, gz["state"], gz["fault"],
                              gz["flags"], gz["yaw"], gz["pitch"], gz["roll"],
                              gz["ymotor"], gz["pmotor"], gz["gyro_y"],
                              gz["gyro_z"], gz["up_ms"], tgt_s,
                              n_hit, n_frames, n_spot, ctrl.err_px,
-                             ctrl.yaw, ctrl.pitch, parser.ok, parser.crc_err))
+                             ctrl.last_eu, ctrl.last_ev,
+                             ctrl.yaw, ctrl.pitch,
+                             ctrl.g[0], ctrl.g[1], ctrl.sg[0], ctrl.sg[1],
+                             parser.ok, parser.crc_err))
                 else:
                     log("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
                         % (ST_NAME[state], tgt_s,

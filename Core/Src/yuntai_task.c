@@ -89,6 +89,15 @@
  * 叠加残余零偏/静摩擦补偿就变成"朝一个方向匀速爬"，且视觉环也会过冲。
  * 改回 0：姿态与真实 1:1，各环增益回到设计值。
  * （=1 只是当年为了复现老版行为留的 A/B 开关，别再打开。） */
+/* ⚠ 2026-10-08 改回 0：地瓜派阶段的配置注释里明确写过（rdk_aim/configs/default.yaml
+ * "2026-09-27 真机实测修正"）：
+ *   这台云台 yaw 轴原本"命令 1° -> 实际转 ~2°"（姿态积分量只有真实的一半），
+ *   等于把视觉环路的等效增益放大 2~3 倍，必须先修成 1:1 才能整定伺服。
+ *   → 也就是这里必须是 0（AHRS 按真实 500Hz 积分）。
+ * 现场表现（=0 之前用 1 时）：偏置一给就冲过头、剩 40~50px 残余误差、
+ *   换算到纸面上的偏差随距离线性变大、抬升时像"没在调节"——正是增益过大的典型。
+ * 注意：止住 yaw 自转的是"静摩擦补偿=0 / YAW_ILIM=1.0 / 死区=0 / 关慢速零偏跟踪"
+ *   那几项（见下方定义），它们保留着，所以改回 0 不会再带回自转。 */
 #define AHRS_LEGACY_HALF_RATE      0
 /* 诊断开关（2026-10-08 现场"yaw 只上电就匀速朝一个方向转"）：
  *   =1 -> yaw 输出恒为 0（角度环、前馈、静摩擦补偿全部不发出力）
@@ -97,16 +106,16 @@
  *   · 电机停住        -> 是【环路在推】，去查 yaw 反馈链（IMU 轴/量程/极性）
  * 判定完请改回 0。 */
 #define YAW_DEBUG_FORCE_ZERO       0
-#define MOTOR_BOOT_DELAY_MS     2000u    /* 等驱动器上电自检：纯延时，不要改小 */
-#define CLOSED_LOOP_DELAY_MS     500u    /* 进闭环后等 0.5s */
-#define SET_MODE_DELAY_MS        500u    /* 切速度模式后等 0.5s */
+#define MOTOR_BOOT_DELAY_MS     1500u   /* 等驱动器上电自检（2000->1500，加快开机） */
+#define CLOSED_LOOP_DELAY_MS     300u   /* 进闭环后等（500->300） */
+#define SET_MODE_DELAY_MS        300u   /* 切速度模式后等（500->300） */
 /* 锁基准前的等待。⚠ 这里同时用来做【第二次陀螺零偏标定】，必须留够 1.5s：
  * 第一次标定是在"电机还没使能、轴是自由的"那 2 秒里做的，线缆扭力会让
  * 平台慢慢转，测出来的零偏里混进了这个转速 —— 于是之后环路会忠实地按
  * 这个假零偏匀速转（实测 1.1°/s、方向每次一样）。第二次在速度模式
  * （0 指令 = 轴被驱动器按住）下重测，才是干净的。 */
-#define LOCK_DELAY_MS           2000u    /* 1500ms 采零偏 + 500ms 余量 */
-#define LOCK_BIAS_CAL_MS        1500u    /* 第二次零偏采样时长 */
+#define LOCK_DELAY_MS           1200u   /* 800ms 采零偏 + 余量（2000->1200，加快开机） */
+#define LOCK_BIAS_CAL_MS         800u   /* 第二次零偏采样时长（500Hz 下仍有约 400 个样本） */
 
 /* ---- 节拍 ---- */
 #define IMU_PERIOD_MS              2u    /* 500Hz 读 IMU */
@@ -129,11 +138,16 @@
  *   用户现场看到的就是"靶子明明静止，水平电机自己在慢慢转"。
  *   现在压到 0.25 -> ki*ilim = 7.5rpm < 脱困转速：积分只能帮 P 精修，
  *   再也不可能靠自己把轴推动。 */
-#define YAW_ILIM                0.25f
+#define YAW_ILIM                1.0f    /* 退回 9.26 版取值（9.30 之后改小反而引出新问题） */
 /* 偏航角度误差死区（度）：小于它就把误差当 0，积分不再爬，
  * 避免"噪声让积分一点点攒起来 -> 轴慢慢爬"。 */
-#define YAW_DEADBAND_DEG        0.10f
-#define YAW_FF_RPM_PER_RADS     66.85f  /* 66.85 rpm per (rad/s) ≈ 7 倍理论抵消量，
+#define YAW_DEADBAND_DEG        0.0f    /* 退回 9.26 版：不加死区 */
+#define YAW_FF_RPM_PER_RADS     80.0f   /* 66.85 -> 80（2026-10-09）：现场"快速转底盘时
+                                         /* 激光慢一步"= 底座跟随不够快。前馈是唯一
+                                          * "不靠误差、直接跟底座转速"的通道，所以先加
+                                          * 这一项（KP 不动，遵守"一次只动一个数"）。
+                                          * 若出现抖/嗡，回调 66.85。原注释：66.85 rpm
+                                          * per (rad/s) ≈ 7 倍理论抵消量，
                                          * 故意过量才能保证越过静摩擦 */
 #define YAW_FF_SIGN            (-1.0f)
 
@@ -148,8 +162,18 @@
 /* ⚠ 补偿量故意取得保守（6rpm），而且**误差越大补得越多**（0.3~1 倍）。
  *   补太猛会让轴"一跳一跳"：这个值可以用 tools/tune_pitch.py 的
  *   PARAM 0x0B 在台架上在线加，找到刚好能推动又不抖的数再写回这里。 */
-#define YAW_STICTION_RPM         6.0f
-#define YAW_STICTION_DEADBAND_DEG 0.15f /* 小于这个角度误差就不补，防抖 */
+#define YAW_STICTION_RPM         2.0f   /* 折中值（2026-10-08）：先按 2rpm 试。
+                                         /* 置 0 -> 小指令完全推不动轴，现场会觉得
+                                          * "水平方向有死区"；置 6（9.30 那版）-> 误差
+                                          * 压不进死区时会被恒定 6rpm 一直推，表现为
+                                          * 上电后 yaw 朝一个方向匀速转。
+                                          * 2rpm 刚好够破静摩擦，又不会带着轴匀速跑；
+                                          * 台架上可再用 PARAM 0x0B 一档档（2/3/4）找
+                                          * 到"推得动又不抖"的值。 */
+#define YAW_STICTION_DEADBAND_DEG 0.30f /* 小于这个角度误差就不补（0.15 -> 0.30）。
+                                         /* 死区放宽是为了"不要在靶心附近持续补"：
+                                          * 残余误差只要 <0.3° 就完全不补 -> 不会像
+                                          * 9.30 那版那样一直以恒定转速推着轴走。 */
 
 /* ---- 俯仰：电机编码器位置环 + 陀螺前馈 ----
  * ⚠⚠ 比例增益的稳定上限（这条公式很重要，之前算错过一次，代价是"手一碰
@@ -357,6 +381,7 @@ static uint8_t    g_bias_cal;       /* 1 = 正在采陀螺零偏样本（见 gyr
 static float      g_yaw_err_rad;    /* 偏航角度环当前误差（rad），给零偏自校准判据用 */
 static uint8_t    g_yaw_stiction_on;/* 当前是否正在做静摩擦补偿（调试打印用） */
 static uint8_t    g_bias_by_rest;   /* 本次零偏修正是靠"平台自静止"判据进来的 */
+static uint8_t    g_lock_wait_logged;  /* "等编码器上报"只打一次日志 */
 static float      g_yaw_stiction_rpm = YAW_STICTION_RPM;  /* 可在线改（PARAM 0x0B）*/
 static float      g_yaw_ilim = YAW_ILIM;                  /* 可在线改（PARAM 0x0C）*/
 
@@ -681,6 +706,11 @@ static void gyro_bias_finalize(void)
 
 static void gyro_bias_track(void)
 {
+    /* 2026-10-08：退回 9.26 行为 —— 这一整套"慢速零偏自校准"是 9.30 之后新增的，
+     * 它会把残余零偏慢慢搬进 g_gyro_bias，一旦估计偏了，残余就被前馈放大成
+     * 恒定转速指令。9.26 版没有它、也是能用的，所以先整体关掉（保留开机的
+     * 两次标定不变）。 */
+#if 0
     static uint32_t quiet_ms = 0u;
     static uint32_t adapt_ms = 0u;
     static uint32_t total_ms = 0u;
@@ -786,6 +816,7 @@ static void gyro_bias_track(void)
         snprintf(buf, sizeof(buf), "[GYRO] bias tracked x=%s y=%s z=%s", bx, by, bz);
         gimbal_link_log(buf);
     }
+#endif
 }
 
 static void yuntai_imu_update(uint32_t now)
@@ -942,21 +973,8 @@ static void yuntai_control(uint32_t now)
         PID_Update(&g_yaw_pid, err, 0.0f, dt);
         /* 前馈：车体怎么转，前馈就让电机反向跟多少。
          * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。 */
-        /* ⚠ 2026-10-08：前馈对"残余陀螺零偏"极其敏感 —— 前馈增益是 66.85
-         * rpm/(rad/s)（约 7 倍过量），残余零偏 0.3°/s 就会被翻译成约 0.4rpm
-         * 的**恒定**指令，和静摩擦补偿合起来正好把轴推着朝一个方向匀速爬
-         * （现场现象："靶子静止，水平电机自己慢慢转，方向每次一样"）。
-         * 陀螺零偏跟踪（gyro_bias_track）本身有残余，所以这里再加一道死区：
-         * 只有明显在转动（>0.5°/s）时才让前馈出力。 */
-        {
-            float wz = gyro_c[2];
-            const float ff_dead = 0.0087f;        /* 0.5°/s */
-            if (fabsf(wz) < ff_dead)
-            {
-                wz = 0.0f;
-            }
-            yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * wz * g_yaw_ff_gain;
-        }
+        /* 退回 9.26 版写法：前馈不加死区 */
+        yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * gyro_c[2] * g_yaw_ff_gain;
 
         /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
         g_yaw_err_rad = err;                  /* 给零偏自校准的"静止判据"用 */
@@ -1333,7 +1351,22 @@ void yuntai_control_loop(void)
             jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
         }
         yuntai_read_feedback(now);
-        if ((now - g_state_ms) > LOCK_DELAY_MS)
+        /* ⚠ 2026-10-08 现场实测：上电头几秒编码器报文可能还没上来（驱动板晚使能/
+         * CAN 刚建链），若此刻就锁参考，俯仰参考会被锁成 0（日志里
+         * [REF] pitch_motor=0.00 + fault=1），之后俯仰环永远按 0 干活、前馈开路乱跑。
+         * 改成：**等两个轴的编码器都上报过**再锁参考；任一轴没上报就停在这里
+         * （云台保持不使能 = 安全），并把原因打出来。9.26 版没有这道判断。 */
+        if (((now - g_state_ms) > LOCK_DELAY_MS) &&
+            ((g_pitch_fb.seen == 0u) || (g_yaw_fb.seen == 0u)))
+        {
+            if (g_lock_wait_logged == 0u)
+            {
+                g_lock_wait_logged = 1u;
+                gimbal_link_log("[WAIT] 编码器未上报 -> 暂不锁定参考(云台保持不使能)");
+            }
+        }
+        if (((now - g_state_ms) > LOCK_DELAY_MS) &&
+            (g_pitch_fb.seen != 0u) && (g_yaw_fb.seen != 0u))
         {
             /* 注意用 g_* 当前值而不是宏：上位机可能在启动阶段就下发了新参数 */
             PID_Init(&g_yaw_pid,   YAW_KP,   YAW_KI,   YAW_KD,   YAW_OUT_RPM);
