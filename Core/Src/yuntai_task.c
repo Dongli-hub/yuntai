@@ -118,8 +118,20 @@
 #define LOCK_BIAS_CAL_MS         800u   /* 第二次零偏采样时长（500Hz 下仍有约 400 个样本） */
 
 /* ---- 节拍 ---- */
-#define IMU_PERIOD_MS              2u    /* 500Hz 读 IMU */
-#define CONTROL_PERIOD_MS          5u    /* 200Hz 控制 */
+#define IMU_PERIOD_MS              1u    /* 1000Hz 读 IMU（2026-10-10: 2->1）
+                                          * 陀螺本身是 1000Hz ODR，M7 完全跟得上；
+                                          * 姿态(AHRS)的采样频率会同步成 1000Hz
+                                          * （mahonySampleFreq = 1000/IMU_PERIOD_MS）。
+                                          * 收益：陀螺/姿态数据更新延迟再少 ~1ms。 */
+/* 控制周期：5ms(200Hz) -> 4ms(250Hz)，2026-10-10。
+ * 用户现场："转弯过快时云台跟不上底盘，转完才慢慢赶上来" —— 除了前馈加大，
+ * 把控制环本身跑快一点，也能直接减少"命令->执行"的采样延迟（相位滞后），
+ * 等于给同样的 PID 参数换来更多相位裕度。IMU 仍是 500Hz、CAN 每拍发一次
+ * （250Hz × 8 字节，总线毫无压力）。 */
+#define CONTROL_PERIOD_MS          2u    /* 500Hz 控制（2026-10-10: 4->2）
+                                          * 前馈/PID 每 2ms 算一次、CAN 每 2ms 发一次：
+                                          * "底盘动 -> 电机反出力"的采样延迟再砍一半
+                                          * （500Hz×2 电机×8 字节，CAN 总线毫无压力）。 */
 #define DEBUG_PERIOD_MS          500u    /* 慢速调试文本周期 */
 #define FB_WARN_PERIOD_MS       1000u    /* 反馈异常告警周期 */
 
@@ -128,9 +140,18 @@
  * 静摩擦脱困转速在 10rpm 量级，所以比例项在小误差时推不动电机，
  * 必须靠前馈（陀螺转速）先把电机"唤醒"，角度环只负责慢慢精修。
  */
-#define YAW_KP                 200.0f   /* rpm/rad */
-#define YAW_KI                  30.0f   /* rpm/(rad*s) */
-#define YAW_KD                  10.0f   /* rpm/(rad/s) */
+/* ⚠ 2026-10-10 现场：小车一动就丢靶 —— 除了 K230 偏置步长太小之外，
+ *   这里的角度环增益也偏软（KP=200rpm/rad ≈ 3.5rpm/°），跟移动目标时
+ *   稳态误差被放大。KP 200->260（≈4.5rpm/°），KI 略收（30->25）。
+ *   KD 10->3：D 项是加在【误差导数】上的，而 K230 的偏置是逐帧阶梯式更新的
+ *   （现在单帧最多 2.5°），误差会跟着一跳一跳 —— KD 大了每次都蹦出几十 rpm
+ *   的尖峰，表现就是"一边追一边抖"。D 只留一点点压超调。 */
+/* ⚠ 2026-10-10：用户明确"9.26 那版最灵敏、转弯不滞后"，所以 yaw 环参数
+ *   **恢复成 9.26 (stable-v1) 的原值**：KP=200 / KI=30 / KD=10。
+ *   我中间为了追"跟随慢"把它们改成 320/18/3，反而让瞬态特性偏离了已验证的那套。 */
+#define YAW_KP                 200.0f   /* rpm/rad（恢复 9.26 原值） */
+#define YAW_KI                  30.0f   /* rpm/(rad*s)（恢复 9.26 原值） */
+#define YAW_KD                  10.0f   /* rpm/(rad/s)（恢复 9.26 原值） */
 #define YAW_OUT_RPM             50.0f   /* 输出限幅；约 300°/s 的补偿能力 */
 /* ⚠ 2026-09-30 现场事故：这里原来是 1.0，而 ki=30 -> 积分单独就能给出 30rpm，
  *   是"能推动轴的最小转速"（≈10rpm）的 3 倍。后果：只要有一点点残余误差
@@ -142,14 +163,24 @@
 /* 偏航角度误差死区（度）：小于它就把误差当 0，积分不再爬，
  * 避免"噪声让积分一点点攒起来 -> 轴慢慢爬"。 */
 #define YAW_DEADBAND_DEG        0.0f    /* 退回 9.26 版：不加死区 */
-#define YAW_FF_RPM_PER_RADS     80.0f   /* 66.85 -> 80（2026-10-09）：现场"快速转底盘时
-                                         /* 激光慢一步"= 底座跟随不够快。前馈是唯一
-                                          * "不靠误差、直接跟底座转速"的通道，所以先加
-                                          * 这一项（KP 不动，遵守"一次只动一个数"）。
-                                          * 若出现抖/嗡，回调 66.85。原注释：66.85 rpm
-                                          * per (rad/s) ≈ 7 倍理论抵消量，
-                                         * 故意过量才能保证越过静摩擦 */
+/* 偏航前馈增益：rpm per (rad/s)。
+ * ⚠ 2026-10-10：恢复 9.26 原值 66.85（我中间加到 80/110，反而让瞬态不干净）。
+ *   前馈是"不靠误差、直接跟着底盘转速动"的通道 —— 转弯时顶住底盘靠它；
+ *   66.85 ≈ 7 倍理论抵消量（故意过量以越过静摩擦）。
+ *   若哪天出现"转弯时相机没顶住"，再往 80/110 试（一次只动一个数）。 */
+#define YAW_FF_RPM_PER_RADS     66.85f
 #define YAW_FF_SIGN            (-1.0f)
+
+/* ---- 偏航偏置的变化率限幅（2026-10-10 新增）----
+ * K230 的偏置是"处理完一帧跳一步"的阶梯信号（一帧最多 2.5°）。直接接到目标角上，
+ * 每一跳都会去激励 D 项和机构，现场表现就是"激光在靶心左右晃"。
+ * 这里把它摊成连续斜坡：AIM 时 250°/s（正常跟随几乎感觉不到），
+ * 退出 AIM 往 0 回时用 60°/s（慢慢回，不甩）。 */
+/* ⚠ 2026-10-10：也恢复 9.26 行为 —— 9.26 里偏置是"直接接上"、没有任何斜坡。
+ *   这里把速率放到 1000°/s（10° 阶跃 10ms 走完），等于关掉斜坡，但保留代码：
+ *   万一以后 K230 的偏置出现大跳变，把这两个数调小即可（一改一测）。 */
+#define YAW_TGT_RATE_DPS       250.0f
+#define YAW_RETURN_RATE_DPS     60.0f
 
 /* ---- 偏航静摩擦补偿（2026-09-30 新增）----
  * 现场逐帧实测：视觉环给出 1.5° 的目标变化时，平台 0.7 秒只走了 0.34° ——
@@ -162,14 +193,11 @@
 /* ⚠ 补偿量故意取得保守（6rpm），而且**误差越大补得越多**（0.3~1 倍）。
  *   补太猛会让轴"一跳一跳"：这个值可以用 tools/tune_pitch.py 的
  *   PARAM 0x0B 在台架上在线加，找到刚好能推动又不抖的数再写回这里。 */
-#define YAW_STICTION_RPM         2.0f   /* 折中值（2026-10-08）：先按 2rpm 试。
-                                         /* 置 0 -> 小指令完全推不动轴，现场会觉得
-                                          * "水平方向有死区"；置 6（9.30 那版）-> 误差
-                                          * 压不进死区时会被恒定 6rpm 一直推，表现为
-                                          * 上电后 yaw 朝一个方向匀速转。
-                                          * 2rpm 刚好够破静摩擦，又不会带着轴匀速跑；
-                                          * 台架上可再用 PARAM 0x0B 一档档（2/3/4）找
-                                          * 到"推得动又不抖"的值。 */
+/* ⚠ 2026-10-10：置 0 = **关闭静摩擦补偿**（恢复 9.26 行为）。
+ *   原因：这段补偿在 |err|>0.3° 且 |输出|<2rpm 时会**覆盖** PID+前馈的输出
+ *   （把精细指令换成恒定 ±2rpm 的"踢"），等于在靶心附近加了非线性 ——
+ *   9.26 那版没有它，实测更干净。真要再开，用 PARAM 0x0B 一档档试 2/3/4。 */
+#define YAW_STICTION_RPM         0.0f
 #define YAW_STICTION_DEADBAND_DEG 0.30f /* 小于这个角度误差就不补（0.15 -> 0.30）。
                                          /* 死区放宽是为了"不要在靶心附近持续补"：
                                           * 残余误差只要 <0.3° 就完全不补 -> 不会像
@@ -209,11 +237,19 @@
  *   一会儿跑出去，视觉环怎么调都收敛不了。
  *   在线把 KP 降到 8、KI 降到 20 之后，俯仰电机角立刻静如止水（跳变 0.0）。
  *   所以默认值改成安全预设。要更快再往上加，但"一次只动一个数"。 */
-#define PITCH_KP                 8.0f   /* rpm/deg；原 15，实测自激 */
-#define PITCH_KI                20.0f   /* rpm/(deg*s)；原 45，实测自激 */
-#define PITCH_KD                 0.10f  /* 编码器测速做一点阻尼；大了会被量化噪声放大 */
+#define PITCH_KP                12.0f   /* rpm/deg；2026-10-10 跟随移动目标：10->12
+                                         /* （8 迟钝、15 自激，12 是新的折中） */
+#define PITCH_KI                12.0f   /* rpm/(deg*s)；2026-10-10: 18->12。
+                                         /* 现场"持续上下晃"= 典型的积分+延迟低频振荡，
+                                          * 俯仰积分原来比偏航强 40 倍（18 vs 0.44 rpm/(deg·s)），
+                                          * 收到 12 之后再靠 D 压。 */
+#define PITCH_KD                 0.05f  /* 2026-10-10: 0.03->0.05（偏置已有斜坡，误差曲线连续，
+                                         /* 可以多给一点阻尼；再大就会放大编码器量化噪声） */
 #define PITCH_OUT_RPM          120.0f   /* 约 720°/s，够甩开了 */
-#define PITCH_ILIM               0.40f  /* 积分限幅；ki*ilim = 18rpm，
+#define PITCH_ILIM               0.70f  /* 积分限幅；2026-10-09：0.40 -> 0.70
+                                         /* ki*ilim = 14rpm > 脱困转速(约10rpm)，
+                                          * 这样积分才推得动轴，消掉"俯仰死区"。原注释：
+                                          * ki*ilim = 18rpm，
                                          * 要略大于脱困转速(约10rpm)才能顶住静摩擦，
                                          * 但又不能大到积分自己就能把输出顶满 */
 #define PITCH_DEADZONE_DEG       0.03f  /* 死区，抑制编码器量化噪声 */
@@ -377,6 +413,10 @@ static uint8_t    g_unwind_done;    /* 本次解绕是否已完成并重锁过�
 static uint8_t    g_prev_mode = 0xFFu;
 static float      g_yaw_cmd_rpm;
 static float      g_pitch_cmd_rpm;
+/* 实际接到目标角上的偏航偏置（做过变化率限幅，见 yuntai_control 里的说明） */
+static float      g_yaw_off_applied;
+/* 上一拍的偏置（用来算"视觉要求的转动速度"，见 yaw 前馈说明） */
+static float      g_yaw_off_prev;
 static uint8_t    g_bias_cal;       /* 1 = 正在采陀螺零偏样本（见 gyro_bias_accumulate） */
 static float      g_yaw_err_rad;    /* 偏航角度环当前误差（rad），给零偏自校准判据用 */
 static uint8_t    g_yaw_stiction_on;/* 当前是否正在做静摩擦补偿（调试打印用） */
@@ -613,6 +653,8 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 static void yuntai_lock_reference(void)
 {
     g_yaw_lock_rad      = imuAngle[0];       /* 绝对方位基准 */
+    g_yaw_off_applied   = 0.0f;              /* 偏置斜坡从 0 重新起步（防重锁时跳一下） */
+    g_yaw_off_prev      = 0.0f;              /* 前馈里的"视觉要求转速"也从 0 起 */
     g_pitch_plat_lock   = imuAngle[1];       /* 平台俯仰基准 */
     g_plat_dtheta       = 0.0f;              /* 平台俯仰变化量从 0 重新算 */
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
@@ -759,7 +801,10 @@ static void gyro_bias_track(void)
                                     (cmd->mode == GP_MODE_STAB));
         uint8_t by_rest = (uint8_t)(mode_ok &&
                                     (fabsf(g_yaw_err_rad) < 0.0087f) /* 0.5° */ &&
-                                    (fabsf(g_yaw_cmd_rpm) < YAW_STICTION_RPM));
+                                    /* ⚠ 这里原来借用 YAW_STICTION_RPM 当"指令很小"的
+                                     * 判据；现在静摩擦补偿关掉了(0)，借用它会永远不成立
+                                     * -> 零偏自校准的"平台自静止"通路失效。所以改成常数。 */
+                                    (fabsf(g_yaw_cmd_rpm) < 2.0f));
         uint8_t ok = (uint8_t)(quiet && (by_lock || by_rest));
         g_bias_by_rest = (uint8_t)(quiet && by_rest && !by_lock);
         if (!ok)
@@ -872,14 +917,16 @@ static void yuntai_control(uint32_t now)
     {
         g_prev_mode   = mode;
         g_unwind_done = 0u;
+        g_yaw_off_prev = g_yaw_off_applied;   /* 防模式切换后第一拍算出假的变化率 */
     }
 
-    /* ---- 主动查一次俯仰位置（20ms = 50Hz）----
+    /* ---- 主动查一次俯仰位置（10ms = 100Hz）----
      * 为什么不能只靠驱动器"主动上报"：上报周期由驱动器决定、我们看不见也改不了。
      * 一旦它偏慢（比如 50ms），位置环就等于多了 25~50ms 的纯延迟 ——
      * 位置环的自激（掰一下开始抖、手扶就稳）几乎都是这么来的。
-     * 主动查询把反馈延迟钉死在 20ms 以内，CAN 上这点流量完全不算什么。 */
-    if ((now - g_last_read_ms) >= 20u)
+     * 主动查询把反馈延迟钉死在 10ms 以内（2026-10-10: 20ms->10ms，跟随更跟手），
+     * CAN 上这点流量（100 帧/s × 8 字节）完全不算什么。 */
+    if ((now - g_last_read_ms) >= 10u)
     {
         g_last_read_ms = now;
         jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
@@ -963,7 +1010,23 @@ static void yuntai_control(uint32_t now)
          *   目标 = 上电锁定的绝对方位 + 偏置
          * 偏置只在 AIM 模式下生效；STAB/IDLE 时偏置恒为 0，
          * 也就是"保持上电时的朝向不动" —— 这是掉线后的安全行为。 */
-        float off_rad = (mode == GP_MODE_AIM) ? (cmd->yaw_offset_deg / rad2deg) : 0.0f;
+        /* ---- 偏置斜坡（见 YAW_TGT_RATE_DPS 说明）---- */
+        float off_cmd = (mode == GP_MODE_AIM) ? cmd->yaw_offset_deg : 0.0f;
+        {
+            float rate = (mode == GP_MODE_AIM) ? YAW_TGT_RATE_DPS
+                                               : YAW_RETURN_RATE_DPS;
+            float dmax = rate * dt;
+            if (off_cmd > (g_yaw_off_applied + dmax))
+            {
+                off_cmd = g_yaw_off_applied + dmax;
+            }
+            else if (off_cmd < (g_yaw_off_applied - dmax))
+            {
+                off_cmd = g_yaw_off_applied - dmax;
+            }
+            g_yaw_off_applied = off_cmd;
+        }
+        float off_rad = off_cmd / rad2deg;
         float err = angle_diff_rad(g_yaw_lock_rad + off_rad, imuAngle[0]);
         /* 死区：误差很小时不再驱动积分（防"慢慢爬"），见 YAW_DEADBAND_DEG */
         if (fabsf(err) < (YAW_DEADBAND_DEG / rad2deg))
@@ -972,9 +1035,24 @@ static void yuntai_control(uint32_t now)
         }
         PID_Update(&g_yaw_pid, err, 0.0f, dt);
         /* 前馈：车体怎么转，前馈就让电机反向跟多少。
-         * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。 */
-        /* 退回 9.26 版写法：前馈不加死区 */
-        yaw_rpm = g_yaw_pid.out + g_yaw_ff_sign * gyro_c[2] * g_yaw_ff_gain;
+         * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。
+         *
+         * ⚠ 2026-10-10 关键修正：IMU 装在【云台】上，gyro_z 测的是云台自己的
+         *   角速度 —— 分不清"底盘带着转"和"视觉让我们转"。
+         *   底盘转的那部分必须反着出力（抗扰）；可视觉要求的转动也被当成干扰
+         *   反向拖住，就变成"转弯结束回正时发飘、视觉跟得慢"。
+         *   所以这里把"视觉要求的转速"d(偏置)/dt 从陀螺里扣掉，前馈只反映底盘。
+         *   （9.26 那版没有这一项，这也是它为什么看着"更直接"的原因之一。） */
+        {
+            float off_rate = 0.0f;
+            if (dt > 1e-6f)
+            {
+                off_rate = (off_cmd - g_yaw_off_prev) / dt / rad2deg;  /* rad/s */
+            }
+            g_yaw_off_prev = off_cmd;
+            yaw_rpm = g_yaw_pid.out +
+                      g_yaw_ff_sign * (gyro_c[2] - off_rate) * g_yaw_ff_gain;
+        }
 
         /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
         g_yaw_err_rad = err;                  /* 给零偏自校准的"静止判据"用 */
