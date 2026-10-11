@@ -35,7 +35,22 @@
 #define GP_MAX_PAYLOAD     64u         /* 本工程最长的是 GIMBAL_STATE(21) 与 TEXT */
 
 /* ---------------- 消息 ID（与上位机 MsgId 一一对应） ---------------- */
-#define GP_MSG_AIM            0x10u    /* 下：瞄准偏置（100Hz，核心指令） */
+/* 2026-10-11 新架构：K230 只上报像素坐标，"像素->偏置"的计算挪到 H723
+ * （见 yuntai_task.c 的"视觉外环"）。AIM payload 布局：
+ *   [0..1] ut  [2..3] vt  [4..5] us  [6..7] vs  （u16 小端，像素）
+ *   [8]    flags  [9] quality
+ *   [10..11] kx100 = 像素/度 × 100（i16 小端）—— 可选，见下。
+ * ut/vt = 靶心像素，us/vs = 激光光斑像素。
+ *
+ * ⚠ 为什么要带 K（px/°）：K230 的处理分辨率是可切换的（640x480/800x600），
+ *   px/° 随分辨率同比变化（7.8 → 9.75）。外环的 e_deg = e_px / K，K 用错
+ *   25% 就等于把外环增益悄悄改了 25%（表现是"比之前更容易来回摆"）。
+ *   所以让 K230 每帧带着 K 走，换分辨率不用重烧 H723。
+ *   兼容：只有一个 10 字节 payload 的老上位机照样能跑 —— 这时用默认 7.8。
+ *         只认 10 字节的老固件遇到 12 字节帧也没事（多出来两个字节被忽略）。 */
+#define GP_MSG_AIM            0x10u    /* 下：视觉像素坐标上报（100Hz，核心指令） */
+#define GP_AIM_PAYLOAD_LEN    10u      /* AIM payload 长度（老格式：无 K） */
+#define GP_AIM_PAYLOAD_LEN_K  12u      /* AIM payload 长度（新格式：带 kx100） */
 #define GP_MSG_MODE           0x11u    /* 下：工作模式 */
 #define GP_MSG_HEARTBEAT      0x12u    /* 下：心跳 */
 #define GP_MSG_SET_ZERO       0x13u    /* 下：把当前朝向记为偏置零点 */
@@ -77,7 +92,16 @@
 /* 0x0C：偏航积分限幅。ki*该值 = 积分单独能给出的最大 rpm。
  *       必须小于"能推动轴的最小转速"（约 10rpm），否则轴会被积分推着慢慢转。 */
 #define GP_PARAM_YAW_ILIM        0x0Cu
-#define GP_PARAM_NUM             0x0Du
+/* 0x0D：视觉外环的 K（像素/度）。默认 7.8（= 640x480 档标定值）。
+ *       正常不用手动发 —— K230 每帧的 AIM 里带着 K（见 GP_AIM_PAYLOAD_LEN_K）。
+ *       留这个入口是为了排查："是不是 K 用错了" 时能在现场直接覆盖它试一把。 */
+#define GP_PARAM_VIS_K           0x0Du
+/* 0x0E / 0x0F：视觉外环的 KP / KD（1/s、秒）。这两个直接决定"回正快不快"：
+ *   外环是积分链 -> 闭环时间常数 τ = 1/KP（KP=2 时 0.5s，这就是"慢"的根源）。
+ *   现场够快/够稳的平衡点用这两个在线找，不用重烧（K230 的 PARAM_SEND 里填）。 */
+#define GP_PARAM_VIS_KP_YAW      0x0Eu
+#define GP_PARAM_VIS_KD_YAW      0x0Fu
+#define GP_PARAM_NUM             0x10u
 
 /* ---------------- 工作模式（GP_MSG_MODE） ---------------- */
 #define GP_MODE_IDLE       0u          /* 不使能、不控制（电机自由） */

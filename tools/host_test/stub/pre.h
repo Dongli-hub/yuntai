@@ -95,6 +95,9 @@ typedef struct
 /* 4) 用到的 HAL API（只声明） */
 uint32_t HAL_GetTick(void);
 HAL_StatusTypeDef HAL_UART_Transmit_IT(UART_HandleTypeDef *h, const uint8_t *d, uint16_t n);
+/* 阻塞发送：gimbal_link_init 的上电信标用它（真实签名带超时参数） */
+HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, const uint8_t *d,
+                                    uint16_t n, uint32_t timeout);
 HAL_StatusTypeDef HAL_UART_AbortTransmit(UART_HandleTypeDef *h);
 HAL_StatusTypeDef HAL_FDCAN_GetRxMessage(FDCAN_HandleTypeDef *h, uint32_t fifo,
                                          FDCAN_RxHeaderTypeDef *hdr, uint8_t *data);
@@ -119,6 +122,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h);
 /* 5) 用到的 HAL 宏 */
 #define __HAL_RCC_GPIOC_CLK_ENABLE()  do { } while (0)
 #define __HAL_UART_ENABLE_IT(h, it)   do { (void)(h); } while (0)
+#define __HAL_UART_DISABLE_IT(h, it)  do { (void)(h); } while (0)
 #define __HAL_UART_CLEAR_FLAG(h, f)   do { (void)(h); } while (0)
 #define __HAL_UART_GET_FLAG(h, f)     0u
 #define UART_IT_RXNE          0u

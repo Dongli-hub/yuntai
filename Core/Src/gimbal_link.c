@@ -91,8 +91,6 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 #define GL_WATCHDOG_MS       500u    /* AIM 断流多久后自动降级到 STAB */
 #define GL_LOG_PERIOD_MS     50u     /* 调试文本最快 20 条/s */
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
-#define GL_OFF_YAW_LIMIT     180.0f  /* 偏置安全限幅（防止上位机给飞了） */
-#define GL_OFF_PITCH_LIMIT   80.0f
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
 
 /* ========================== 缓冲区 ========================== */
@@ -294,32 +292,33 @@ void gimbal_link_log_force(const char *text)
 
 /* ========================== 收到一帧 ========================== */
 
-static float gl_clampf(float v, float lim)
-{
-    if (v > lim)
-    {
-        return lim;
-    }
-    if (v < -lim)
-    {
-        return -lim;
-    }
-    return v;
-}
-
 static void gl_handle_frame(uint32_t now_ms)
 {
     switch (s_parser.msg_id)
     {
     case GP_MSG_AIM:
-        if (s_parser.len >= 6u)
+        /* 2026-10-11 新架构：payload = ut vt us vs (u16×4 小端) + flags + quality
+         * ut/vt = 靶心像素，us/vs = 激光光斑像素；偏置由 yuntai_task 现算。
+         * 新上位机还会在后面带 2 字节 kx100 = 像素/度 ×100（分辨率可切换，
+         * K 跟着帧走）；只带 10 字节的老上位机照样收，vis_k_x100 保持 0
+         * -> 外环用默认 7.8。 */
+        if (s_parser.len >= GP_AIM_PAYLOAD_LEN)
         {
-            s_cmd.yaw_offset_deg   = gl_clampf((float)gp_get_i16(&s_parser.payload[0]) / 100.0f,
-                                               GL_OFF_YAW_LIMIT);
-            s_cmd.pitch_offset_deg = gl_clampf((float)gp_get_i16(&s_parser.payload[2]) / 100.0f,
-                                               GL_OFF_PITCH_LIMIT);
-            s_cmd.flags      = s_parser.payload[4];
-            s_cmd.quality    = s_parser.payload[5];
+            s_cmd.px_ut      = gp_get_u16(&s_parser.payload[0]);
+            s_cmd.px_vt      = gp_get_u16(&s_parser.payload[2]);
+            s_cmd.px_us      = gp_get_u16(&s_parser.payload[4]);
+            s_cmd.px_vs      = gp_get_u16(&s_parser.payload[6]);
+            s_cmd.flags      = s_parser.payload[8];
+            s_cmd.quality    = s_parser.payload[9];
+            if (s_parser.len >= GP_AIM_PAYLOAD_LEN_K)
+            {
+                s_cmd.vis_k_x100 = (uint16_t)gp_get_i16(&s_parser.payload[10]);
+            }
+            else
+            {
+                s_cmd.vis_k_x100 = 0u;      /* 老格式（10 字节）-> 用默认 K */
+            }
+            s_cmd.px_ms      = now_ms;
             s_cmd.laser      = (uint8_t)((s_cmd.flags & GP_AIM_LASER_ON) ? 1u : 0u);
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
             s_cmd.boost      = (uint8_t)((s_cmd.flags & GP_AIM_BOOST) ? 1u : 0u);
@@ -366,8 +365,6 @@ static void gl_handle_frame(uint32_t now_ms)
 
     case GP_MSG_SET_ZERO:
         s_zero_req      = 1u;
-        s_cmd.yaw_offset_deg   = 0.0f;
-        s_cmd.pitch_offset_deg = 0.0f;
         gl_send(GP_MSG_ACK, (const uint8_t[]){GP_MSG_SET_ZERO, 0u}, 2u);
         break;
 
@@ -576,8 +573,6 @@ void gimbal_link_poll(uint32_t now_ms)
         s_alive = 0u;
         s_cmd.mode             = GP_MODE_STAB;
         s_cmd.laser            = 0u;
-        s_cmd.yaw_offset_deg   = 0.0f;
-        s_cmd.pitch_offset_deg = 0.0f;
         s_last_log_ms = 0u;
         gimbal_link_log("[LINK] AIM 断流 -> 自动切 STAB + 关激光");
     }

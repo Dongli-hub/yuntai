@@ -12,10 +12,14 @@
 
 用法：
     cd D:\\STM32\\STM32projects\\yuntai2
-    python k230_aim\\tools\\pc_sim_main.py            # cv2 方案
-    python k230_aim\\tools\\pc_sim_main.py rects      # 原生 find_rects 方案
+    python k230_aim\\tools\\pc_sim_main.py
+
+（场景尺寸、死区、K 都从 main.py 里读/跟着算，所以改了 PROC_W/PROC_H 之后
+  这里不用动 —— 仿真跑通了就说明那两个分辨率下 main.py 的链路是自洽的。）
 """
+import io
 import os
+import re
 import struct
 import sys
 import time as real_time
@@ -28,8 +32,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 MAIN_PY = os.path.join(ROOT, "k230_aim", "main.py")
 
-IMG_W, IMG_H = 640, 480
-PX_PER_DEG = 430.0 * 3.14159265 / 180.0     # fx=430px 时，1° ≈ 7.5px
+
+def _read_proc_size():
+    """从 main.py 里读 PROC_W/PROC_H —— 仿真场景必须和真实处理分辨率一致，
+    否则 main.py 里那套"按 S_SCALE 缩放"的判据会全部对不上（手动同步迟早会忘）。"""
+    txt = io.open(MAIN_PY, encoding="utf-8").read()
+    w = int(re.search(r"^PROC_W\s*=\s*(\d+)", txt, re.M).group(1))
+    h = int(re.search(r"^PROC_H\s*=\s*(\d+)", txt, re.M).group(1))
+    return w, h
+
+
+IMG_W, IMG_H = _read_proc_size()
+S_SCALE = IMG_W / 640.0
+# fx=430px(640 档) 时 1° ≈ 7.5px；分辨率一换，px/° 同比缩放（和 main.py 的
+# VIS_K = 7.8*S 是同一个道理，只是这里用的焦距估值略小）
+PX_PER_DEG = 430.0 * S_SCALE * 3.14159265 / 180.0
 
 # ----------------------------------------------------------------------
 # 虚拟时间
@@ -73,23 +90,40 @@ sys.modules["ustruct"] = struct
 # ----------------------------------------------------------------------
 class Scene(object):
     def __init__(self):
-        self.tgt_u = 300.0
-        self.tgt_v = 240.0
-        self.spot_u = 330.0
-        self.spot_v = 250.0
+        # 基准点都按 S_SCALE 缩放：640x480 时就是 (300,240)/(312,252)
+        self.tgt_u = 300.0 * S_SCALE
+        self.tgt_v = 240.0 * S_SCALE
+        # 与 main.py 的 USE_FIXED_LASER / LASER_UV 保持一致（激光在画面里的固定位置）
+        self.spot_u = 312.0 * S_SCALE
+        self.spot_v = 252.0 * S_SCALE
 
     def render(self):
         img = np.full((IMG_H, IMG_W, 3), 190, np.uint8)
-        w, h, t = 200, 330, 20
+        w = int(200 * S_SCALE)
+        h = int(330 * S_SCALE)
+        t = int(round(20 * S_SCALE))
         x0 = int(self.tgt_u - w / 2)
         y0 = int(self.tgt_v - h / 2)
         cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (25, 25, 30), t)
-        cv2.circle(img, (int(self.spot_u), int(self.spot_v)), 5,
-                   (250, 190, 250), -1)
+        # 激光点：红边要够红（a>=25、b>=-20）才能过 SPOT_THRESHOLDS 第二档。
+        # 2026-10-11：原来的 (250,190,250) 算出来 b=-21，正好差 1 检不出来。
+        cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
+                   int(round(5 * S_SCALE)),
+                   (120, 120, 255), -1)
         return img
 
 
 SCENE = Scene()
+
+
+class FakeBlob(object):
+    """复现 CanMV blob 的下标访问：b[0..3]=x,y,w,h  b[4]=面积  b[5/6]=中心"""
+
+    def __init__(self, x, y, w, h, area):
+        self._v = (x, y, w, h, area, x + w // 2, y + h // 2)
+
+    def __getitem__(self, i):
+        return self._v[i]
 
 
 class FakeFrame(object):
@@ -145,30 +179,66 @@ class FakeFrame(object):
             out.append(R([(int(p[0][0]), int(p[0][1])) for p in approx]))
         return out
 
-    def find_blobs(self, thresholds, roi=None, merge=True,
+    def find_blobs(self, thresholds, roi=None, merge=True, margin=4,
                    pixels_threshold=3, area_threshold=3):
-        x, y = SCENE.spot_u, SCENE.spot_v
+        """仿真版 find_blobs：在合成场景上做真实 LAB 阈值分割。
+        2026-10-11：原来这里是个只认光斑的占位桩，导致仿真里"靶纸检测"
+        永远命中 0；现在按 CanMV 语义实现（阈值 -> ROI -> margin 合并 ->
+        连通域），PC 仿真才能真正跑通"视觉 -> 上报 -> 外环"整条链。"""
+        lab = cv2.cvtColor(self.np, cv2.COLOR_BGR2LAB)
+        L = lab[:, :, 0].astype(np.float32) / 2.55      # 0~100（同 CanMV）
+        A = lab[:, :, 1].astype(np.int16) - 128
+        B = lab[:, :, 2].astype(np.int16) - 128
+        mask = np.zeros(L.shape, np.uint8)
+        for (l0, l1, a0, a1, b0, b1) in thresholds:
+            m = ((L >= l0) & (L <= l1) & (A >= a0) & (A <= a1) &
+                 (B >= b0) & (B <= b1))
+            mask[m] = 255
         if roi is not None:
             rx, ry, rw, rh = roi
-            if not (rx <= x <= rx + rw and ry <= y <= ry + rh):
-                return []
+            keep = np.zeros_like(mask)
+            y1 = max(0, min(IMG_H, ry + rh))
+            x1 = max(0, min(IMG_W, rx + rw))
+            keep[max(0, ry):y1, max(0, rx):x1] = \
+                mask[max(0, ry):y1, max(0, rx):x1]
+            mask = keep
+        if merge and (margin > 0):
+            k = np.ones((2 * margin + 1, 2 * margin + 1), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        n, _labels, stats, _cents = cv2.connectedComponentsWithStats(mask, 4)
+        out = []
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < max(int(pixels_threshold), int(area_threshold)):
+                continue
+            out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
+                                int(stats[i, cv2.CC_STAT_TOP]),
+                                int(stats[i, cv2.CC_STAT_WIDTH]),
+                                int(stats[i, cv2.CC_STAT_HEIGHT]), area))
+        return out
 
-        class B(object):
-            def __init__(self, x, y):
-                self.v = (int(x) - 4, int(y) - 4, 9, 9)
+    def get_histogram(self, *a, **kw):
+        """仿真版直方图：用 OpenCV 的 Otsu 阈值冒充 CanMV 的
+        img.get_histogram().get_threshold().value()，让 PC 仿真也能走
+        main.py 新的 Otsu 阈值路径。"""
+        gray = cv2.cvtColor(self.np, cv2.COLOR_BGR2GRAY)
+        v, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-            def area(self):
-                return 50
+        class _P(object):
+            def __init__(self, val):
+                self._v = val
 
-            def __getitem__(self, i):
-                if i == 4:
-                    return 50
-                if i == 5:
-                    return self.v[0] + 4
-                if i == 6:
-                    return self.v[1] + 4
-                return self.v[i]
-        return [B(x, y)]
+            def value(self):
+                return self._v
+
+        class _H(object):
+            def __init__(self, val):
+                self._v = val
+
+            def get_threshold(self):
+                return _P(self._v)
+
+        return _H(int(v))
 
     def get_pixel(self, x, y):
         p = self.np[int(y), int(x)]
@@ -327,6 +397,18 @@ class FakeH723(object):
         self.ready = False
         self.aim_count = 0
         self.ack_count = 0
+        # 视觉外环状态（镜像 H723 固件 vis_outer_step 的数学，2026-10-11 新架构）
+        self.px_ut = 0
+        self.px_vt = 0
+        self.px_us = 0
+        self.px_vs = 0
+        self.aim_flags = 0
+        self.vis_k_x100 = 0            # AIM 尾部带的 K×100（0 = 没带）
+        self.px_ms = -1e9
+        self.vis_eu = 0.0
+        self.vis_ev = 0.0
+        self.vis_seen = False
+        self.vis_last_ms = -1e9
 
     def bind(self, uart):
         self.uart = uart
@@ -350,10 +432,16 @@ class FakeH723(object):
             self.on_frame(msg_id, payload)
 
     def on_frame(self, msg_id, payload):
-        if msg_id == 0x10 and len(payload) == 6:
-            y, p, flags, q = struct.unpack("<hhBB", payload)
-            self.cmd_yaw = y / 100.0
-            self.cmd_pitch = p / 100.0
+        if msg_id == 0x10 and len(payload) in (10, 12):
+            # 新架构（2026-10-11）：ut vt us vs (u16×4 小端) + flags + quality
+            # 12 字节版：尾部再带 kx100 = 像素/度 ×100（分辨率可切换）
+            (ut, vt, us, vs, flags, _q) = struct.unpack("<HHHHBB", payload[:10])
+            self.px_ut, self.px_vt = ut, vt
+            self.px_us, self.px_vs = us, vs
+            self.aim_flags = flags
+            if len(payload) >= 12:
+                self.vis_k_x100 = struct.unpack("<h", payload[10:12])[0]
+            self.px_ms = self.t * 1000.0
             self.laser = 1 if (flags & 0x01) else 0
             self.aim_count += 1
         elif msg_id == 0x11 and len(payload) >= 1:
@@ -364,6 +452,8 @@ class FakeH723(object):
         elif msg_id == 0x13:
             self.cmd_yaw = self.cmd_pitch = 0.0
             self.att_yaw = self.att_pitch = 0.0
+            self.vis_eu = self.vis_ev = 0.0
+            self.vis_seen = False
 
     def _send(self, msg_id, payload):
         body = struct.pack("<BBB", msg_id, 0, len(payload)) + payload
@@ -385,12 +475,43 @@ class FakeH723(object):
         if not self.ready and self.t > 1.0:
             self.ready = True
         dt = 0.02
+        # ---- 视觉外环（镜像 H723 固件 vis_outer_step）：像素误差 -> 偏置 ----
+        vid = (self.aim_flags & 0x02) != 0          # AIM_VALID
+        now_ms = self.t * 1000.0
+        if vid and (self.px_ms - self.vis_last_ms) > 1.0:
+            self.vis_last_ms = self.px_ms
+            eu = self.px_ut - self.px_us
+            ev = self.px_vt - self.px_vs
+            db = 3.0 * S_SCALE      # 死区也随分辨率缩放（同 H723 的 ks 做法）
+            if abs(eu) < db:
+                eu = 0.0
+            if abs(ev) < db:
+                ev = 0.0
+            if not self.vis_seen:
+                self.vis_eu, self.vis_ev, self.vis_seen = eu, ev, True
+            else:
+                self.vis_eu += 0.7 * (eu - self.vis_eu)
+                self.vis_ev += 0.7 * (ev - self.vis_ev)
+        if (self.mode == 2) and vid and \
+                ((now_ms - self.vis_last_ms) <= 150.0):
+            # K：优先用 AIM 帧带过来的（4~16 之间才算数），否则默认 7.8
+            k = self.vis_k_x100 / 100.0
+            if (k < 4.0) or (k > 16.0):
+                k = 7.8
+            ru = -4.0 * (self.vis_eu / k)            # VIS_SIGN*VIS_KP/K
+            rv = -3.0 * (self.vis_ev / k)
+            ru = max(-120.0, min(120.0, ru))
+            rv = max(-60.0, min(60.0, rv))
+            self.cmd_yaw = max(-120.0, min(120.0, self.cmd_yaw + ru * dt))
+            self.cmd_pitch = max(-20.0, min(20.0, self.cmd_pitch + rv * dt))
         tau = 0.12
         if self.mode == 2:
             self.att_yaw += (self.cmd_yaw - self.att_yaw) * dt / tau
             self.att_pitch += (self.cmd_pitch - self.att_pitch) * dt / tau
-        SCENE.tgt_u = 300.0 - self.att_yaw * PX_PER_DEG
-        SCENE.tgt_v = 240.0 - self.att_pitch * PX_PER_DEG
+        # 符号约定：偏置增大（att 跟着增大）-> 目标在画面里向正方向移。
+        # 只有这样 SIGN=-1 的外环才是负反馈（与现场收敛方向一致）。
+        SCENE.tgt_u = 300.0 + self.att_yaw * PX_PER_DEG
+        SCENE.tgt_v = 240.0 + self.att_pitch * PX_PER_DEG
         self.t += dt
         self.send_telemetry()
 
@@ -400,13 +521,10 @@ FAKE_H723 = None
 
 def run():
     global FAKE_H723
-    method = sys.argv[1] if len(sys.argv) > 1 else "cv2"
     FAKE_H723 = FakeH723()
     install_fake_modules()
 
     src = open(MAIN_PY, "r", encoding="utf-8").read()
-    src = src.replace('TARGET_METHOD = "rects"',
-                      'TARGET_METHOD = "%s"' % method)
     src = src.replace('DISPLAY_MODE = "VIRT"', 'DISPLAY_MODE = "OFF"')
 
     fake_t = [0.0]
@@ -421,7 +539,7 @@ def run():
     os.exitpoint = exitpoint2
 
     print("=" * 66)
-    print("PC 仿真：TARGET_METHOD=%s，最多 %d 个循环" % (method, MAX_ITERS))
+    print("PC 仿真：%dx%d，最多 %d 个循环" % (IMG_W, IMG_H, MAX_ITERS))
     print("=" * 66)
     try:
         exec(compile(src, MAIN_PY, "exec"), {"__name__": "__main__"})

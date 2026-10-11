@@ -23,7 +23,9 @@
 
 #include "main.h"
 
-/* 上位机下发的命令，yuntai_task 只读（内部已限幅） */
+/* 上位机下发的命令，yuntai_task 只读。
+ * 2026-10-11 新架构：K230 只给"像素坐标"，瞄准偏置由 H723 的视觉外环现算
+ * （见 yuntai_task.c），这里不再有 yaw/pitch_offset_deg 字段。 */
 typedef struct
 {
     uint8_t mode;              /* GP_MODE_xxx */
@@ -35,8 +37,10 @@ typedef struct
     uint8_t locked;            /* 上位机已锁定靶心 */
     uint8_t quality;           /* 0~255 跟踪质量 */
     uint8_t unwind_dps;        /* 解绕速度 (°/s)，来自 UNWIND 消息 */
-    float   yaw_offset_deg;    /* 偏航偏置（加在上电锁定值上） */
-    float   pitch_offset_deg;  /* 俯仰偏置 */
+    uint16_t px_ut, px_vt;     /* 靶心像素坐标（K230 上报） */
+    uint16_t px_us, px_vs;     /* 激光光斑像素坐标 */
+    uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
+    uint32_t px_ms;            /* 本帧到达时刻（视觉外环判"冻住"用） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */
 } GimbalCmd_t;
 
