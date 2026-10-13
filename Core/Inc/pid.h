@@ -19,6 +19,7 @@ typedef struct {
     float integral;     // 积分项
     float prev_error;   // 上一次误差
     float prev_measurement; // 上一次测量值
+    float d_filt;       // 微分滤波状态（一阶低通，见 PID_D_TAU_S）*/
 
     float output_limit; // 输出限幅
     float integral_limit; // 积分限幅

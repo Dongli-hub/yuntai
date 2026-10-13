@@ -123,15 +123,32 @@
                                           * 姿态(AHRS)的采样频率会同步成 1000Hz
                                           * （mahonySampleFreq = 1000/IMU_PERIOD_MS）。
                                           * 收益：陀螺/姿态数据更新延迟再少 ~1ms。 */
-/* 控制周期：5ms(200Hz) -> 4ms(250Hz)，2026-10-10。
- * 用户现场："转弯过快时云台跟不上底盘，转完才慢慢赶上来" —— 除了前馈加大，
- * 把控制环本身跑快一点，也能直接减少"命令->执行"的采样延迟（相位滞后），
- * 等于给同样的 PID 参数换来更多相位裕度。IMU 仍是 500Hz、CAN 每拍发一次
- * （250Hz × 8 字节，总线毫无压力）。 */
-#define CONTROL_PERIOD_MS          2u    /* 500Hz 控制（2026-10-10: 4->2）
-                                          * 前馈/PID 每 2ms 算一次、CAN 每 2ms 发一次：
-                                          * "底盘动 -> 电机反出力"的采样延迟再砍一半
-                                          * （500Hz×2 电机×8 字节，CAN 总线毫无压力）。 */
+/* 控制周期：5ms(200Hz) -> 4ms(250Hz) -> 2ms(500Hz) -> **1ms(1000Hz)**。
+ * ⚠ 2026-10-11 深夜(38)：用户对照参考代码提出 —— 他们也用 BMI088、跑 1kHz。
+ *   核对结果：我们的 IMU/AHRS **本来就已经是 1000Hz**（IMU_PERIOD_MS=1），
+ *   落后的是控制环（500Hz）。控制拍越快，"命令->执行"的采样延迟越小
+ *   （相位滞后按 周期/2 算），等于给同样的 PID 换来更多相位余量 —— 这正是
+ *   "顿挫/自激"最缺的东西。CAN 每拍发一次：1000Hz × 8 字节 ≈ 240kbps，
+ *   1Mbps 总线毫无压力；H723(550MHz) 的 1ms 预算里，BMI088 的 SPI 读 +
+ *   双轴 PID + 两路 CAN 发送大约只占 0.3~0.5ms，够用。 */
+#define CONTROL_PERIOD_MS          1u    /* 1000Hz 控制（2026-10-11: 2->1）
+                                          * dt 自动跟着变（dt = 该值/1000），
+                                          * 所以 PID 不用另外改。 */
+#define CONTROL_PERIOD_DEFAULT_MS  1u    /* 历史：500Hz(2ms) → 1kHz(1ms) → 退回
+                                          * 500Hz → **2026-10-13 再回到 1kHz**。
+                                          * （中间那次"1kHz 出问题"其实是状态寄存器
+                                          *   被反复重写的锅，已经修掉了。）
+                                           * 现在做成在线可调（PARAM 0x1C）：
+                                           *   200 = 2ms(500Hz)，100 = 1ms(1kHz，默认)，
+                                           *   500 = 5ms(200Hz)。改完立即生效。
+                                           * ⚠⚠ 2026-10-13（52 号日志："高频抖没了、
+                                           * 很流畅，但转底盘电机还有点跟不上"）：
+                                           * **默认从 2ms 改回 1ms**。当年"1kHz 出问题"
+                                           * （卡角度档位）后来查明是"状态寄存器被反复
+                                           * 重写"的锅（已修），与节拍无关；而现在的主要
+                                           * 矛盾是"底盘转动时顶不住"——采样延迟每减半，
+                                           * 同样增益就多一份相位余量，我们就能把"顶住
+                                           * 底盘"的力加回来而不重新引入高频抖。*/
 #define DEBUG_PERIOD_MS          500u    /* 慢速调试文本周期 */
 #define FB_WARN_PERIOD_MS       1000u    /* 反馈异常告警周期 */
 
@@ -149,10 +166,47 @@
 /* ⚠ 2026-10-10：用户明确"9.26 那版最灵敏、转弯不滞后"，所以 yaw 环参数
  *   **恢复成 9.26 (stable-v1) 的原值**：KP=200 / KI=30 / KD=10。
  *   我中间为了追"跟随慢"把它们改成 320/18/3，反而让瞬态特性偏离了已验证的那套。 */
-#define YAW_KP                 200.0f   /* rpm/rad（恢复 9.26 原值） */
-#define YAW_KI                  30.0f   /* rpm/(rad*s)（恢复 9.26 原值） */
-#define YAW_KD                  10.0f   /* rpm/(rad/s)（恢复 9.26 原值） */
-#define YAW_OUT_RPM             50.0f   /* 输出限幅；约 300°/s 的补偿能力 */
+/* ⚠⚠ 2026-10-12 对照参考代码后的结论（用户现场："转底盘不顶、一积累就猛甩"）：
+ *   参考代码（QGimbal）的角度环是 **一个 PID 直接出电流**：
+ *       kp = 5.0（软！）   kd = 110（极强）   ki = 0.1   输出限幅 ±1.65 A
+ *   也就是 **速率项（kd×角速度）为主、位置项只做慢修** —— 所以他们：
+ *       · 底盘一转，平台被"速率项"顶住（kd 大到一定饱和在 1.65A 的力矩上）；
+ *       · 位置误差攒大了也只是"软软地"修回来，不会像我们那样"猛甩一下"。
+ *   我们这边的问题正是**位置项太硬**：KP=200rpm/rad，30° 的滞后一乘就是
+ *   100rpm 的指令，电机当然"唰"地甩过去。
+ *   所以把 KP 从 200 降到 60（软修），KI 30->20，KD 保持（现在微分已加低通），
+ *   并且**三个都做成在线可调**（0x18/0x19/0x1A），现场一档档试。
+ *   "顶住底盘"这件事由速率阻尼(0x11) + 底盘转速前馈(0x12) 负责。*/
+/* ⚠⚠⚠ 2026-10-12 深夜（38 号日志复盘后）：**整段偏航内环参数回到 bf3bf46
+ *   "不脱靶追随" 那一版的原值**（KP=200 / KI=30 / KD=10 / 速率项 66.85）。
+ *   理由（不要再凭"参考代码更软"去改，除非现场数据说话）：
+ *     · bf3bf46 是**唯一被现场完整验证过**的版本：用户原话"自稳模式下我转动
+ *       底盘基本上看不到云台的位姿变化"（日志 31）+ 跑车 2 圈以上不掉靶；
+ *     · 38 号日志暴露的问题正好是**环路太软**：手推平台 12.3° 时指令只有
+ *       -16rpm（P 项 60×0.2rad），平台被人手按住 2~3 秒"顶不动"，积分一路
+ *       攒到限幅（KI×ILIM=20rpm），一松手就是一脚大摆 —— 这就是"攒-甩"。
+ *       bf3bf46 的等效速率项是 66.85rpm/(rad/s)（≈7 倍理论抵消量），手一推
+ *       立刻就是几十 rpm 的反力，根本攒不起来；而现在只剩 11（1.15 倍）。
+ *     · "阻尼 70 会抖"那条实测结论（日志 36/37）是在**别的组合**下得到的，
+ *       且当时前后还同时改着视觉/K230 侧；它不该被用来否定 bf3bf46 这套。
+ *   等价关系记一下（省的以后又绕晕）：
+ *       pid + (-1)×(damp×(gyro-off_rate) + match×off_rate)
+ *     = pid - damp×gyro + (damp-match)×off_rate
+ *   ⇒ 要复刻 bf3bf46：damp=66.85、match=0（上面的 off_rate 系数正好=66.85）。*/
+/* ⚠ 2026-10-13（52 号日志后）：200 → **300**。"转底盘时电机跟不上"是刚度不够：
+ *   刚度 = 角度环KP × 速率环Kp = 300×25 = 7.5 A/rad（原来 5.0，参考代码 5.0）。
+ *   注意**抬 KP 只加"位置刚度"、不加"速率反馈"**（速率反馈 = kp_rate×(damp+9.549)），
+ *   所以它不会把刚压下去的高频抖重新引回来 —— 这正是现在最该动的那一个旋钮。
+ *   0x18 在线可改（30000 = 300）。*/
+#define YAW_KP                 300.0f   /* rpm/rad（0x18 可在线改） */
+#define YAW_KI                  30.0f   /* rpm/(rad*s)（0x19） */
+#define YAW_KD                  10.0f   /* rpm/(rad/s)（0x1A；微分已加 5ms 低通） */
+/* ⚠ 2026-10-11 深夜(31)：50 -> 80 rpm（约 480°/s）。不改这个数的话，前馈
+ *   (66.85 rpm/(rad/s)) 在底盘转速 >43°/s 时**自己就把指令顶到限幅**，环路
+ *   退化成 bang-bang —— 掠射位姿下这种"一顿一顿"最要命。抬到 80 之后，
+ *   前馈保持线性到 ~69°/s 的底盘转速；真需要更快时电机自己会先饱和。
+ *   限幅同时是"跑飞保护"的一环，所以别超过电机实际能跟上的量级。*/
+#define YAW_OUT_RPM             80.0f   /* 输出限幅；约 480°/s 的补偿能力 */
 /* ⚠ 2026-09-30 现场事故：这里原来是 1.0，而 ki=30 -> 积分单独就能给出 30rpm，
  *   是"能推动轴的最小转速"（≈10rpm）的 3 倍。后果：只要有一点点残余误差
  *   （陀螺零偏残留、基准误差），积分就会顶到限幅、**把轴慢慢推着匀速转** ——
@@ -168,7 +222,87 @@
  *   前馈是"不靠误差、直接跟着底盘转速动"的通道 —— 转弯时顶住底盘靠它；
  *   66.85 ≈ 7 倍理论抵消量（故意过量以越过静摩擦）。
  *   若哪天出现"转弯时相机没顶住"，再往 80/110 试（一次只动一个数）。 */
-#define YAW_FF_RPM_PER_RADS     66.85f
+/* ⚠⚠⚠ 2026-10-11 深夜(36)：**拆成两个增益**（这是对照参考代码后的结论）。
+ *   现场(36) 40Hz 示踪的波形：误差慢慢涨到 -15~-36px，平台几乎不动，然后**猛地
+ *   跳 3.5~5.6°**（gz 40~70°/s），冲过头再反向 —— 典型"先攒后放"顿挫。
+ *   原因：我们的偏航环是**位置主导**（KP=200rpm/rad 很强、速率项只有一个 11），
+ *   平台只能靠"攒出角度误差"才动得起来。
+ *   参考代码恰恰相反 —— Gimbal_config.h 里：
+ *       GIMBAL_ANGLE_KP_YAW = 5.0    GIMBAL_ANGLE_KD_YAW = 110.0   (≈22 : 1)
+ *     也就是**角度环以速率项为主**，位置项只做精修；它的内环还是电流环
+ *     （4-5kHz 级），所以轴是"跟着速率平滑走"，不会攒-跳。
+ *   现在把速率项拆开，两个方向分开设：
+ *     ① 速率阻尼 damp×(gyro - 视觉要求转速)：抗扰、压抖，量级照参考给到 70
+ *        （≈7 倍理论量 9.55；旧代码里 66.85 那个数其实起的就是这个作用）
+ *     ② 视觉转速前馈 match×视觉要求转速：让平台"按视觉要求的速率走"，
+ *        不让它靠位置误差攒出来。match = 11 ≈ 1.15 倍理论抵消量，跟得准不过冲。
+ *   合起来就同时满足"平移台子跟得稳"和"偏置换向不冲"。*/
+/* ⚠⚠⚠ 2026-10-11 深夜(37)：阻尼 70 **被现场数据否掉了** —— 如实记下来：
+ *   37 号日志(1760 帧示踪) 对比：阻尼 70 时 |gz| 中位 7.9 / 90 分位 47.9、
+ *   误差符号翻转 3.18Hz；而 36 号（阻尼=前馈=11）是 2.9 / 25.8、1.5Hz。
+ *   也就是**阻尼越大，抖动越快越大**——原因：`damp×(gyro-off_rate)` 是**闭环
+ *   速率反馈**，而它脚下是驱动器的速度环（自带 50~100ms 迟滞）：增益 70 时
+ *   速率环增益 ≈ 70/9.55 = 7.3 倍，已经越过相位余量 -> 1.4~3Hz 自激。
+ *   参考代码能上 110 的 KD，是因为它的内环是**电流环**（几 kHz、几乎无迟滞）——
+ *   我们这条链路没有那个条件，只能把速率反馈压在 1~2 倍理论量。
+ *   ⇒ 回到 36 号那一版（11，实测最平滑）：damp 与 match 同值。*/
+/* ⚠ 2026-10-12 深夜：**回到 bf3bf46 的等效值**（damp=66.85、match=0）。
+ *   现式：pid - damp×gyro + (damp-match)×off_rate。 */
+#define YAW_FF_RPM_PER_RADS     0.0f    /* 视觉转速前馈（match；0x02 在线可改） */
+/* ⚠⚠ 2026-10-13（46 号日志："抖动幅度比原来大了"）—— 收回上一版的判断：
+ *   把阻尼从 66.85 收到 15 之后振幅反而变大，说明这一轴的抖动**不是高增益
+ *   速度反馈自激，而是"粘-滑"极限环**（静摩擦大：滑环）：
+ *     卡住 -> 误差攒 -> 脱困推力顶开 -> 冲过去 -> （阻尼不够，刹不住）-> 再卡住…
+ *   阻尼在这里的作用是"刹车"：要在一个滑动里刹住约 0.15Nm 的摩擦余量，需要
+ *     阻尼电流 ≈ 0.15Nm / (0.04Nm/A) = 3.75A 每 rad/s（滑动速度~1rad/s 时）
+ *   ⇒ damp×速率环Kp 必须回到 3A/(rad/s) 量级（66.85×50mA/rpm=3.34 ✓）。
+ *   所以阻尼**回到 66.85**；"高频小声"vs"低频大声"是同一现象的两端，
+ *   真正要压的是"冲过去的余量"——见下面自适应脱困补偿。*/
+/* ⚠⚠ 2026-10-13（51 号日志：用户把驱动器"力矩爬升率"改成 50Nm/s 后，"振动频率
+ *   非常之快"）—— 把所有证据拼起来，结论是：**我们的速率反馈比参考代码大一个
+ *   数量级，环路在 HF 上自激**。算一笔账（力矩模式）：
+ *     总共的速率反馈（A per rad/s）
+ *       = 速率环Kp × (damp + 9.549) / 1000          [阻尼项 + 速率环自身的速度反馈]
+ *     旧值：50 × (50 + 9.549)/1000 = 2.98 A/(rad/s)
+ *     参考代码（QGimbal）：kd≈110/1ms 步长 ⇒ 等效 **0.11 A/(rad/s)** —— 我们大 27 倍！
+ *   爬升率 5Nm/s 时它把这个自激"削平"成了 25Hz 的小幅抖；爬到 50Nm/s 之后
+ *   环路能自由响应，自激频率更高、更"刺耳" —— 这就是你听到的"频率非常之快"。
+ *   正解不是把爬升率调回去，而是把速率反馈降回参考量级：
+ *     kp_rate 50→25 mA/rpm（P 电流 = 25×角度环KP200 = **5.0 A/rad = 参考的 kp** ✓）
+ *     damp     50→12 rpm/(rad/s)  ⇒ 总速率反馈 = 25×(12+9.549)/1000 ≈ **0.54 A/(rad/s)**
+ *     ki       3→2（速率环积分，慢一点不碍事）
+ *   0x11/0x15/0x16 都可在线改。*/
+/* ⚠ 2026-10-13（52 号日志后）：12 → **18**。1kHz 控制把采样延迟砍半，
+ *   相位余量多出来一份，正好可以把这个"顶住底盘"的旋钮加回来一点：
+ *   总速率反馈 = 25×(18+9.549)/1000 ≈ 0.69 A/(rad/s)（参考 0.11，仍是同量级）。*/
+#define YAW_RATE_DAMP_RPM_PER_RADS 18.0f  /* 平台速率阻尼（damp；0x11 在线可改） */
+/* ⚠⚠ 2026-10-11 深夜(38)：**底盘转速前馈**（用户提醒后才补上的那一块）。
+ *   物理关系是恒等式：平台角速度(陀螺) = 底盘角速度 + 电机角速度
+ *   ⇒ 底盘角速度 = 陀螺 − 电机转速。而**电机转速驱动器一直在 CAN 回报里给**
+ *     （jc_parse_speed_reply 的 sp，之前解析出来直接丢掉了 ✗）。
+ *   有了它就能"预判"：底盘正要带着平台转起来的那一刻，直接把反向转速喂给电机，
+ *   平台几乎不动 —— 而不用等角度误差攒出来再反应（那正是"一顿一顿"的根源）。
+ *   理论增益：要让平台在世界上不动，motor_rpm = −ω_base/(2π/60) = −9.55×ω_base
+ *   ⇒ 默认 -9.55（负号是因为"电机转速为正 = 平台相对底盘正转"，要抵消底盘
+ *     的 +ω 就得让电机 −ω）。⚠ 符号依赖编码器/陀螺的方向约定，所以现场先试
+ *   **两个符号**：0x12 = -955 和 +955，哪个"平移台子时平台更稳"就用哪个。
+ *   默认 0 = 关（不冒风险），确认符号后写进默认值。*/
+/* ⚠⚠ 2026-10-12：**改成默认开启**（用户现场："转底盘时电机没有明显调节迹象，
+ *   一攒够就猛甩一下"）。算一下就清楚为什么必须开：
+ *     底盘匀速转 Ω 时，要让平台在世界里不动，电机必须以 −9.55Ω (rpm) 相对转动。
+ *     这个"稳态转速"只能由位置环的 P 项顶出来 —— KP=60 时
+ *         err = 9.55Ω/60 rad = 9.1°×(Ω/rad·s⁻¹)
+ *     底盘 30°/s ⇒ 平台要一直落后 ≈4.6° 才勉强匀速抵消；而"阻尼项"帮不上忙
+ *     （平台真被顶住时陀螺≈0，阻尼项自己就没有了）。这就是"不顶"。
+ *     本条前馈直接用测量值把稳态转速喂进去（前馈不经过反馈环 → 不会自激），
+ *     位置环只负责修残差 → 滞后≈0，松手也不再"猛甩回来"。
+ *   符号怎么来的：速度模式下已实测"正指令 → 平台正向转"，驱动器自报转速 sp 
+ *   与指令同号；陀螺正 = 平台同方向转 ⇒ base = 陀螺 − sp 的方向约定自洽，
+ *   所以增益取 −9.55（要抵消 +ω_base 就让电机 −ω）。
+ *   ⚠ 万一现场"转底盘反而更差/更晃"，一个参数就能退出：
+ *       (0x12, 0)    = 关掉（回到旧行为）
+ *       (0x12, 955)  = 反符号试试（若陀螺/编码器方向约定与上面不符）*/
+#define YAW_BASE_FF_RPM_PER_RADS (-9.55f)
 #define YAW_FF_SIGN            (-1.0f)
 
 /* ---- 偏航偏置的变化率限幅（2026-10-10 新增）----
@@ -197,6 +331,19 @@
  *   原因：这段补偿在 |err|>0.3° 且 |输出|<2rpm 时会**覆盖** PID+前馈的输出
  *   （把精细指令换成恒定 ±2rpm 的"踢"），等于在靶心附近加了非线性 ——
  *   9.26 那版没有它，实测更干净。真要再开，用 PARAM 0x0B 一档档试 2/3/4。 */
+/* ⚠⚠ 2026-10-11 深夜(34)：0 -> 3.0（**默认打开**）。现场日志(34) 峰值帧：
+ *   手转台子 ~30°/s 时，平台自己的陀螺在 2.2 / 24.2 / -9.3 / 16.7 / 64.9 之间
+ *   来回跳 —— 平台根本没能"稳住"，用户看到的就是"时而打中、时而大幅摆"。
+ *   这条静摩擦补偿治的是**小修正做不出来**：偏置只需要平台以 ~2°/s 慢转
+ *   （指令 0.33rpm），而轴能推动的最小转速 ≈10rpm -> 轴不动 -> 角度误差攒大
+ *   -> PID 输出过阈值时轴突然一跳 -> 冲过头 -> 误差反向 -> 粘-跳极限环。
+ *   ⚠ 实现方式改过：旧版是"把输出替换成 ±kick"（所以现场看到"一跳一跳"才被
+ *   关掉）；现在是**加**在上面（PID+前馈该怎么算还怎么算，只是"不够推得动"
+ *   时补一点）。现场用 PARAM 0x0B 一档档试 2/3/4，找到既不粘也不抖的值。*/
+/* ⚠ 2026-10-12 深夜：**回到 0（关）**，同 bf3bf46（那时也是 0）。
+ *   原因：它是"|错误|>0.3° 且 |输出|<3rpm 时把输出替换成 ±3rpm"的非线性踢腿；
+ *   在速率项 66.85 的强阻尼下基本用不上，却可能在过零点附近给环路添一个
+ *   相位不对的小方波（"一顿一顿"的老嫌疑之一）。要试就 (0x0B, 200~400)。*/
 #define YAW_STICTION_RPM         0.0f
 #define YAW_STICTION_DEADBAND_DEG 0.30f /* 小于这个角度误差就不补（0.15 -> 0.30）。
                                          /* 死区放宽是为了"不要在靶心附近持续补"：
@@ -237,13 +384,17 @@
  *   一会儿跑出去，视觉环怎么调都收敛不了。
  *   在线把 KP 降到 8、KI 降到 20 之后，俯仰电机角立刻静如止水（跳变 0.0）。
  *   所以默认值改成安全预设。要更快再往上加，但"一次只动一个数"。 */
-#define PITCH_KP                12.0f   /* rpm/deg；2026-10-10 跟随移动目标：10->12
+#define PITCH_KP                15.0f   /* rpm/deg；2026-10-14: 12->15（内环提速，
+                                         * 直接压"视觉外环 + 内环 50~100ms 滞后"
+                                         * 引起的 ~1Hz 慢摆；1kHz 下每拍增益
+                                         * 6×15×0.001=0.09，离发散门限还很远） */
                                          /* （8 迟钝、15 自激，12 是新的折中） */
 #define PITCH_KI                12.0f   /* rpm/(deg*s)；2026-10-10: 18->12。
                                          /* 现场"持续上下晃"= 典型的积分+延迟低频振荡，
                                           * 俯仰积分原来比偏航强 40 倍（18 vs 0.44 rpm/(deg·s)），
                                           * 收到 12 之后再靠 D 压。 */
-#define PITCH_KD                 0.05f  /* 2026-10-10: 0.03->0.05（偏置已有斜坡，误差曲线连续，
+#define PITCH_KD                 0.08f  /* 2026-10-14: 0.05->0.08（配合 KP 15 一起提速；
+                                         * 2026-10-10: 0.03->0.05（偏置已有斜坡，误差曲线连续，
                                          /* 可以多给一点阻尼；再大就会放大编码器量化噪声） */
 #define PITCH_OUT_RPM          120.0f   /* 约 720°/s，够甩开了 */
 #define PITCH_ILIM               0.70f  /* 积分限幅；2026-10-09：0.40 -> 0.70
@@ -258,6 +409,9 @@
 #define PITCH_TRAVEL_LIMIT_DEG  80.0f   /* 相对上电位置的行程软限位 */
 #define PITCH_TGT_RATE_DPS     150.0f   /* 俯仰目标角速率限幅（防饱和打摆，见控制里说明） */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
+/* 底盘转速前馈（0x12）用的偏航电机反馈新鲜度上限：反馈断流/过期就把前馈停掉，
+ * 免得拿着几十毫秒前的旧转速当"底盘在转"去给一脚。 */
+#define YAW_BASE_FF_FB_TIMEOUT_MS 50u
 #define PITCH_RUNAWAY_DEG       25.0f   /* 跟踪误差持续这么大 = 方向反了或卡死 */
 #define PITCH_RUNAWAY_MS       400u     /* 持续这么久就锁故障并降级 */
 
@@ -357,6 +511,7 @@ typedef enum
 #define FAULT_PITCH_FB_LOST     0x01u
 #define FAULT_PITCH_RUNAWAY     0x02u
 #define FAULT_YAW_FB_LOST       0x04u
+#define FAULT_YAW_RUNAWAY       0x08u   /* 力矩模式下陀螺超限（符号/量纲不对）*/
 
 /* 编码器反馈（含解卷绕，兼容"单圈 0~360"和"多圈连续"两种读数） */
 typedef struct
@@ -365,6 +520,10 @@ typedef struct
     float    prev;       /* 上一帧原始读数 */
     float    cont;       /* 解卷绕后的连续角（deg） */
     float    zero;       /* 锁零时的连续角 */
+    float    spd;        /* 电机转速（rpm，驱动器在上报里直接给的）——
+                          * ⚠ 2026-10-11 现场提醒："底盘转速不就在手上吗？"
+                          *   对：平台角速度(陀螺) = 底盘角速度 + 电机角速度，
+                          *   所以 **底盘转速 = 陀螺 - 本机转速**，驱动器一直在报。*/
     uint32_t t_ms;       /* 最近一次更新时间 */
     uint8_t  seen;       /* 是否收到过至少一帧 */
 } EncFb_t;
@@ -380,11 +539,13 @@ static YuntaiState g_state = YUNTAI_STATE_BMI088_INIT;
 static uint32_t    g_state_ms;      /* 当前状态的进入时刻 */
 static uint32_t    g_last_imu_ms;
 static uint32_t    g_last_ctrl_ms;
+static uint32_t    g_ctrl_period_ms = CONTROL_PERIOD_DEFAULT_MS; /* 在线可改 0x1C */
 static uint32_t    g_last_dbg_ms;
 /* 调试行交替开关：TEXT 单条上限 60 字符，[DBG]/[VIS] 两条轮着发 */
 static uint8_t     g_dbg_toggle;
 static uint32_t    g_last_fbwarn_ms;
 static uint32_t    g_last_read_ms;
+static uint32_t    g_last_hold_ms;  /* LOCK 阶段"按住两轴"的 0 速指令节拍 */
 static uint32_t    g_last_stat_ms;
 static float       g_gyro_bias[3];   /* 陀螺零偏（上电时在 MOTOR_BOOT 那 2s 里标定） */
 static float       g_gyro_sum[3];
@@ -392,6 +553,7 @@ static uint32_t    g_gyro_n;
 static uint8_t     g_cmd_sent;      /* 状态机里"只发一次"的指令是否已发 */
 static uint8_t     g_imu_ok;
 static uint32_t    g_bmi_retry;
+
 
 static PID_Controller g_yaw_pid;
 static PID_Controller g_pitch_pid;
@@ -415,6 +577,72 @@ static uint8_t    g_unwind_done;    /* 本次解绕是否已完成并重锁过�
 static uint8_t    g_prev_mode = 0xFFu;
 static float      g_yaw_cmd_rpm;
 static float      g_pitch_cmd_rpm;
+
+/* ---- 驱动器错误码（2026-10-12 新增）----
+ * 现场出现过"指令给着、电机就是不动、姿态卡在几个角度"，怀疑是驱动器进了保护。
+ * 手册 5.7 有现成的读法（0x43 / 寄存器 0x000C），所以每 2 秒读一次，变化就上报。*/
+static uint32_t g_yaw_err_code;
+static uint32_t g_pitch_err_code;
+static uint32_t g_yaw_err_prev = 0xFFFFFFFFu;   /* 上一次已上报的（初值取不可能值）*/
+static uint32_t g_pitch_err_prev = 0xFFFFFFFFu;
+static uint32_t g_last_err_read_ms;
+
+/* ---- 驱动器控制模式回读（2026-10-12，见 jc_read_mode 说明）----
+ * 驱动器重启会退回"位置梯形轨迹"，那时它不执行速度指令、只锁当前位置 —— 正好
+ * 是现场"顶不住/一跳一跳/指令无效"的样子。回读到不对（连续 2 次）就重写一次。*/
+static uint8_t  g_yaw_mode_bad_cnt;
+static uint8_t  g_pitch_mode_bad_cnt;
+static uint8_t  g_yaw_mode_rb = 0xFFu;    /* 最近回读到的模式（0xFF=还没读到）*/
+static uint8_t  g_pitch_mode_rb = 0xFFu;
+static uint8_t  g_yaw_loop_rb = 0xFFu;    /* 最近回读到的"闭环使能"状态 */
+static uint8_t  g_pitch_loop_rb = 0xFFu;
+static uint32_t g_last_mode_log_ms;
+
+/* ---- 偏航"指令不跟"监视（2026-10-12，见控制环里的说明）---- */
+static uint32_t g_yaw_stall_ms;
+static uint32_t g_last_stall_log_ms;
+
+/* ---- 原始反馈帧快照（2026-10-12）----
+ * 现场日志出现"指令 -80rpm、电机自报转速 0.0、位置却一跳 25~50°"，三种解释
+ * 都可能（驱动器没执行/自报字段不对/我们解析错），光看解析后的值分不清 ——
+ * 所以把最近一帧 0x2A 的**原始 8 字节**也打出来，一眼就能对账。 */
+static uint8_t  g_yaw_raw[8];
+static uint8_t  g_yaw_raw_len;
+static uint32_t g_yaw_raw_ms;
+static uint8_t  g_pitch_raw[8];
+static uint8_t  g_pitch_raw_len;
+static uint32_t g_pitch_raw_ms;
+static uint32_t g_last_raw_ms;
+static uint8_t  g_raw_toggle;
+
+/* ---- 电机响应测试（PARAM 0x1B=100 触发；见 gimbal_proto.h 说明）---- */
+static uint8_t  g_yaw_test_run;      /* 0=关，1=速度脚本，2=力矩脚本 */
+static uint32_t g_yaw_test_ms;
+static uint32_t g_yaw_test_log_ms;
+static float    g_yaw_test_ma;       /* 力矩脚本当前注入的电流（mA） */
+static uint8_t  g_yaw_torque_bak;    /* 力矩脚本启动前的模式设置（跑完恢复）*/
+/* ---- 力矩符号（±1）----
+ * 驱动器自报"正电流→正转"的方向约定，我们无法凭空假定；开机时用两次等幅反向
+ * 电流脉冲比一比（见 g_yaw_test_run==3 那段），判不出来就保持 +1，靠控制环里
+ * 那道 >3.5rad/s 的保命闸兜底。*/
+static float    g_torque_sign = 1.0f;
+static uint8_t  g_torque_sign_checked;   /* 开机只自动查一次 */
+static float    g_sign_int_plus, g_sign_int_minus;
+/* ---- 力矩指令下发节拍（2026-10-13，见控制环里的说明）----
+ * 用户实测（上位机）：**0.02Nm 就能让这一轴动** —— 说明轴很轻、之前"推不动"
+ * 不是摩擦，是**我们下发的力矩没落到电机上**。最大嫌疑：驱动器参数里的
+ * "**力矩爬升率 = 5.00 Nm/s**" —— 我们每 2ms 重写一次 0x0020，爬升斜坡被不停
+ * 重置，力矩永远爬不上去（2ms 只允许 0.01Nm）。上位机是单条指令，所以能动。
+ * 对策：把力矩指令按节拍下发（默认 20ms），让驱动器有时间爬到位；0x1E 可调
+ * （ms×100，0 = 关掉节流、恢复每拍都写）。*/
+/* ⚠ 2026-10-13（48 号日志）：**节流默认关掉（0）**。加上 20ms 节流之后抖动反而
+ *   更厉害 —— 它给力矩通路加了 0~20ms 的死延迟，而我们这条环的阻尼项在振动时
+ *   是饱和出力的，延时一大相位余量立刻变负。爬升率那条假设也被证伪：48 号日志里
+ *   20ms 节流下 ±6A 脉冲依旧推不动（两段积分 0.01°），而**正常闭环时电机其实
+ *   一直在驱动平台**（ym 与平台姿态同步摆动）。
+ *   保留 0x1E 只是为了必要时做对比实验。*/
+static uint32_t g_torque_wr_ms   = 0u;
+static uint32_t g_last_torque_wr_ms;
 /* 实际接到目标角上的偏航偏置（做过变化率限幅，见 yuntai_control 里的说明） */
 static float      g_yaw_off_applied;
 /* 上一拍的偏置（用来算"视觉要求的转动速度"，见 yaw 前馈说明） */
@@ -426,6 +654,9 @@ static uint8_t    g_bias_by_rest;   /* 本次零偏修正是靠"平台自静止"
 static uint8_t    g_lock_wait_logged;  /* "等编码器上报"只打一次日志 */
 static float      g_yaw_stiction_rpm = YAW_STICTION_RPM;  /* 可在线改（PARAM 0x0B）*/
 static float      g_yaw_ilim = YAW_ILIM;                  /* 可在线改（PARAM 0x0C）*/
+static float      g_yaw_kp = YAW_KP;                      /* 可在线改（PARAM 0x18）*/
+static float      g_yaw_ki = YAW_KI;                      /* 可在线改（PARAM 0x19）*/
+static float      g_yaw_kd = YAW_KD;                      /* 可在线改（PARAM 0x1A）*/
 
 /* ---- 运行时可改的当前参数值（GP_MSG_PARAM 改写的就是这些）----
  * 上电时用上面 #define 的默认值初始化；之后现场用 tools/tune_pitch.py 改，
@@ -435,6 +666,174 @@ static float      g_yaw_ilim = YAW_ILIM;                  /* 可在线改（PARA
  */
 static float g_yaw_ff_sign    = YAW_FF_SIGN;
 static float g_yaw_ff_gain    = YAW_FF_RPM_PER_RADS;
+static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x11 */
+/* ⚠⚠ 2026-10-12 现场(38 号日志)后**又改回默认关**：
+ *   38 号日志里 yaw 电机"指令 -16→-33rpm 时原地不动 2~3 秒，随后突然甩成
+ *   ±330°/s 的大摆动，最后停在一个角度上连 -43rpm 指令都不理" —— 事后复盘的
+ *   结论是：**在驱动器到底有没有执行我们的速度指令这件事被证实之前，不能再往
+ *   指令里叠任何"靠驱动器自报转速反推"的项** —— 所以才关了这么久。
+ * ⚠⚠ 2026-10-13 晚：**改成"电流域速度前馈"**：
+ *   · 数据源换成**电机位置差分**（位置是真实数据；驱动器自报 spd 在偏航上恒 0）；
+ *   · 前馈量 = 按底盘转速方向给一段**摩擦前馈电流**（平滑饱和于 0.3rad/s），
+ *     直接加在力矩输出上 —— 不走反馈环，所以不会自激；
+ *   · 物理依据：要让平台在世界里不动，电机必须反向以 w_base 转，而顶开静摩擦
+ *     约需 0.5A（用户上位机实测 0.02Nm 就能动）——这 0.5A 现在"提前"给出，
+ *     不用等角度误差攒出来。
+ * ⚠⚠⚠ 2026-10-14（54 号日志）：**默认重新关掉（0）**。用户从日志里抓到：
+ *   静止时 wb= 自己在 ±30°/s 来回翻（-28,-26,-32,+30,-27,+33）—— 这个估计器
+ *   分不清"底盘在转"与"平台自己在动"：平台一晃，陀螺立刻动，而位置差分估计
+ *   有延迟，两者相减就冒出一个假的"底盘转速"，前馈于是**变成正反馈**，越喂越振。
+ *   ⇒ 想再启用必须把估计器做得更慢（现在 τ≈50ms）并现场验证 wb= 静止时不翻。
+ *   默认 0 = 关；想试 (0x12, 50)；符号反了就发负值。*/
+static float g_yaw_base_ff    = 0.0f;
+static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
+static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
+static float   g_yaw_pos_last;                   /* 上一帧电机位置（deg） */
+static uint32_t g_yaw_pos_ms;                    /* 上一帧时间戳（0=还没初始化）*/
+/* 电机"类速度模式"用哪个控制模式值（写 0x0060）。**默认回到 1=速度模式**。
+ * ⚠ 2026-10-12 现场教训：上一版默认 0x05（低速大扭）后，用户单测自稳时
+ *   "转底盘时电机没有明显调节迹象、手晃有反抗、然后猛地转到别处定住" ——
+ *   这正是"电机在保持某个相对速度而不是在跟我们的指令"的表现。手册里 0x05
+ *   旁边还单列了"5.12 设置低速（寄存器 0x0027）"，完全可能 0x05 用的是
+ *   0x0027 里面的**固定低速**、而不是我们一直在写的 0x0021。
+ *   ⇒ 回到历史所有成功测试（含 bf3bf46 不脱靶追随）用的 0x01；想再试 0x05
+ *     就用 PARAM 0x13=5（配合观察，日志里 ym= 是驱动器自报转速，能直接看出
+ *     指令与转速是否还对得上）。 */
+static uint8_t g_speed_mode = JC_MODE_SPEED;
+/* ---- 偏航"力矩模式"（2026-10-12，手册 + 参考代码对照后的结果）----
+ * 手册《JC系列CAN通信说明》权威定义：
+ *   · 控制模式（寄存器 0x0060）：0=力矩 / 1=速度 / 2=位置梯形 / 3=位置滤波 /
+ *     4=位置直通 / 5=低速大扭  ✓（我们之前按上位机顺序推断的 0x05 是对的 ✓）
+ *   · 设置扭矩（寄存器 0x0020，命令字 0x2B）：数值 = Nm × 100 ✓
+ *   · 0x2A 回复：位置(24bit)+速度(16bit)+电流(16bit)，都 ×100 ✓ ——
+ *     我们 jc_parse_speed_reply 的解析与此一致 ✓
+ * 参考代码（QGimbal）内环就是"电流环"，参数：
+ *   GIMBAL_MAX_CURRENT  = 1.65 A        （输出限幅）
+ *   GIMBAL_SPEED_KP_YAW = 1.3e-2 A/rpm  （速率环 P）
+ *   GIMBAL_SPEED_KI_YAW = 3.9e-4 A/(rpm·s)
+ * 我们的电机：力矩常数 0.040 Nm/A（上位机读数）→ 1.65 A = 0.066 Nm。
+ * 于是力矩模式下我们固件自己接一个**速率环**：反馈 = IMU 陀螺（不是驱动器），
+ * 输出 = 电流(A) -> 力矩，正好复刻参考代码的结构。
+ * ⚠ 默认关闭（0）：力矩模式没有驱动器内环保护，符号/量纲一旦不对就是满力矩冲，
+ *   所以做成在线开关 0x14，台架上先看"手拧时平台稳不稳"再固化。*/
+/* ⚠⚠ 2026-10-12 深夜（42 号日志 + 用户明确要求）：**偏航默认改为力矩模式**。
+ *   依据：
+ *     · 41/42 号日志里偏航驱动器报 mode=1、err=0，但我们的速度指令它就是不执行
+ *       （转子相对定子不转、自报转速恒 0、电流只有 0.05~0.9A 的保持量），
+ *       而俯仰同配置却是好的 —— 说明"速度指令这条通道"在偏航上不通；
+ *     · 用户给的《JC系列CAN通信说明》写得清楚：力矩模式 = 写 0x0060=0，
+ *       力矩值 = 写寄存器 0x0020（Nm×100，命令字 0x2B），我们按这个实现；
+ *     · 参考代码（QGimbal）稳定环就是"角度环直接出电流"，本来也不走速度环。
+ *   于是偏航改成：驱动器收力矩指令，速率环（陀螺反馈）在固件里跑（见下面那段）。
+ *   ⚠ 想退回速度模式：(0x14, 0)。*/
+static uint8_t g_yaw_torque   = 1u;        /* 0=速度类模式 1=力矩模式（默认）*/
+#define TORQUE_ENGAGE_MS      500u         /* 力矩模式"软接入"时长（见控制环里说明） */
+static uint8_t  g_torque_prev   = 0u;      /* 上一拍是否在力矩模式 */
+static uint32_t g_torque_on_ms  = 0u;      /* 本次进入力矩模式的时刻 */
+/* ⚠ 2026-10-12 深夜(43 号日志)：速率环 P 13 → 25 → **50 mA/rpm**，限幅 1.65A
+ *   → **2.5A**。依据：
+ *     · 43 号日志的力矩符号自检：±1A（0.04Nm）脉冲下平台净转角只有 0.01° ——
+ *       说明这一轴"推不动"，原来的 1.65A=0.066Nm 量级不够；用户也反馈"掰的
+ *       时候反抗力变轻了"（就是我们能给出的最大力矩太小）；
+ *     · 增益换算：角度环 KP=200 rpm/rad × 速率环 50 mA/rpm = 10 A/rad
+ *       （参考代码角度环 kp=5 A/rad，我们取两倍左右，因为这一轴明显更"重"）；
+ *     · 电流上限 2.5A = 0.1 Nm。驱动器自己那台上位机的"输出限制"是 60A，
+ *       不会挡我们；电机"校准电流"用的就是 4.5A，2.5A 在合理范围。
+ *     ⚠ 热：长时间连续 2.5A 会让这个小电机温热，比赛跑长了可以 (0x17, 200)
+ *       收到 2.0A；测试阶段先用默认。
+ *   0x15/0x16/0x17 都可以在线改。*/
+/* ⚠⚠ 2026-10-13（51 号日志）：**降回参考量级 25 / 2.0**（推导见上面 damp 的注释）。
+ *   46→50/3.0 那次的结论（"粘滑不是自激"）是在**脱困补偿还是 4A 硬开关**的前提下
+ *   得到的；现在补偿已改成 2A/平滑自适应，硬非线性小得多，速率反馈就该按参考
+ *   代码的量级来配 —— 5.0A/rad 的刚度 + 0.54A/(rad/s) 的速率反馈。*/
+/* ---- 力矩模式"角度环直接出电流"的三个独立增益（2026-10-14 重写，见控制环里说明）
+ *   KPc 位置刚度：A/rad（0x15，值=A/rad×100）
+ *   KDc 速度反馈：A/(rad/s)（0x11，值=A/(rad/s)×100）—— 这条就是"速度前馈"的等价物
+ *   KIc 积分     ：A/(rad·s)（0x16，值=A/(rad·s)×100）
+ * 默认取值依据：
+ *   · KPc=6A/rad（参考代码 5，我们取 6；再大就靠 KDc 压）
+ *   · KDc=1.5A/(rad/s)（参考只有 0.11，但那是"无摩擦、无滑环"的轴；我们这一轴
+ *     需要强速度反馈才能顶住底盘拖动 —— 这正是一直想要的"速度前馈"）
+ *   · KIc=8A/(rad·s)（消静差；有脱困补偿兜底，不用更大）*/
+static float   g_tq_kp    = 6000.0f;   /* mA/rad（=6 A/rad；0x15）*/
+static float   g_tq_kd    = 2000.0f;   /* mA/(rad/s)（=2.0 A/(rad/s)；0x11）
+                                        * ⚠ 这条是"速度前馈"的等价物：速度模式当年的
+                                        * 前馈 66.85rpm/(rad/s) 之所以能顶住底盘，是因为
+                                        * 它脚下的驱动器速度环会给出"要多少电流给多少"；
+                                        * 我们这条是电流域的直接对应（0.08Nm/(rad/s)），
+                                        * 复查过相位余量：3ms 延迟下 25Hz 处环路增益只有
+                                        * 0.21，稳。嫌顶不住往 0x11=250/300 加，嫌抖往 100 收。*/
+static float   g_tq_ki    = 8000.0f;   /* mA/(rad·s)（=8 A/(rad·s)；0x16）*/
+static float   g_yaw_off_rate;         /* 视觉目标角速度（rad/s，AIM 才有）*/
+
+/* ---- 俯仰力矩模式——⚠⚠⚠ 2026-10-14 试过并**失败回退，默认关闭** ----
+ * 尝试：俯仰也搬进力矩模式、反馈用 IMU 俯仰（世界系，与偏航同构）。
+ * 58 号日志证伪了这条路：**IMU 装在俯仰轴下方（偏航平台上），它根本看不到
+ * 俯仰臂的运动** —— 现象是 `pmot` 自己转到 243° 停住、而 `pit` 一直纹丝不动
+ * （1.0°）。用 IMU 当俯仰的反馈 = 开环：积分一路涨、电机一头转到行程尽头，
+ * 现场就是"猛地向下、又猛地向上、毫无规律地晃"。
+ * ⇒ 俯仰的反馈**必须用电机自己的编码器**。
+ * ⚠⚠ 2026-10-14 二版（用户拍板的结构）：**目标值仍由 IMU 变化生成（平台补偿），
+ *   闭环反馈用编码器**，但内环从"驱动器那条 50~100ms 慢速度环"换成**我们自己的
+ *   1kHz 速率环**（反馈=驱动器自报的编码器转速，俯仰这一路它报得很准）。
+ *   即：位置环(15rpm/deg, 沿用) → 速率环(30mA/rpm) → 电流。*/
+static uint8_t g_pitch_torque = 1u;   /* 1=编码器反馈的力矩模式（默认）*/
+static float   g_ptq_kp   = 8000.0f;   /* mA/rad（0x05）*/
+static float   g_ptq_kd   = 1000.0f;   /* mA/(rad/s)（0x07）*/
+static float   g_ptq_ki   = 20000.0f;  /* mA/(rad·s)（0x06）*/
+static float   g_pitch_ilim_a = 3.0f;  /* 电流限幅 A（0x08）*/
+static float   g_pitch_tq_i;           /* 积分（mA）*/
+static float   g_pitch_iq_ma;          /* 最近输出（mA，给日志）*/
+static float   g_pitch_imu_lock;       /* 锁基准时的 IMU 俯仰（rad）*/
+static float   g_pbreak_i;             /* 俯仰脱困电流（A）*/
+static uint8_t g_pbreak_stuck, g_pbreak_want;
+/* 俯仰力矩模式的"速率环"（内环，1kHz）：把位置环输出的 rpm 变成电流。
+ * 转速反馈 = 驱动器自报的编码器转速（俯仰这一路可信）。*/
+static float   g_prate_kp = 30.0f;     /* mA/rpm */
+static float   g_prate_ki = 1.0f;      /* mA/(rpm·s) */
+static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32 Nm
+                                            * ⚠ 2026-10-13 由 2.5A 提到 6A：
+                                            * 43/44 号日志证明 ±0.08Nm 推不动这一轴
+                                            * （偏航带滑环，静摩擦大），而驱动器自己
+                                            * 的"输出限制"是 60A，不会挡我们。
+                                            * ⚠ 47 号日志后 6A → 8A：①从静止 ±6A 都
+                                            * 推不动（符号自检两段都 0.00°）⇒ 摩擦最大
+                                            * 的角度段需要更多；②"动的时候抖"要在一次
+                                            * 滑动里刹住，刹车（阻尼）也吃限幅。
+                                            * 8A=0.32Nm 仍是脉冲性质；嫌热 (0x17, 600)。*/
+/* ---- 力矩模式"脱困补偿"（2026-10-13）----
+ * 滑环静摩擦大：线性环路要产生 0.2Nm 需要十几度误差，那就没法瞄准了。
+ * 做法：误差超过死区、且平台几乎没在动时，**至少**往误差方向给这么多电流
+ * （A）；一旦动起来就交回线性环路精修。0x1D 可在线改（单位 A×100）。*/
+static float   g_yaw_stict_a  = 2.0f;      /* 脱困电流上限：A（0x1D）→ 0.08 Nm
+                                            * ⚠ 46 号日志：±4A 脉冲从静止推不动
+                                            * 这一轴（两段积分都 0.00°），而 6A 能动
+                                            * ⚠ 2026-10-13 又降回 3A：用户上位机实测
+                                            * "0.02Nm 就能动"，说明这一轴本身很轻；
+                                            * 补偿给太猛反而自己制造来回冲 —— 先按
+                                            * 温和值跑，不够再 (0x1D, 500)。*/
+/* ---- 自适应脱困补偿的斜坡率（见控制环里那段）----
+ * 固定偏置的两难：滑环静摩擦随角度变，固定 4A 在"好角度"上远大于需要
+ * （一顶就冲过去 = 粘滑的来源）；调小又在"坏角度"上推不动。
+ * 自适应版：卡着时以 8A/s 往上爬，一动/误差一小就以 30A/s 掉下来 ——
+ * 偏置总是"刚好够"，冲过头的余量最小。0x1D 只当上限用。*/
+#define YAW_BREAK_SLEW_A_PER_S    4.0f
+#define YAW_BREAK_DECAY_A_PER_S  30.0f
+/* ⚠⚠ 2026-10-13（53 号日志："手放到电机上能感到高频振动"）：
+ *   两个判据全部改成**施密特迟滞**。原来"误差>0.2° 且 平台速率<2.9°/s = 卡住"，
+ *   而稳态时平台速率就在 ±3°/s 附近飘、误差也在 0.2° 上下跳 —— 两个条件都贴着
+ *   阈值来回穿，补偿就以高频通断（4A/s 上、30A/s 下），电机跟着"嗡嗡"。
+ *   平台惯量大、姿态看不出在动，但手摸电机能明显感觉到。
+ *   迟滞之后，进入/退出只在明确跨门限时发生，中间不抖。*/
+#define YAW_BREAK_ERR_DEG       0.30f   /* 上沿：误差超过它才"想动"（°）*/
+#define YAW_BREAK_ERR_LO_DEG    0.12f   /* 下沿：误差低于它才放弃"想动" */
+#define YAW_BREAK_RATE_RADS     0.15f   /* 上沿：速率超过它才判"动起来"（8.6°/s）*/
+#define YAW_BREAK_RATE_LO_RADS  0.04f   /* 下沿：速率低于它才判"卡住"（2.3°/s）*/
+static float   g_break_i;                  /* 自适应脱困电流（A，0..上限）*/
+static uint8_t g_break_stuck;              /* 迟滞状态：1=卡住（正在脱困） */
+static uint8_t g_break_want;               /* 迟滞状态：1=误差够大、想动 */
+static float   g_rate_i       = 0.0f;      /* 速率环积分器（mA）*/
+static float   g_rate_iq_ma   = 0.0f;      /* 最近一次输出的电流（mA，给日志看）*/
 static float g_pitch_ff_sign  = PITCH_FF_SIGN;
 static float g_pitch_ff_gain  = PITCH_FF_RPM_PER_RADS;
 static float g_pitch_kp       = PITCH_KP;
@@ -565,8 +964,12 @@ static void laser_apply(uint8_t on)
  * ========================================================================== */
 
 /** 把原始读数解卷绕成连续角（无论驱动器给的是单圈 0~360 还是多圈连续值） */
-static void enc_update(EncFb_t *e, float raw, uint32_t now)
+static void enc_update(EncFb_t *e, float raw, float spd_rpm, uint32_t now)
 {
+    if (spd_rpm > -30000.0f)        /* 传 -32768 = 这一路没带转速 */
+    {
+        e->spd = spd_rpm;
+    }
     if (!e->seen)
     {
         e->raw  = raw;
@@ -615,17 +1018,80 @@ static void yuntai_read_feedback(uint32_t now)
     CanRxFrame_t f;
     float   pos;
     int16_t sp, cur;
+    uint8_t mb;
 
     /* 偏航总线（FDCAN1）：位置只用来做"绕线监视"和解绕，不参与稳定环 */
     while (can_bsp_get_frame(&hfdcan1, &f))
     {
         if (jc_parse_speed_reply(f.data, f.len, &pos, &sp, &cur))
         {
-            enc_update(&g_yaw_fb, pos, now);
+            /* ⚠ 驱动器回报的"速度"原始单位是 0.01rpm（与指令同量纲），
+             * 换算成 rpm 存进反馈里（下面算"底盘转速"要用它）。 */
+            enc_update(&g_yaw_fb, pos, (float)sp / 100.0f, now);
+            /* 留一份原始帧（[RAW] 日志用，见 globals 处说明） */
+            if (f.len >= 8u)
+            {
+                uint8_t i8;
+                for (i8 = 0u; i8 < 8u; i8++) g_yaw_raw[i8] = f.data[i8];
+                g_yaw_raw_len = 8u;
+                g_yaw_raw_ms  = now;
+            }
         }
         else if (jc_parse_position_reply(f.data, f.len, &pos))
         {
-            enc_update(&g_yaw_fb, pos, now);
+            enc_update(&g_yaw_fb, pos, -32768.0f, now);
+        }
+        else if (jc_parse_error_reply(f.data, f.len, &g_yaw_err_code))
+        {
+            /* 变化上报；非 0 时每个读周期（2s）都报一次，把上下文一起带上 ——
+             * "驱动器报了什么故障、当时指令/转速/位置各是多少"一次给全。 */
+            if ((g_yaw_err_code != g_yaw_err_prev) || (g_yaw_err_code != 0u))
+            {
+                char eb[80];
+                char c0[12], s0[12], p0[12];
+                g_yaw_err_prev = g_yaw_err_code;
+                fmt_f(c0, sizeof(c0), g_yaw_cmd_rpm, 0);
+                fmt_f(s0, sizeof(s0), g_yaw_fb.spd, 1);
+                fmt_f(p0, sizeof(p0), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 0);
+                snprintf(eb, sizeof(eb),
+                         "[MOTOR] yaw err=0x%08lX cmd=%s spd=%s ym=%s",
+                         (unsigned long)g_yaw_err_code, c0, s0, p0);
+                gimbal_link_log(eb);
+            }
+        }
+        else if (jc_parse_mode_reply(f.data, f.len, &mb))
+        {
+            uint8_t expect = (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                  : g_speed_mode;
+            g_yaw_mode_rb = mb;
+            if (mb == expect)
+            {
+                g_yaw_mode_bad_cnt = 0u;
+            }
+            else if (mb <= 5u)
+            {
+                g_yaw_mode_bad_cnt++;
+                /* ⚠ 2026-10-13：**只告警、不重写**（同 CLOSED_LOOP 处说明：
+                 * 运行期反复写会清掉驱动器内部状态）。*/
+                if (g_yaw_mode_bad_cnt >= 2u)
+                {
+                    g_yaw_mode_bad_cnt = 0u;
+                    {
+                        char eb[64];
+                        snprintf(eb, sizeof(eb),
+                                 "[MOTOR] WARN yaw mode=%u expect=%u",
+                                 (unsigned)mb, (unsigned)expect);
+                        gimbal_link_log(eb);
+                    }
+                }
+            }
+        }
+        else if (jc_parse_loop_state_reply(f.data, f.len, &mb))
+        {
+            g_yaw_loop_rb = mb;
+            /* ⚠ 2026-10-13：**只记录、不重写**（见卡死监视处的说明）。
+             * 这个回读值目前两个轴都读到 0（包括正常的俯仰），可信度存疑，
+             * 所以它只作为日志参考。*/
         }
     }
 
@@ -634,11 +1100,62 @@ static void yuntai_read_feedback(uint32_t now)
     {
         if (jc_parse_speed_reply(f.data, f.len, &pos, &sp, &cur))
         {
-            enc_update(&g_pitch_fb, pos, now);
+            enc_update(&g_pitch_fb, pos, (float)sp / 100.0f, now);
+            if (f.len >= 8u)
+            {
+                uint8_t i8;
+                for (i8 = 0u; i8 < 8u; i8++) g_pitch_raw[i8] = f.data[i8];
+                g_pitch_raw_len = 8u;
+                g_pitch_raw_ms  = now;
+            }
         }
         else if (jc_parse_position_reply(f.data, f.len, &pos))
         {
-            enc_update(&g_pitch_fb, pos, now);
+            enc_update(&g_pitch_fb, pos, -32768.0f, now);
+        }
+        else if (jc_parse_error_reply(f.data, f.len, &g_pitch_err_code))
+        {
+            if ((g_pitch_err_code != g_pitch_err_prev) ||
+                (g_pitch_err_code != 0u))
+            {
+                char eb[64];
+                g_pitch_err_prev = g_pitch_err_code;
+                snprintf(eb, sizeof(eb), "[MOTOR] pit err=0x%08lX",
+                         (unsigned long)g_pitch_err_code);
+                gimbal_link_log(eb);
+            }
+        }
+        else if (jc_parse_mode_reply(f.data, f.len, &mb))
+        {
+            g_pitch_mode_rb = mb;
+            {
+            uint8_t expect_p = (g_pitch_torque != 0u) ? JC_MODE_TORQUE
+                                                      : g_speed_mode;
+            if (mb == expect_p)
+            {
+                g_pitch_mode_bad_cnt = 0u;
+            }
+            else if (mb <= 5u)
+            {
+                g_pitch_mode_bad_cnt++;
+                if (g_pitch_mode_bad_cnt >= 2u)
+                {
+                    g_pitch_mode_bad_cnt = 0u;
+                    {
+                        char eb[64];
+                        snprintf(eb, sizeof(eb),
+                                 "[MOTOR] WARN pit mode=%u expect=%u",
+                                 (unsigned)mb, (unsigned)expect_p);
+                        gimbal_link_log(eb);
+                    }
+                }
+            }
+            }
+        }
+        else if (jc_parse_loop_state_reply(f.data, f.len, &mb))
+        {
+            g_pitch_loop_rb = mb;
+            /* 只记录、不重写（见偏航侧说明）*/
         }
     }
 }
@@ -691,13 +1208,27 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  *   ① 把瞬态闸门从"冻结"改成"软闸门"（见下）、② 加了饱和 anti-windup ——
  *   这两条就是当初把 KP 砍到 2.0 的原因（冲过头），现在它们没了。
  *   想再快/再稳：PARAM 0x0E（KP）、0x0F（KD）在线调，不用重烧。*/
-#define VIS_KP_YAW          6.0f     /* 1/s：每 1° 误差给出的偏置角速度 */
-#define VIS_KP_PITCH        4.0f
+/* ⚠ 2026-10-11 深夜(31)：用户要求"像自稳环一样看不见滞后"（掠射位姿下画面
+ *   变化最剧烈）。6.0 -> 12.0：跟随静差 = 目标角速度 / (KP/(1+KD))，翻倍后再
+ *   砍一半；稳定余量还很大（环路纯延迟 ≈ 视觉一帧 25ms，判据 KP·T < 1，
+ *   12×0.025 = 0.3，还有 3 倍余量）。想再快用 PARAM 0x0E 在线加。*/
+/* ⚠ 2026-10-11 深夜(32)：用户现场 —— 反应快了，但收敛时"快速左右振动"。
+ *   这是典型的相位余量不足（真正的滞后在执行机构：驱动器速度环 + 死区，
+ *   约 50~100ms，比视觉那 25ms 大）。加大 KD 正好两件事一起办：
+ *     ① 阻尼（相位超前）；② KD 同时是"目标速度前馈"（移动靶靠它）。
+ *   注意这个式子下 有效环路增益 ≈ KP/(1+KD)，所以 KP 跟着一起抬，
+ *   响应速度不掉：12/1.25 = 9.6  ->  14/1.45 = 9.7（一样快）+ 阻尼翻倍。*/
+/* ⚠ 2026-10-11 深夜(35)：14 -> 16，同时 KD 0.45 -> 0.60（用户："可以再加大 D"）。
+ *   现场 40Hz 示踪：误差以 **1.59Hz** 来回翻（81 次/51s），跟随时静差
+ *   = (1+KD)/KP × 目标角速度 —— 16/1.60 = 10.0，与上一版 14/1.45 = 9.66 相当
+ *   （速度不掉），但**超前量多了**（KD 从 0.45 到 0.60），压 1~2Hz 这种摆动更有效。*/
+#define VIS_KP_YAW          16.0f    /* 1/s：每 1° 误差给出的偏置角速度 */
+#define VIS_KP_PITCH        11.0f
 /* 微分阻尼（对应"微分滤波"：直接复用已经滤波的误差变化率 g_vis_rate_*）：
  *   rate += SIGN * KD * d(e_deg)/dt ，KD 单位 = 秒；置 0 = 关闭。
  * 作用：误差在快速收敛时提前"踩刹车"，压住过冲/来回摆。*/
-#define VIS_KD_YAW          0.20f
-#define VIS_KD_PITCH        0.15f
+#define VIS_KD_YAW          0.60f
+#define VIS_KD_PITCH        0.45f
 #define VIS_D_LIMIT_DPS     40.0f    /* 微分项限幅（°/s）：防图像噪声喂进来 */
 #define VIS_SIGN_YAW       -1.0f     /* 与原 K230 的 SIGN_YAW/PITCH 一致 */
 #define VIS_SIGN_PITCH     -1.0f
@@ -707,7 +1238,12 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_LIMIT_PITCH_DEG 20.0f
 #define VIS_FREEZE_MS       150u     /* 多久没有新帧 -> 冻住偏置 */
 #define VIS_DEADBAND_PX     3.0f     /* 像素死区（防图像噪声被积分） */
-#define VIS_EMA             0.7f     /* 像素误差一阶滤波（仅新帧到达时更新） */
+/* 像素误差一阶滤波：0.7 -> 0.8 -> 0.9（新帧才更新）。群延迟 =(1-α)/α×帧周期
+ * （帧周期 ≈30ms）：0.7→12ms、0.8→6ms、0.9→3ms。
+ * ⚠(37) 这条延迟直接决定"能用的环路增益上限"（相位余量），所以在
+ *   打不动执行机构迟滞的前提下，这里每削 3ms 都是白赚的。
+ *   0.9 的代价是误差噪声多一点；配合 3px 死区 + 速率滤波已经够用。*/
+#define VIS_EMA             0.9f
 /* ---- 瞬态闸门（2026-10-11 移植自原 K230 侧，治"直角弯甩靶"）----
  * 现场（21 号日志）：过直角弯时平台被底盘拖着转，视觉误差瞬间冲到 40~50px；
  * 旧外环把这段"转弯滞后"当真实误差积分，2 秒就把偏置卷到 40°+（平台绝对
@@ -722,11 +1258,26 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  *   现在把它改成"软闸门"：触发时把偏置速率压到 VIS_GATE_SOFT（25%），
  *   而不是清零。既保留"转弯时不拿假误差卷偏置"的保护（再加上面的
  *   anti-windup 兜底），又不把跟随掐死。*/
-#define VIS_GATE_PX_S      120.0f    /* 像素误差变化率闸门（px/s）：80->120 */
-#define VIS_GATE_DPS        35.0f    /* 平台自转角速度闸门（°/s） */
-#define VIS_GATE_FREEZE_MS  200.0f
-#define VIS_GATE_OPEN_MS    300.0f
-#define VIS_GATE_SOFT        0.25f   /* 软闸门：触发期间偏置速率 ×0.25 */
+#define VIS_GATE_PX_S      600.0f    /* 像素误差变化率闸门（px/s）：80->120->600
+                                      * 为什么放到 600：现场日志(29) 里"手一动
+                                      * 整个台子"的合法快速跟随有 400~500px/s，
+                                      * 120 会把**正常跟随**也压到 25% 速率
+                                      * （日志里 1/3 的采样时刻在软闸门里）。
+                                      * 600px/s ≈ 15px/帧 @40fps —— 真目标单帧
+                                      * 跳这么多不可能是跟随（那是误检/换目标），
+                                      * 而"被甩"这种转折由下面的陀螺闸门兜底。*/
+/* ⚠⚠ 2026-10-11 深夜(33) 第三次改 —— 用户："转弯时振动特别严重，一顿一顿"。
+ *   原因就是上面这套**脉冲式**软闸门：它按"触发 200ms / 放行 300ms"的节拍
+ *   把环路增益在 14 和 3.5 之间来回切 —— 增益以 ~2Hz 方波跳动，平台自然
+ *   "一顿一顿"。而触发它的陀螺门限 35°/s 恰好就是转弯时最常出现的值。
+ *   现在换成**连续缩放**（不再有任何时间窗/脉冲）：
+ *       因子 = 1 / (1 + 超限倍数)
+ *     gyro 超过 VIS_GATE_DPS 的倍数、像素速率超过 VIS_GATE_PX_S 的倍数，
+ *     两者各算一个因子取小的。超限越多压得越狠（平滑、无节拍），
+ *     正常情况下（不超限）= 1.0，一点不影响灵敏度。
+ *   "被甩时不要把假误差卷进偏置"的保护还在：①这个连续缩放；②偏置
+ *   anti-windup（指令顶限幅时不再往同方向涨）。参考代码里没有这一层。*/
+#define VIS_GATE_DPS        35.0f    /* 平台自转角速度门限（°/s） */
 
 static float    g_vis_eu, g_vis_ev;              /* 滤波后的像素误差 */
 static float    g_vis_yaw_off, g_vis_pitch_off;  /* 外环输出：偏置（度） */
@@ -734,11 +1285,19 @@ static uint32_t g_vis_last_ms;                   /* 已处理的帧时间戳 */
 static uint8_t  g_vis_seen;                      /* 是否已收到过有效帧 */
 static float    g_vis_rate_u, g_vis_rate_v;      /* 误差变化率（px/s，滤波） */
 static float    g_vis_eu_prev, g_vis_ev_prev;    /* 上一帧原始误差 */
-static float    g_vis_gate_freeze_ms;            /* 瞬态闸门：冻结剩余(ms) */
-static float    g_vis_gate_open_ms;              /* 瞬态闸门：强制放行剩余(ms) */
+static float    g_vis_gate_scale = 1.0f;         /* 瞬态连续缩放因子（1=不限制） */
 static float    g_vis_k_override = 0.0f;         /* 手动覆盖 K（GP_PARAM_VIS_K，0=不覆盖） */
 static float    g_vis_kp_yaw = VIS_KP_YAW;       /* 可在线改（PARAM 0x0E） */
 static float    g_vis_kd_yaw = VIS_KD_YAW;       /* 可在线改（PARAM 0x0F） */
+/* ⚠ 2026-10-14（56 号联调日志："整体可以，但晃动比较厉害"）：
+ *   逐行看像素差，晃动**几乎全在俯仰轴**：竖直分量周期性地甩到 ±40~58px
+ *   （≈±5~8°），水平分量只有 ±6px。俯仰的视觉外环原来是**编译期常量**
+ *   （KP=11/s、KD=0.45），没有在线旋钮 —— 所以先把它做成可调并默认软化：
+ *     KP 11→6（外环交叉频率 ≈1.75Hz 太贴近俯仰内环带宽，是"内外环打架"的典型），
+ *     KD 0.45→0.7（补阻尼）。分别用 0x1F / 0x20 在线改。*/
+static float    g_vis_kp_pitch = 4.5f;           /* 可在线改（PARAM 0x1F） */
+static float    g_vis_kd_pitch = 0.85f;          /* 可在线改（PARAM 0x20） */
+static float    g_yaw_out_rpm = YAW_OUT_RPM;     /* 可在线改（PARAM 0x10） */
 /* 偏航指令是否已经贴着限幅（+1/-1/0），给下面的视觉偏置做 anti-windup。
  * 现场日志(25)：被扰动那 2 秒里 Yc 一直贴在 ±48（限幅 ±50），而视觉偏置
  * 还在往同一方向涨到 ±24° —— 平台已经满舵了，再加偏置只会"攒账"，
@@ -777,8 +1336,7 @@ static void vis_outer_reset(void)
     g_vis_rate_v = 0.0f;
     g_vis_eu_prev = 0.0f;
     g_vis_ev_prev = 0.0f;
-    g_vis_gate_freeze_ms = 0.0f;
-    g_vis_gate_open_ms = 0.0f;
+    g_vis_gate_scale = 1.0f;
 }
 
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
@@ -837,27 +1395,31 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
     {
         return;             /* 冻住偏置：不积分、不清零 */
     }
-    /* ---- 瞬态闸门（软闸门，见宏说明）：转弯/被甩时把偏置速率压到 25% ---- */
+    /* ---- 瞬态"连续"缩放（见宏说明）：超限越多压得越狠，没有任何时间窗 ----
+     * 旧版是"触发就冻/按 200ms+300ms 的节拍压到 25%"，那是平台"一顿一顿"
+     * 的直接来源（环路增益被切成方波）。现在只用瞬时量算比例：
+     *   因子 = 1 / (1 + 超限倍数)，两个判据各算一个取小。不超限 = 1.0。*/
     float gate_scale = 1.0f;
-    if (g_vis_gate_open_ms > 0.0f)
     {
-        g_vis_gate_open_ms -= dt * 1000.0f;     /* 强制放行期：正常积分 */
-    }
-    else if (g_vis_gate_freeze_ms > 0.0f)
-    {
-        g_vis_gate_freeze_ms -= dt * 1000.0f;
-        if (g_vis_gate_freeze_ms <= 0.0f)
+        float r_lim = VIS_GATE_PX_S * ks;
+        float r_max = fabsf(g_vis_rate_u);
+        if (fabsf(g_vis_rate_v) > r_max)
         {
-            g_vis_gate_open_ms = VIS_GATE_OPEN_MS;  /* 冻完强制放行一段 */
+            r_max = fabsf(g_vis_rate_v);
         }
-        gate_scale = VIS_GATE_SOFT;   /* 软闸门：慢下来，但不掐死 */
-    }
-    else if ((fabsf(g_vis_rate_u) > (VIS_GATE_PX_S * ks)) ||
-             (fabsf(g_vis_rate_v) > (VIS_GATE_PX_S * ks)) ||
-             (fabsf(gyro_z_dps) > VIS_GATE_DPS))
-    {
-        g_vis_gate_freeze_ms = VIS_GATE_FREEZE_MS;
-        gate_scale = VIS_GATE_SOFT;   /* 触发即慢下来 */
+        if (r_max > r_lim)
+        {
+            gate_scale = r_lim / r_max;         /* 1/(1+倍数) 的等价写法 */
+        }
+        float g_abs = fabsf(gyro_z_dps);
+        if (g_abs > VIS_GATE_DPS)
+        {
+            float gs = VIS_GATE_DPS / g_abs;
+            if (gs < gate_scale)
+            {
+                gate_scale = gs;
+            }
+        }
     }
     /* ---- 500Hz 连续积分出偏置（P + 微分阻尼，见宏说明）---- */
     {
@@ -865,12 +1427,12 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float dv_dps = clampf(g_vis_rate_v / k, -200.0f, 200.0f);
         float du_d = clampf(g_vis_kd_yaw * du_dps,
                             -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
-        float dv_d = clampf(VIS_KD_PITCH * dv_dps,
+        float dv_d = clampf(g_vis_kd_pitch * dv_dps,
                             -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
         float ru = gate_scale * VIS_SIGN_YAW * (g_vis_kp_yaw * (g_vis_eu / k) +
                                                 du_d);
         float rv = gate_scale * VIS_SIGN_PITCH * \
-                   (VIS_KP_PITCH * (g_vis_ev / k) + dv_d);
+                   (g_vis_kp_pitch * (g_vis_ev / k) + dv_d);
         /* ---- 偏航 anti-windup：指令已经顶着限幅时，不许再往同一方向加偏置
          * （反向的修正照收）。没有这一条：平台满舵期间偏置一直涨，
          * 扰动结束后要花好几秒把这些虚账收回来（现场：甩出去又慢慢回正）。*/
@@ -895,6 +1457,7 @@ static void yuntai_lock_reference(void)
     g_yaw_off_prev      = 0.0f;              /* 前馈里的"视觉要求转速"也从 0 起 */
     vis_outer_reset();                       /* 视觉外环偏置也从 0 起步（新架构） */
     g_pitch_plat_lock   = imuAngle[1];       /* 平台俯仰基准 */
+    g_pitch_imu_lock    = imuAngle[1];       /* 力矩模式下俯仰的世界系基准 */
     g_plat_dtheta       = 0.0f;              /* 平台俯仰变化量从 0 重新算 */
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
     g_pitch_motor_lock  = g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f;
@@ -1143,7 +1706,7 @@ static void yuntai_control(uint32_t now)
 {
     const GimbalCmd_t *cmd = gimbal_link_cmd();
     const uint8_t mode = cmd->mode;
-    const float   dt   = (float)CONTROL_PERIOD_MS / 1000.0f;
+    const float   dt   = (float)g_ctrl_period_ms / 1000.0f;
     const float   rad2deg = 57.29578f;
     float yaw_rpm, pitch_rpm;
     uint8_t pitch_fb_ok;
@@ -1169,6 +1732,22 @@ static void yuntai_control(uint32_t now)
     {
         g_last_read_ms = now;
         jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+    }
+
+    /* ---- 每 2 秒读一次两个驱动器的错误码（2026-10-12 新增）----
+     * 只在错误码**变化**时上报（见 yuntai_read_feedback），所以平时不出日志；
+     * 一旦驱动器进了保护，日志里会直接出现 [MOTOR] yaw err=0x........。*/
+    if ((now - g_last_err_read_ms) >= 2000u)
+    {
+        g_last_err_read_ms = now;
+        jc_read_error(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_error(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        /* 顺带回读控制模式（驱动器重启会退回位置模式，见 jc_read_mode 说明）*/
+        jc_read_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        /* 以及"闭环使能"状态（模式对但没闭环 = 电机根本没被驱动）*/
+        jc_read_loop_state(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_loop_state(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
     }
 
     /* ---- 编码器反馈：每周期抽干一次，队列永远不会堆满 ---- */
@@ -1293,21 +1872,68 @@ static void yuntai_control(uint32_t now)
                 off_rate = (off_cmd - g_yaw_off_prev) / dt / rad2deg;  /* rad/s */
             }
             g_yaw_off_prev = off_cmd;
+            g_yaw_off_rate = off_rate;   /* 给力矩模式的"目标速度前馈"用 */
+            /* 速率项拆成两个方向（见 YAW_RATE_DAMP_RPM_PER_RADS 说明）：
+             *   阻尼  = -damp × (平台速率 - 视觉要求速率)   —— 抗扰/压抖
+             *   前馈  = +match × 视觉要求速率              —— 按视觉要求平滑跟
+             * 两者都乘 g_yaw_ff_sign，现场那个"前馈符号"旋钮仍然管用。*/
             yaw_rpm = g_yaw_pid.out +
-                      g_yaw_ff_sign * (gyro_c[2] - off_rate) * g_yaw_ff_gain;
+                      g_yaw_ff_sign * (g_yaw_rate_damp *
+                                       (gyro_c[2] - off_rate) +
+                                       g_yaw_ff_gain * off_rate);
+            /* ---- 底盘转速估计（2026-10-13 晚；给"速度前馈"用）----
+             * 恒等式：底盘转速 = 平台陀螺 − 电机相对转速。
+             * ⚠ 驱动器自报的 spd 字段在偏航上恒为 0（不可信），所以改用**电机位置
+             * 差分**：位置一直是真实数据、随 0x2A 回复 1kHz 更新、0.01° 分辨率。
+             * 两道保护：
+             *   ① 单帧速率 >±10rad/s（573°/s）= 位置跳变/毛刺，整帧丢弃；
+             *   ② 一阶低通 **τ≈50ms**（1kHz 下 a=0.02）。
+             *      ⚠ 54 号日志教训：a=0.15（τ=7ms）时，环路自身的 10~25Hz 抖动
+             *      会从"陀螺与位置差分的相位差"里冒出来，被误当成底盘转速 ——
+             *      所以必须慢到只跟得上手转底盘那种 1~2Hz 的运动。
+             * 估计值放 g_yaw_base_rate（rad/s），日志里的 wb= 打印的就是它。*/
+            if ((g_yaw_fb.seen != 0u) && ((now - g_yaw_pos_ms) >= 1u))
+            {
+                if (g_yaw_pos_ms == 0u)
+                {
+                    g_yaw_pos_last = g_yaw_fb.cont;   /* 第一次：只latch */
+                }
+                else
+                {
+                    float d_deg = g_yaw_fb.cont - g_yaw_pos_last;
+                    float rate  = (d_deg / 57.29578f) /
+                                  ((float)(now - g_yaw_pos_ms) * 0.001f);
+                    if (fabsf(rate) < 10.0f)
+                    {
+                        g_mot_rate_f += 0.02f * (rate - g_mot_rate_f);
+                    }
+                    g_yaw_pos_last = g_yaw_fb.cont;
+                }
+                g_yaw_pos_ms = now;
+            }
+            g_yaw_base_rate = gyro_c[2] - g_mot_rate_f;
         }
 
         /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
         g_yaw_err_rad = err;                  /* 给零偏自校准的"静止判据"用 */
         {
             float err_deg = err * 57.29578f;
-            if ((fabsf(err_deg) > YAW_STICTION_DEADBAND_DEG) &&
+            if ((g_yaw_stiction_rpm > 0.0f) &&
+                (fabsf(err_deg) > YAW_STICTION_DEADBAND_DEG) &&
                 (fabsf(yaw_rpm) < g_yaw_stiction_rpm))
             {
-                /* 误差越大补得越多：0.15° 只补 30%，1° 以上补满 */
-                float gain = clampf(fabsf(err_deg) / 1.0f, 0.3f, 1.0f);
-                float kick = g_yaw_stiction_rpm * gain;
-                yaw_rpm = (err_deg > 0.0f) ? kick : -kick;
+                /* ⚠ 0.5 -> 1.0：这里改成"补到刚好推得动"而不是"替换输出"。
+                 * 旧写法把 PID+前馈辛苦算出的精细量整个丢掉、换成恒定 kick，
+                 * 所以在靶心附近会一跳一跳；现在只把**不够的部分**加上去：
+                 *   want = ±stiction（方向 = 误差方向），缺多少补多少。 */
+                float want = (err_deg > 0.0f) ? g_yaw_stiction_rpm
+                                              : -g_yaw_stiction_rpm;
+                /* 只在"命令方向确实是想减小误差"时才补 —— 底盘转弯时前馈
+                 * 可能反向出力（抗扰），那是对的，不能去顶它。 */
+                if ((yaw_rpm == 0.0f) || ((yaw_rpm > 0.0f) == (want > 0.0f)))
+                {
+                    yaw_rpm = want;
+                }
                 g_yaw_stiction_on = 1u;
             }
             else
@@ -1316,24 +1942,353 @@ static void yuntai_control(uint32_t now)
             }
         }
     }
-    g_yaw_cmd_rpm = clampf(yaw_rpm, -YAW_OUT_RPM, YAW_OUT_RPM);
+    g_yaw_cmd_rpm = clampf(yaw_rpm, -g_yaw_out_rpm, g_yaw_out_rpm);
     /* 饱和标志（给视觉外环 anti-windup 用）：|指令| 到限幅 96% 就算"满舵"。
      * vis_outer_step 在当前节拍之前跑，所以它用的是上一拍的标志（5ms 旧，够用）。*/
     g_yaw_sat_dir = 0.0f;
-    if (g_yaw_cmd_rpm >= (0.96f * YAW_OUT_RPM))
+    if (g_yaw_cmd_rpm >= (0.96f * g_yaw_out_rpm))
     {
         g_yaw_sat_dir = 1.0f;
     }
-    else if (g_yaw_cmd_rpm <= (-0.96f * YAW_OUT_RPM))
+    else if (g_yaw_cmd_rpm <= (-0.96f * g_yaw_out_rpm))
     {
         g_yaw_sat_dir = -1.0f;
+    }
+
+    /* ---- 偏航"指令不跟"监视（2026-10-12 新增，治 38 号日志那种"卡住不响"）----
+     * 38 号日志实测：指令 -16 → -33rpm 连续 2~3 秒，电机自报转速 ≈0、位置一动
+     * 不动；随后突然甩成 ±330°/s 的大摆。不管根因在驱动器的哪种保护上，这种
+     * "指令大、反馈纹丝不动"的状态都必须**先被看见、并且不许积分攒着**，否则
+     * 一解卡就是一脚大摆。
+     * 判据（⚠ 2026-10-12 改）：|指令|>20rpm 且 **平台陀螺** |ω|<3rpm 当量，连续 1 秒。
+     *   原来用"驱动器自报转速"，但它在偏航上恒为 0（41/42 号日志），判据失效；
+     *   平台到底动没动，陀螺才是真话。
+     * 处理：清一次角度环（把积分扔掉，别让它当弹簧）+ 最多每 2 秒打一条日志。*/
+    if ((fabsf(g_yaw_cmd_rpm) > 20.0f) &&
+        (fabsf(gyro_c[2] * 9.5493f) < 3.0f))
+    {
+        g_yaw_stall_ms += g_ctrl_period_ms;
+        if (g_yaw_stall_ms >= 1000u)
+        {
+            PID_Reset(&g_yaw_pid);
+            /* ⚠ 2026-10-13：**不再在这里重写状态寄存器**。老代码明确记录过
+             * "运行期反复写会清掉驱动器内部状态、电机完全不动"，而我们之前每
+             * 10 秒就在这里补写一次 A2/模式 —— 很可能就是"越自愈越不动"的来源。
+             * 现在只清积分 + 打日志（诊断用），驱动器状态只在开机写一次。*/
+            if ((now - g_last_stall_log_ms) >= 2000u)
+            {
+                char sb[72];
+                char c0[12], c1[12];
+                g_last_stall_log_ms = now;
+                fmt_f(c0, sizeof(c0), g_yaw_cmd_rpm, 0);
+                fmt_f(c1, sizeof(c1), g_yaw_fb.spd, 1);
+                snprintf(sb, sizeof(sb), "[WARN] yaw stall: cmd=%s spd=%s",
+                         c0, c1);
+                gimbal_link_log(sb);
+            }
+        }
+    }
+    else
+    {
+        g_yaw_stall_ms = 0u;
+    }
+
+    /* ---- 电机响应测试（PARAM 0x1B：100=速度脚本 / 200=力矩脚本；见 gimbal_proto.h）----
+     * 它**直接覆盖最终指令**（在 PID/前馈所有计算之后），所以不受任何调参影响；
+     * 测试期间角度环每个周期都清一次，测试结束后环路从干净状态接管。*/
+    if (g_yaw_test_run == 1u)
+    {
+        uint32_t el = now - g_yaw_test_ms;
+        float tcmd;
+        if      (el < 1000u)  tcmd =   0.0f;
+        else if (el < 2500u)  tcmd =  20.0f;
+        else if (el < 4000u)  tcmd = -20.0f;
+        else if (el < 5500u)  tcmd =   8.0f;
+        else if (el < 7000u)  tcmd =  -8.0f;
+        else if (el < 8500u)  tcmd =   3.0f;
+        else if (el < 10000u) tcmd =  -3.0f;
+        else
+        {
+            g_yaw_test_run = 0u;
+            tcmd = 0.0f;
+            gimbal_link_log_force("[MOTO] speed test done");
+        }
+        if (g_yaw_test_run != 0u)
+        {
+            PID_Reset(&g_yaw_pid);
+            g_yaw_cmd_rpm = tcmd;
+            if ((now - g_yaw_test_log_ms) >= 200u)
+            {
+                char tb[72], t0[12], t1[12], t2[12], t3[12];
+                g_yaw_test_log_ms = now;
+                fmt_f(t0, sizeof(t0), tcmd, 1);
+                fmt_f(t1, sizeof(t1), g_yaw_fb.spd, 1);
+                fmt_f(t2, sizeof(t2), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
+                /* gz = 平台陀螺（°/s）：驱动器自报转速在偏航上不可信，
+                 * 平台到底动没动看它 */
+                fmt_f(t3, sizeof(t3), gyro_c[2] * 57.29578f, 1);
+                snprintf(tb, sizeof(tb), "[MOTO] V cmd=%s spd=%s gz=%s ym=%s",
+                         t0, t1, t3, t2);
+                gimbal_link_log_force(tb);
+            }
+        }
+    }
+    else if (g_yaw_test_run == 2u)
+    {
+        /* 力矩脚本：直接给电流（mA），看陀螺怎么响应 —— 一次把"符号对不对、
+         * 多大力能推动平台"两件事问清楚。0.5A≈0.02Nm，1.5A≈0.06Nm，2.5A≈0.1Nm。
+         * ⚠ 43 号日志证明 ±1A 都推不动这一轴，所以加了 2.5A 档。*/
+        uint32_t el = now - g_yaw_test_ms;
+        float tma;
+        if      (el < 1000u)  tma =    0.0f;
+        else if (el < 2200u)  tma =  500.0f;
+        else if (el < 3400u)  tma = -500.0f;
+        else if (el < 4600u)  tma = 1500.0f;
+        else if (el < 5800u)  tma = -1500.0f;
+        else if (el < 7000u)  tma = 2500.0f;
+        else if (el < 8200u)  tma = -2500.0f;
+        else if (el < 9000u)  tma =    0.0f;
+        else
+        {
+            g_yaw_test_run = 0u;
+            tma = 0.0f;
+            /* 测试结束：恢复测试前的模式设置（默认就是力矩模式）*/
+            g_yaw_torque = g_yaw_torque_bak;
+            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                     : g_speed_mode);
+            gimbal_link_log_force("[MOTO] torque test done");
+        }
+        g_yaw_test_ma = tma;
+        if (g_yaw_test_run != 0u)
+        {
+            if ((now - g_yaw_test_log_ms) >= 200u)
+            {
+                char tb[72], t0[12], t1[12], t2[12];
+                g_yaw_test_log_ms = now;
+                fmt_f(t0, sizeof(t0), tma, 0);
+                fmt_f(t1, sizeof(t1), gyro_c[2] * 57.29578f, 1);
+                fmt_f(t2, sizeof(t2), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
+                snprintf(tb, sizeof(tb), "[MOTO] T cmd=%smA gz=%s ym=%s",
+                         t0, t1, t2);
+                gimbal_link_log_force(tb);
+            }
+        }
+    }
+    else if (g_yaw_test_run == 3u)
+    {
+        /* ---- 力矩符号自检（约 0.8s）----
+         * +1000mA 300ms → -1000mA 300ms，比较两段的积分角速度：
+         *   正电流那一段让平台往正方向转得多  => 符号 +1；
+         *   反了                              => 符号 -1（后续电流全部取反）。
+         * 两段等幅反向，静载（重力/线缆）的影响在差值里抵消。*/
+        uint32_t el = now - g_yaw_test_ms;
+        float tma;
+        /* ⚠ 46 号日志：±4A 从静止推不动（两段积分 0.00°）→ 加到 ±6A 并拉长到 400ms，
+         * 至少问出"这一轴从静止到底要多大才能动"。*/
+        if      (el < 200u)  tma =    0.0f;
+        else if (el < 600u)  tma = 6000.0f;
+        else if (el < 1000u) tma = -6000.0f;
+        else
+        {
+            float d = g_sign_int_plus - g_sign_int_minus;   /* rad */
+            g_yaw_test_run = 0u;
+            tma = 0.0f;
+            if (fabsf(d) > 0.02f)      /* ≈1.1° 净差，够大才认 */
+            {
+                g_torque_sign = (d > 0.0f) ? 1.0f : -1.0f;
+            }
+            /* 恢复调用前的模式设置（自动检查时本来就是力矩模式，等于不变）*/
+            g_yaw_torque = g_yaw_torque_bak;
+            g_rate_i = 0.0f;
+            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                     : g_speed_mode);
+            {
+                char tb[72], t0[12], t1[12], t2[12];
+                /* 把两段的积分角都打出来：都≈0 = 轴根本没动（力矩不够）；
+                 * 一正一负差不多大 = 动了但对称（脉冲太短/摩擦对称）-> 判不出符号。*/
+                fmt_f(t0, sizeof(t0), d * 57.29578f, 2);
+                fmt_f(t1, sizeof(t1), g_sign_int_plus * 57.29578f, 2);
+                fmt_f(t2, sizeof(t2), g_sign_int_minus * 57.29578f, 2);
+                snprintf(tb, sizeof(tb), "[MOTO] chk +%s -%s d=%s -> %d",
+                         t1, t2, t0, (g_torque_sign > 0.0f) ? 1 : -1);
+                gimbal_link_log_force(tb);
+            }
+        }
+        if (g_yaw_test_run != 0u)
+        {
+            if (el < 200u)
+            {
+                g_sign_int_plus = 0.0f;
+                g_sign_int_minus = 0.0f;
+            }
+            else if (el < 600u)
+            {
+                g_sign_int_plus += gyro_c[2] * dt;
+            }
+            else
+            {
+                g_sign_int_minus += gyro_c[2] * dt;
+            }
+            g_yaw_test_ma = tma;
+            if ((now - g_yaw_test_log_ms) >= 150u)
+            {
+                char tb[72], t0[12], t1[12];
+                g_yaw_test_log_ms = now;
+                fmt_f(t0, sizeof(t0), tma, 0);
+                fmt_f(t1, sizeof(t1), gyro_c[2] * 57.29578f, 1);
+                snprintf(tb, sizeof(tb), "[MOTO] S cmd=%smA gz=%s", t0, t1);
+                gimbal_link_log_force(tb);
+            }
+        }
     }
 #if YAW_DEBUG_FORCE_ZERO
     /* 诊断：强制 yaw 输出 0（见文件顶部 YAW_DEBUG_FORCE_ZERO 说明） */
     g_yaw_cmd_rpm = 0.0f;
     g_yaw_stiction_on = 0u;
 #endif
-    yuntai_set_yaw(g_yaw_cmd_rpm);
+    if (g_yaw_torque != 0u)
+    {
+        /* ==========================================================================
+         * 力矩模式：**参考代码式"角度环直接出电流"**（2026-10-14 重写）
+         * ==========================================================================
+         * 参考代码（QGimbal）：i = kp·e + ki·∫e + kd·(−ω)，P/I/D 三个旋钮**彼此独立**。
+         * 我们原来是"角度环(rpm) → 速率环(mA)"两级串联，有个硬伤：
+         *     位置刚度 = 速率环Kp × 角度环KP
+         *     速率反馈 = 速率环Kp × (damp + 9.55)
+         *   两者共用一个速率环Kp —— 想加大"速度反馈"（顶住底盘），位置刚度就被顶到
+         *   失控；想降刚度（防抖），速度反馈又不够。这就是"速度模式下好好的前馈，
+         *   搬进力矩模式就发抖"的根本原因。
+         * 现在改成直接出电流，三个量独立：
+         *     KPc (0x15, A/rad)   位置刚度
+         *     KDc (0x11, A/(rad/s)) 速度反馈（= 速度模式那条前馈的等价物）
+         *     KIc (0x16, A/(rad·s)) 积分（消静差）
+         * 视觉目标速度前馈仍走 off_rate（AIM 时目标在动，就按 KDc 前馈跟上）。
+         * 摩擦那份非线性仍由"带迟滞的脱困补偿"负责（参考代码没有滑环，不需要它）。*/
+        float ilim_ma;
+        /* ---- 软接入（2026-10-12）----
+         * 刚切进力矩模式时积分=0、平台可能还带着几度的位置误差，若一上来就
+         * 放开全部电流限幅，第一拍就可能"咯"地一顿。这里让限幅在
+         * TORQUE_ENGAGE_MS 内从 0 爬满：接入瞬间电流很小，之后线性放开。 */
+        if (g_torque_prev == 0u)
+        {
+            g_torque_on_ms = now;     /* 刚进力矩模式：记录接入时刻 */
+            g_torque_prev  = 1u;
+        }
+        ilim_ma = g_rate_ilim_a * 1000.0f;
+        {
+            uint32_t el = now - g_torque_on_ms;
+            if (el < TORQUE_ENGAGE_MS)
+            {
+                ilim_ma *= (float)el / (float)TORQUE_ENGAGE_MS;
+            }
+        }
+        /* ⚠ 积分（mA）：对"角度误差"积分（原来是转速误差）——消静差用 */
+        g_rate_i += g_tq_ki * g_yaw_err_rad * dt;
+        g_rate_i = clampf(g_rate_i, -ilim_ma, ilim_ma);
+        g_rate_iq_ma = clampf(g_tq_kp * g_yaw_err_rad
+                              - g_tq_kd * (gyro_c[2] - g_yaw_off_rate)
+                              + g_rate_i,
+                              -ilim_ma, ilim_ma);
+        /* 力矩脚本进行中：直接注入测试电流（绕开速率环，见 0x1B=200 说明） */
+        if (g_yaw_test_run == 2u)
+        {
+            g_rate_i = 0.0f;
+            g_rate_iq_ma = clampf(g_yaw_test_ma, -ilim_ma, ilim_ma);
+        }
+        /* ---- 底盘转速"速度前馈"（2026-10-13 晚，0x12；见 g_yaw_base_ff 说明）----
+         * 底盘在以 w_base 转时，要让平台在世界里不动，电机必须**反向以 w_base 转**，
+         * 而这一步需要先顶开静摩擦。所以按 base 转速方向给一段**摩擦前馈电流**
+         * （平滑饱和、不是开关）——"转底盘"还没攒出角度误差时电机就已经在出力，
+         * 这一项不走反馈环，所以不会自激。*/
+        if (g_yaw_base_ff != 0.0f)
+        {
+            float e = g_yaw_base_rate / 0.3f;   /* 0.3rad/s（17°/s）饱和 */
+            if (e >  1.0f) e =  1.0f;
+            if (e < -1.0f) e = -1.0f;
+            g_rate_iq_ma -= g_yaw_base_ff * 1000.0f * e;   /* A->mA */
+            g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
+        }
+
+        /* ---- 自适应脱困补偿（2026-10-13 第三版，见 YAW_BREAK_* 说明）----
+         * 卡着（误差>0.5° 且平台几乎没动）→ 脱困电流以 10A/s 往上爬；
+         * 一动起来/误差小了 → 以 15A/s 掉下来。方向 = 误差方向。
+         * 好处：在滑环摩擦大的角度段它能爬到足够大把轴顶开；在摩擦小的段它
+         * 只爬到"刚好够"就停，冲过头的余量最小 —— 这才是粘滑极限环的根治点。*/
+        if ((g_yaw_test_run == 0u) && (g_yaw_stict_a > 0.0f))
+        {
+            float err_deg = g_yaw_err_rad * 57.29578f;
+            float aer = fabsf(err_deg);
+            float gr  = fabsf(gyro_c[2]);
+            /* 施密特：误差与速率各自带迟滞，避免在阈值上高频通断 */
+            if (g_break_want)
+            {
+                if (aer < YAW_BREAK_ERR_LO_DEG)  g_break_want = 0u;
+            }
+            else
+            {
+                if (aer > YAW_BREAK_ERR_DEG)     g_break_want = 1u;
+            }
+            if (g_break_stuck)
+            {
+                if (gr > YAW_BREAK_RATE_RADS)    g_break_stuck = 0u;
+            }
+            else
+            {
+                if (gr < YAW_BREAK_RATE_LO_RADS) g_break_stuck = 1u;
+            }
+            if ((g_break_want != 0u) && (g_break_stuck != 0u))
+            {
+                g_break_i += YAW_BREAK_SLEW_A_PER_S * dt;
+            }
+            else
+            {
+                g_break_i -= YAW_BREAK_DECAY_A_PER_S * dt;
+            }
+            g_break_i = clampf(g_break_i, 0.0f, g_yaw_stict_a);
+            if (g_break_i > 0.0f)
+            {
+                float want = (err_deg > 0.0f) ? g_break_i : -g_break_i;
+                g_rate_iq_ma += want * 1000.0f;
+                g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
+                g_yaw_stiction_on = 1u;
+            }
+            else
+            {
+                g_yaw_stiction_on = 0u;
+            }
+        }
+        else
+        {
+            g_break_i = 0.0f;
+        }
+        /* ⚠ 安全闸：平台转太快（>200°/s）说明符号/量纲不对或失控，
+         * 立刻把力矩清零并清积分（台架上第一次试的时候这道闸就是保命的）。*/
+        if (fabsf(gyro_c[2]) > 3.5f)
+        {
+            g_rate_iq_ma = 0.0f;
+            g_rate_i = 0.0f;
+            g_fault |= FAULT_YAW_RUNAWAY;
+        }
+        /* A -> Nm×100：电流(mA)*0.001*力矩常数0.040Nm/A*100 = mA*0.004 */
+        /* ---- 按节拍下发（见 g_torque_wr_ms 说明）----
+         * 每拍都写会把驱动器的"力矩爬升率 5Nm/s"斜坡不停重置，力矩爬不上去。*/
+        if ((g_torque_wr_ms == 0u) ||
+            ((now - g_last_torque_wr_ms) >= g_torque_wr_ms))
+        {
+            g_last_torque_wr_ms = now;
+            jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                               (int16_t)(g_rate_iq_ma * 0.004f * g_torque_sign));
+        }
+    }
+    else
+    {
+        g_torque_prev = 0u;      /* 回到速度类模式：下次再接力矩模式要重新软接入 */
+        g_rate_iq_ma = 0.0f;
+        g_rate_i = 0.0f;
+        yuntai_set_yaw(g_yaw_cmd_rpm);
+    }
 
     /* ======================================================================
      * 俯仰轴
@@ -1408,7 +2363,37 @@ static void yuntai_control(uint32_t now)
         }
         g_pitch_tgt_deg = tgt;
 
+        /* ---- 力矩模式（俯仰）：IMU 变化"改目标" + **编码器闭环**（2026-10-14）----
+         * 结构（用户定死）：目标值 = 编码器锁定角 + 视觉偏置 + 平台补偿（IMU 变化），
+         * 反馈 = **电机编码器** —— IMU 在俯仰轴下方、看不到俯仰臂，只能是"改目标"
+         * 的那一路，绝不能当反馈。
+         * 内环换成我们自己的 1kHz 速率环（转速反馈 = 驱动器自报的编码器转速，
+         * 俯仰这一路它报得很准，±0.01rpm），替代驱动器那条 50~100ms 的慢速度环。*/
         float err = tgt - g_pitch_fb.cont;
+        if (g_pitch_torque != 0u)
+        {
+            float ilim_ma = g_pitch_ilim_a * 1000.0f;
+            float we;
+            PID_Update(&g_pitch_pid, err, 0.0f, dt);      /* 沿用 rpm/deg 的位置环 */
+            we = g_pitch_pid.out - g_pitch_fb.spd;        /* 速率环：编码器转速反馈 */
+            g_pitch_tq_i += g_prate_ki * we * dt;
+            g_pitch_tq_i = clampf(g_pitch_tq_i, -ilim_ma, ilim_ma);
+            g_pitch_iq_ma = clampf(g_prate_kp * we + g_pitch_tq_i,
+                                   -ilim_ma, ilim_ma);
+            /* 安全闸：编码器转速异常（符号/量纲不对时会飞）→ 立刻清零。
+             * ⚠ 收得很紧：正常输出上限才 120rpm，超过 250rpm 一定是出事了 */
+            if (fabsf(g_pitch_fb.spd) > 250.0f)
+            {
+                g_pitch_iq_ma = 0.0f;
+                g_pitch_tq_i  = 0.0f;
+                g_fault |= FAULT_PITCH_RUNAWAY;
+            }
+            jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                               (int16_t)(g_pitch_iq_ma * 0.004f));
+            pitch_rpm = g_pitch_pid.out;                  /* 仅供日志 */
+        }
+        else
+        {
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
         pitch_rpm = g_pitch_pid.out + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
 
@@ -1417,7 +2402,7 @@ static void yuntai_control(uint32_t now)
          * 这时继续输出就是"朝一个方向狂奔"，必须立刻降级成纯前馈并报故障。 */
         if (fabsf(err) > PITCH_RUNAWAY_DEG)
         {
-            g_runaway_ms += CONTROL_PERIOD_MS;
+            g_runaway_ms += g_ctrl_period_ms;
             if (g_runaway_ms > PITCH_RUNAWAY_MS)
             {
                 g_fault |= FAULT_PITCH_RUNAWAY;
@@ -1430,10 +2415,14 @@ static void yuntai_control(uint32_t now)
             g_runaway_ms = 0u;
             g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
         }
+        }   /* ← else：速度模式（位置环）分支结束；力矩模式在上面那支里已发完力矩 */
     }
     g_pitch_cmd_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
     g_pitch_pos_deg = g_pitch_fb.cont;
-    yuntai_set_pitch(g_pitch_cmd_rpm);
+    if (g_pitch_torque == 0u)
+    {
+        yuntai_set_pitch(g_pitch_cmd_rpm);
+    }
 
     /* ---- 反馈丢失告警（每秒最多一条，不刷屏） ---- */
     if ((now - g_last_fbwarn_ms) > FB_WARN_PERIOD_MS)
@@ -1461,12 +2450,76 @@ static void yuntai_debug(uint32_t now)
         return;
     }
     g_last_dbg_ms = now;
+    /* ---- 原始反馈帧（每 2 秒一条，yaw/pitch 交替）----
+     * 用来核对"驱动器到底报了什么"：p=解析出的位置(°)，s=解析出的转速(rpm)，
+     * age=这一帧距现在多少 ms（明显偏大 = 驱动器不回帧/反馈断流）。
+     * 现场"指令 -80rpm、自报转速 0、位置却跳 25~50°"就靠它定案。 */
+    if ((now - g_last_raw_ms) >= 2000u)
+    {
+        char rb[80];
+        char p0[12], s0[12];
+        g_last_raw_ms = now;
+        g_raw_toggle = (uint8_t)(g_raw_toggle ? 0u : 1u);
+        if (g_raw_toggle != 0u)
+        {
+            fmt_f(p0, sizeof(p0), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
+            fmt_f(s0, sizeof(s0), g_yaw_fb.spd, 1);
+            snprintf(rb, sizeof(rb),
+                     "[RAW] yaw %02X %02X %02X %02X %02X %02X %02X %02X p=%s s=%s age=%u",
+                     (unsigned)g_yaw_raw[0], (unsigned)g_yaw_raw[1],
+                     (unsigned)g_yaw_raw[2], (unsigned)g_yaw_raw[3],
+                     (unsigned)g_yaw_raw[4], (unsigned)g_yaw_raw[5],
+                     (unsigned)g_yaw_raw[6], (unsigned)g_yaw_raw[7],
+                     p0, s0,
+                     (unsigned)((g_yaw_raw_len == 8u) ? (now - g_yaw_raw_ms)
+                                                      : 9999u));
+        }
+        else
+        {
+            fmt_f(p0, sizeof(p0), g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f, 1);
+            fmt_f(s0, sizeof(s0), g_pitch_fb.spd, 1);
+            snprintf(rb, sizeof(rb),
+                     "[RAW] pit %02X %02X %02X %02X %02X %02X %02X %02X p=%s s=%s age=%u",
+                     (unsigned)g_pitch_raw[0], (unsigned)g_pitch_raw[1],
+                     (unsigned)g_pitch_raw[2], (unsigned)g_pitch_raw[3],
+                     (unsigned)g_pitch_raw[4], (unsigned)g_pitch_raw[5],
+                     (unsigned)g_pitch_raw[6], (unsigned)g_pitch_raw[7],
+                     p0, s0,
+                     (unsigned)((g_pitch_raw_len == 8u) ? (now - g_pitch_raw_ms)
+                                                        : 9999u));
+        }
+        gimbal_link_log_force(rb);
+    }
     /* 每 5s 顺带报一次链路统计：crc 一直涨 = 波特率/线长/共地有问题；
      * ovf/txdrop 一直涨 = H723 这一侧处理不过来 */
     if ((now - g_last_stat_ms) > 5000u)
     {
         g_last_stat_ms = now;
         gimbal_link_log(gimbal_link_stats());
+    }
+    /* ---- 驱动器**实际控制模式**与错误码（每 2 秒一条，与回读同频）----
+     * 现场只要看到 y/p 不是 1（速度模式）或 err 非 0，就知道驱动器没在听速度
+     * 指令 —— 这正是"转底盘顶不住、一跳一跳"最可能的根因。*/
+    if ((now - g_last_mode_log_ms) >= 2000u)
+    {
+        char mb2[72];
+        char m0[8], m1[8], l0[8], l1[8];
+        g_last_mode_log_ms = now;
+        if (g_yaw_mode_rb == 0xFFu) { m0[0] = '?'; m0[1] = '\0'; }
+        else { snprintf(m0, sizeof(m0), "%u", (unsigned)g_yaw_mode_rb); }
+        if (g_pitch_mode_rb == 0xFFu) { m1[0] = '?'; m1[1] = '\0'; }
+        else { snprintf(m1, sizeof(m1), "%u", (unsigned)g_pitch_mode_rb); }
+        if (g_yaw_loop_rb == 0xFFu) { l0[0] = '?'; l0[1] = '\0'; }
+        else { snprintf(l0, sizeof(l0), "%u", (unsigned)g_yaw_loop_rb); }
+        if (g_pitch_loop_rb == 0xFFu) { l1[0] = '?'; l1[1] = '\0'; }
+        else { snprintf(l1, sizeof(l1), "%u", (unsigned)g_pitch_loop_rb); }
+        snprintf(mb2, sizeof(mb2),
+                 "[MOTOR] mode y=%s p=%s loop y=%s p=%s",
+                 m0, m1, l0, l1);
+        gimbal_link_log_force(mb2);
+        snprintf(mb2, sizeof(mb2), "[MOTOR] err y=0x%lX p=0x%lX",
+                 (unsigned long)g_yaw_err_code, (unsigned long)g_pitch_err_code);
+        gimbal_link_log_force(mb2);
     }
     {
         /* 注意：这里全部用 fmt_f，不能写 %f（newlib-nano 会截断输出） */
@@ -1480,7 +2533,11 @@ static void yuntai_debug(uint32_t now)
         fmt_f(b0, sizeof(b0), g_pitch_pos_deg, 1);
         fmt_f(b1, sizeof(b1), g_pitch_tgt_deg, 1);
         fmt_f(b2, sizeof(b2), g_pitch_cmd_rpm, 0);
-        fmt_f(b3, sizeof(b3), g_yaw_cmd_rpm, 0);
+        /* ⚠ 2026-10-12：这一格原来是把"偏航指令"重复打了一遍（Yc= 已经在打），
+         * 现在改成**驱动器自报的偏航电机转速**（ys=）—— 现场判断"指令有没有被
+         * 执行"就看这一对：Yc 是我们要的、ys 是电机实际在转的，两个差很远
+         * （比如 Yc=-43 而 ys≈0）就是"驱动器没跟指令"，不要再往 PID 上调。 */
+        fmt_f(b3, sizeof(b3), g_yaw_fb.seen ? g_yaw_fb.spd : 0.0f, 1);
         /* 2026-10-11 新架构：这两个偏置由 H723 视觉外环现算（不再来自 K230） */
         fmt_f(b4, sizeof(b4), g_vis_yaw_off, 1);
         fmt_f(b5, sizeof(b5), g_vis_pitch_off, 1);
@@ -1500,8 +2557,8 @@ static void yuntai_debug(uint32_t now)
         if (g_dbg_toggle != 0u)
         {
             snprintf(buf, sizeof(buf),
-                     "[DBG] p=%s t=%s o=%s Yc=%s o=%s ym=%s%s fb=%u",
-                     b0, b1, b2, b8, b3, b7,
+                     "[DBG] p=%s t=%s o=%s Yc=%s ym=%s ys=%s%s fb=%u",
+                     b0, b1, b2, b8, b7, b3,
                      (g_yaw_stiction_on ? " S" : ""), (unsigned)fb_age);
         }
         else
@@ -1509,18 +2566,25 @@ static void yuntai_debug(uint32_t now)
             char e0[12], e1[12], e2[12];
             char k0[12];
             char cz[12];
+            char wb[12];
             uint32_t vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms)
                                                   : 9999u;
             fmt_f(e0, sizeof(e0), g_vis_eu, 0);
             fmt_f(e1, sizeof(e1), g_vis_ev, 0);
-            fmt_f(e2, sizeof(e2), g_vis_gate_freeze_ms, 0);
+            /* gf = 瞬态缩放因子 ×100（100 = 没限制；越小说明当前压得越狠）。
+             * 它现在是**连续**量，不再有"冻 200ms"的节拍 —— 看它就知道
+             * 转弯时环路增益有没有被切。 */
+            fmt_f(e2, sizeof(e2), g_vis_gate_scale * 100.0f, 0);
+            /* wb = 估计的底盘角速度（°/s）：平移/转台子时这个数应该明显不为 0，
+             * 而平台陀螺应该接近 0 —— 这两个数的对比就是"稳没稳"的直接证据。 */
+            fmt_f(wb, sizeof(wb), g_yaw_base_rate * 57.29578f, 0);
             /* k = 本帧实际用的像素/度：K230 换了分辨率时这里会跟着变
              * （不变 = 那边没带上 K，还在用默认 7.8）。 */
             fmt_f(k0, sizeof(k0), vis_k_px_deg(cmd), 2);
             fmt_f(cz, sizeof(cz), g_vis_kp_yaw, 1);
             snprintf(buf, sizeof(buf),
-                     "[VIS] off=%s %s eu=%s ev=%s k=%s kp=%s gf=%s v=%u",
-                     b4, b5, e0, e1, k0, cz, e2, (unsigned)vis_age);
+                     "[VIS] off=%s %s eu=%s ev=%s k=%s kp=%s g=%s wb=%s v=%u",
+                     b4, b5, e0, e1, k0, cz, e2, wb, (unsigned)vis_age);
         }
     }
     gimbal_link_log(buf);
@@ -1649,6 +2713,13 @@ void yuntai_control_loop(void)
     /* ---- 3. 进入闭环（只发一次；运行期反复写这个寄存器会清掉驱动器
      *         的内部状态，表现是水平电机完全不动）---- */
     case YUNTAI_STATE_CLOSED_LOOP:
+        /* ⚠⚠ 2026-10-13（用户提醒"看看之前的代码"）：**恢复成 bf3bf46 的"只发一次"**。
+         * 老代码里有一句现场记录：**运行期反复写"进入闭环"这个寄存器会清掉驱动器
+         * 的内部状态，表现是"水平电机完全不动"** —— 而我们上一版开机连写 6 次
+         * （A2×3 + 模式×3），运行中还每 10 秒自愈重写一次。43/44 号日志里"指令
+         * 收下了、模式也对、电机就是纹丝不动"正是这句话描述的现象。
+         * 现在严格照 bf3bf46（唯一完整验证过的版本）来：A2 一次、模式一次，
+         * 运行期一律不写这两个寄存器。*/
         if (!g_cmd_sent)
         {
             g_cmd_sent = 1u;
@@ -1666,18 +2737,42 @@ void yuntai_control_loop(void)
 
     /* ---- 4. 切速度模式（同样只发一次）---- */
     case YUNTAI_STATE_SET_MODE:
+        /* ⚠⚠ 2026-10-13：**回到"只发一次"**（同 CLOSED_LOOP 处的说明）：
+         * 运行期/开机反复写这些状态寄存器，会把驱动器的内部状态清掉。
+         * 严格照 bf3bf46：这里只发一次控制模式。*/
         if (!g_cmd_sent)
         {
             g_cmd_sent = 1u;
-            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
-            jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_SPEED);
-            gimbal_link_log("[MOTOR] set speed mode");
+            /* 偏航默认走力矩模式（见 g_yaw_torque 说明），俯仰保持速度模式 */
+            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                     : g_speed_mode);
+            jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                                (g_pitch_torque != 0u) ? JC_MODE_TORQUE
+                                                       : g_speed_mode);
+            /* ⚠ 2026-10-13：切完模式后**再补一次"进入闭环"**。
+             * 依据：驱动器"切换后的模式不能保存" + 切模式有可能把自己的状态机
+             * 复位；而上位机能驱动这一轴的流程是"先选模式发送、再点闭环模式"。
+             * 这里把顺序对齐成 模式 -> 闭环（开机各一次，不违反"运行期不反复写"）。*/
+            jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+            jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+            {
+                char sb[44];
+                snprintf(sb, sizeof(sb), "[MOTOR] mode yaw=0x%02X pit=0x%02X",
+                         (unsigned)((g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                         : g_speed_mode),
+                         (unsigned)((g_pitch_torque != 0u) ? JC_MODE_TORQUE
+                                                           : g_speed_mode));
+                gimbal_link_log(sb);
+            }
         }
         if ((now - g_state_ms) > SET_MODE_DELAY_MS)
         {
             g_state    = YUNTAI_STATE_LOCK;
             g_state_ms = now;
             g_last_imu_ms = now;
+            /* 让 LOCK 里的"按住两轴"第一条 0 速指令立即发出（不然等 50ms） */
+            g_last_hold_ms = now - 50u;
             /* 清空累加器，准备做【第二次零偏标定】（这次电机已经把轴按住了） */
             g_gyro_sum[0] = g_gyro_sum[1] = g_gyro_sum[2] = 0.0f;
             g_gyro_n = 0u;
@@ -1708,6 +2803,24 @@ void yuntai_control_loop(void)
             g_last_read_ms = now;
             jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
         }
+        /* ---- 让两个轴"按住"（2026-10-12 补上，见本 case 头注释）----
+         * 第二次零偏标定要在"轴被驱动器顶住"的条件下测：线缆/滑环的扭力顶不
+         * 动它，平台才真的是静止的，测出来的才是零偏本身。不给这两条 0 速指令
+         * 的话，轴是自由的（注释里"发 0 速压住"其实一直没实现），平台可能自己
+         * 慢慢转 —— 零偏被污染后就是现场"上电后朝一个方向慢慢转"的老毛病。
+         * 20Hz 发一次足够（驱动器会自己保持住），不占 CAN 带宽。 */
+        if ((now - g_last_hold_ms) >= 50u)
+        {
+            g_last_hold_ms = now;
+            yuntai_set_yaw(0.0f);
+            yuntai_set_pitch(0.0f);
+            /* 偏航若走力矩模式，速度寄存器不起作用，必须把力矩也压到 0，
+             * 否则轴在 LOCK 阶段是自由的（还会沿用上一次残留的力矩值）。*/
+            if (g_yaw_torque != 0u)
+            {
+                jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, 0);
+            }
+        }
         yuntai_read_feedback(now);
         /* ⚠ 2026-10-08 现场实测：上电头几秒编码器报文可能还没上来（驱动板晚使能/
          * CAN 刚建链），若此刻就锁参考，俯仰参考会被锁成 0（日志里
@@ -1727,7 +2840,7 @@ void yuntai_control_loop(void)
             (g_pitch_fb.seen != 0u) && (g_yaw_fb.seen != 0u))
         {
             /* 注意用 g_* 当前值而不是宏：上位机可能在启动阶段就下发了新参数 */
-            PID_Init(&g_yaw_pid,   YAW_KP,   YAW_KI,   YAW_KD,   YAW_OUT_RPM);
+            PID_Init(&g_yaw_pid,   g_yaw_kp, g_yaw_ki, g_yaw_kd, g_yaw_out_rpm);
             PID_Init(&g_pitch_pid, g_pitch_kp, g_pitch_ki, g_pitch_kd, g_pitch_out_rpm);
             PID_Init(&g_yaw_unwind_pid, UNWIND_KP, 0.0f, 0.0f, UNWIND_RPM_MAX);
             g_yaw_pid.integral_limit   = g_yaw_ilim;   /* 可在线改（PARAM 0x0C）*/
@@ -1739,13 +2852,24 @@ void yuntai_control_loop(void)
             g_last_ctrl_ms = now;
             g_last_dbg_ms  = now;
             gimbal_link_log("=== STABILIZATION ACTIVE ===");
+            /* 偏航力矩模式：开机自动查一次力矩符号（见 g_torque_sign 说明）*/
+            if ((g_yaw_torque != 0u) && (g_torque_sign_checked == 0u))
+            {
+                g_torque_sign_checked = 1u;
+                g_yaw_test_run = 3u;
+                g_yaw_test_ms = now;
+                g_yaw_test_log_ms = now - 200u;
+                g_yaw_torque_bak = g_yaw_torque;   /* 检查完恢复成力矩模式 */
+                gimbal_link_log_force(
+                    "[MOTO] torque sign check (0.8s, hands off)");
+            }
         }
         break;
 
     /* ---- 6. 稳定 + 瞄准 ---- */
     case YUNTAI_STATE_RUNNING:
         yuntai_imu_update(now);
-        if ((now - g_last_ctrl_ms) >= CONTROL_PERIOD_MS)
+        if ((now - g_last_ctrl_ms) >= g_ctrl_period_ms)
         {
             g_last_ctrl_ms = now;
             yuntai_control(now);
@@ -1829,6 +2953,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         break;
 
     case GP_PARAM_PITCH_KP:
+        /* 俯仰位置环 KP（rpm/deg）——两种模式都用它：力矩模式下位置环→速率环 */
         g_pitch_kp = clampf(v, 0.0f, 40.0f);
         g_pitch_pid.kp = g_pitch_kp;
         PID_Reset(&g_pitch_pid);
@@ -1888,6 +3013,213 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         g_vis_kd_yaw = clampf(v, 0.0f, 1.0f);
         break;
 
+    case GP_PARAM_VIS_KP_PITCH:
+        /* 俯仰视觉外环 KP（1/s）。默认 6.0；还在慢摆往 400/300 收，收敛慢往 800 */
+        g_vis_kp_pitch = clampf(v, 0.0f, 60.0f);
+        break;
+
+    case GP_PARAM_VIS_KD_PITCH:
+        /* 俯仰视觉外环 KD（秒）。默认 0.70；摆动压不住就往 1.0~1.2 加 */
+        g_vis_kd_pitch = clampf(v, 0.0f, 1.0f);
+        break;
+
+    case GP_PARAM_YAW_OUT_RPM:
+        /* 偏航输出限幅（rpm）。下限 20（别锁死自己），上限 150（≈900°/s，
+         * 再大纯粹是给跑飞留空间）。*/
+        g_yaw_out_rpm = clampf(v, 20.0f, 150.0f);
+        break;
+
+    case GP_PARAM_YAW_RATE_DAMP:
+        /* ⚠ 2026-10-14 起是"双语义"：
+         *   · 力矩模式（默认）：**速度反馈 KDc，A/(rad/s)**，值=A/(rad/s)×100。
+         *     默认 150 = 1.5 A/(rad/s)。**这条就是"速度前馈"的等价物** ——
+         *     "转底盘顶不住"就往上加（200/250），"高频抖"就往下收（100）。
+         *   · 速度模式：仍是 rpm per rad/s（bf3bf46 那条 66.85 的老语义）。*/
+        if (g_yaw_torque != 0u)
+        {
+            g_tq_kd = clampf(v, 0.0f, 100.0f) * 1000.0f;
+        }
+        else
+        {
+            g_yaw_rate_damp = clampf(v, 0.0f, 300.0f);
+        }
+        break;
+
+    case GP_PARAM_YAW_BASE_FF:
+        /* 底盘转速"速度前馈"增益（**A per rad/s**，×100 编码）。
+         * 0 = 关；默认 0.5（=0.02Nm，正好是这一轴的静摩擦量级）。
+         * 嫌"转底盘还是跟不上"就往上试 (0x12, 80)/(0x12, 100)；
+         * 如果转底盘时反而更糟（说明符号反了）就发负值 (0x12, -50)。*/
+        g_yaw_base_ff = clampf(v, -10.0f, 10.0f);
+        break;
+
+    case GP_PARAM_SPEED_MODE:
+        /* 切换电机控制模式（写 0x0060），**立即生效**：
+         *   1 = 速度模式（**默认**；历史所有成功测试都是它）
+         *   5 = 低速大扭（⚠ 语义未证实：可能用的是寄存器 0x0027 的固定低速
+         *       而不是我们写的 0x0021 —— 上一版默认它时现场出现"转底盘不顶"。
+         *       要用的话必须盯着日志里 ym= 与指令是否还对得上）
+         *   0 = 力矩模式（别在这里切；力矩模式有自己的开关 0x14 和整套
+         *       速率环参数 0x15~0x17） */
+        if ((v > 0.5f) && (v < 6.0f))
+        {
+            g_speed_mode = (uint8_t)v;
+            /* 偏航若开着力矩模式，这里只改"速度模式备选值"，别把它掰回速度模式 */
+            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                     : g_speed_mode);
+            jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, g_speed_mode);
+            {
+                char sb[44];
+                snprintf(sb, sizeof(sb), "[MOTOR] mode <- 0x%02X",
+                         (unsigned)g_speed_mode);
+                gimbal_link_log_force(sb);
+            }
+        }
+        break;
+
+    case GP_PARAM_YAW_TORQUE:
+        /* 偏航力矩模式开关：0=关（速度类模式）/ 1=开。
+         * 开的时候**立刻**把偏航驱动器的控制模式切成 0x00（力矩）；
+         * 关的时候切回 g_speed_mode（默认 0x05 低速大扭）。俯仰轴不动。*/
+        g_yaw_torque = (v >= 0.5f) ? 1u : 0u;
+        g_rate_i = 0.0f;
+        g_rate_iq_ma = 0.0f;
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                            (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                 : g_speed_mode);
+        gimbal_link_log_force(g_yaw_torque ? "[MOTOR] yaw -> TORQUE mode"
+                                           : "[MOTOR] yaw -> speed mode");
+        break;
+
+    case GP_PARAM_RATE_KP:
+        /* ⚠ 2026-10-14 新语义：力矩模式"角度环"**位置刚度 KPc（A/rad）**，值=A/rad×100。
+         *   默认 600 = 6 A/rad（参考代码 5）。大了高频抖/叫，小了软。
+         *   注意：速度模式下它不生效（那条路径用角度环KP/速率环Kp）。*/
+        g_tq_kp = clampf(v, 0.0f, 100.0f) * 1000.0f;
+        break;
+
+    case GP_PARAM_RATE_KI:
+        /* ⚠ 新语义：**积分 KIc（A/(rad·s)）**，值=A/(rad·s)×100。默认 800 = 8。
+         *   它是"消静差"用的最后一道，有脱困补偿兜底，别给太大（会低频摆）。*/
+        g_tq_ki = clampf(v, 0.0f, 200.0f) * 1000.0f;
+        break;
+
+    case GP_PARAM_RATE_ILIM:
+        /* 电流限幅（A）：0.05~20（8 A = 0.32 Nm）*/
+        g_rate_ilim_a = clampf(v, 0.05f, 20.0f);
+        break;
+
+    case GP_PARAM_YAW_KP:
+        /* 偏航角度环 P（rpm/rad）。参考代码的等价项很软（kp=5 对 kd=110），
+         * 我们默认 60；**越大越容易"猛甩"**，越小越软但静差越大。 */
+        g_yaw_kp = clampf(v, 0.0f, 1000.0f);
+        g_yaw_pid.kp = g_yaw_kp;
+        break;
+
+    case GP_PARAM_YAW_KI:
+        g_yaw_ki = clampf(v, 0.0f, 200.0f);
+        g_yaw_pid.ki = g_yaw_ki;
+        PID_Reset(&g_yaw_pid);      /* 换积分必须清干净，别带着旧记忆推 */
+        break;
+
+    case GP_PARAM_YAW_KD:
+        /* 偏航角度环 D（rpm/(rad/s)）。微分现在带 5ms 低通（见 pid.c），
+         * 所以可以比原来放心地加大：这是"压住摆动"的主要旋钮。 */
+        g_yaw_kd = clampf(v, 0.0f, 200.0f);
+        g_yaw_pid.kd = g_yaw_kd;
+        break;
+
+    case GP_PARAM_MOTOR_TEST:
+        /* 电机响应测试（见 gimbal_proto.h 的 0x1B 说明）。
+         *   value = 100 -> 速度脚本（0/+20/-20/+8/-8/+3/-3 rpm）
+         *   value = 200 -> 力矩脚本（0/+500/-500/+1500/-1500 mA）
+         *   其它值      -> 中止。测试期间会刷 [MOTO] 行。*/
+        {
+            uint32_t tnow = HAL_GetTick();
+            if (value >= 300)
+            {
+                /* 只做符号自检（自动切力矩模式，跑完恢复现场设置）*/
+                g_yaw_test_run = 3u;
+                g_yaw_test_ms = tnow;
+                g_yaw_test_log_ms = tnow - 200u;
+                g_yaw_torque_bak = g_yaw_torque;
+                g_yaw_torque = 1u;
+                jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                    JC_MODE_TORQUE);
+                gimbal_link_log_force("[MOTO] sign check start");
+            }
+            else if (value >= 200)
+            {
+                g_yaw_test_run = 2u;
+                g_yaw_test_ms = tnow;
+                g_yaw_test_log_ms = tnow - 200u;
+                g_yaw_test_ma = 0.0f;
+                g_yaw_torque_bak = g_yaw_torque;   /* 跑完恢复现场设置 */
+                g_yaw_torque = 1u;
+                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                    JC_MODE_TORQUE);
+                gimbal_link_log_force(
+                    "[MOTO] torque test: 0/+500/-500/+1500/-1500 mA");
+            }
+            else if (value >= 100)
+            {
+                g_yaw_test_run = 1u;
+                g_yaw_test_ms = tnow;
+                g_yaw_test_log_ms = tnow - 200u;   /* 让第一条日志立刻出来 */
+                gimbal_link_log_force(
+                    "[MOTO] speed test: 0/+20/-20/+8/-8/+3/-3 rpm");
+            }
+            else
+            {
+                if ((g_yaw_test_run == 2u) || (g_yaw_test_run == 3u))
+                {
+                    g_yaw_torque = g_yaw_torque_bak;
+                    jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                        (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                             : g_speed_mode);
+                }
+                g_yaw_test_run = 0u;
+                gimbal_link_log_force("[MOTO] test aborted");
+            }
+        }
+        break;
+
+    case GP_PARAM_CTRL_PERIOD:
+        /* 控制/指令周期（ms×100）。1~10ms 之间夹住，改完立即生效（见 0x1C 说明）*/
+        g_ctrl_period_ms = (uint32_t)clampf(v, 1.0f, 10.0f);
+        {
+            char sb[44];
+            snprintf(sb, sizeof(sb), "[CTRL] period <- %ums (%uHz)",
+                     (unsigned)g_ctrl_period_ms,
+                     (unsigned)(1000u / g_ctrl_period_ms));
+            gimbal_link_log_force(sb);
+        }
+        break;
+
+    case GP_PARAM_TQ_STICTION:
+        /* 力矩脱困补偿电流（A×100，见 gimbal_proto.h 的 0x1D 说明）*/
+        g_yaw_stict_a = clampf(v, 0.0f, 10.0f);
+        {
+            char sb[44], n0[12];
+            fmt_f(n0, sizeof(n0), g_yaw_stict_a, 2);
+            snprintf(sb, sizeof(sb), "[CTRL] tqStiction <- %sA", n0);
+            gimbal_link_log_force(sb);
+        }
+        break;
+
+    case GP_PARAM_TQ_WR_MS:
+        /* 力矩指令下发周期（ms×100，见 g_torque_wr_ms 说明）*/
+        g_torque_wr_ms = (uint32_t)clampf(v, 0.0f, 200.0f);
+        {
+            char sb[44];
+            snprintf(sb, sizeof(sb), "[CTRL] tqWrite %ums", 
+                     (unsigned)g_torque_wr_ms);
+            gimbal_link_log_force(sb);
+        }
+        break;
+
     case GP_PARAM_DUMP:
         /* 只汇报，不改动。两行，方便上位机直接打印 */
         fmt_f(n1, sizeof(n1), g_pitch_ff_sign, 2);
@@ -1923,6 +3255,55 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         fmt_f(n1, sizeof(n1), g_vis_kp_yaw, 1);
         fmt_f(n2, sizeof(n2), g_vis_kd_yaw, 2);
         snprintf(buf, sizeof(buf), "[PARAM] visKp %s visKd %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_yaw_out_rpm, 0);
+        fmt_f(n2, sizeof(n2), g_yaw_ff_gain, 1);
+        snprintf(buf, sizeof(buf), "[PARAM] yawOut %s yawFFg %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_yaw_rate_damp, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] yawDamp %s", n1);
+        gimbal_link_log_force(buf);
+    /* 偏航角度环三件套（0x18/0x19/0x1A）。判据：KP 太硬 -> 猛甩一下；
+     * 来回摆 -> KD 太小或 KI 太大。 */
+    fmt_f(n1, sizeof(n1), g_yaw_kp, 1);
+    fmt_f(n2, sizeof(n2), g_yaw_ki, 2);
+    snprintf(buf, sizeof(buf), "[PARAM] yawAngKp %s yawAngKi %s", n1, n2);
+    gimbal_link_log_force(buf);
+    fmt_f(n1, sizeof(n1), g_yaw_kd, 1);
+    snprintf(buf, sizeof(buf), "[PARAM] yawAngKd %s", n1);
+    gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_yaw_base_ff, 2);
+        fmt_f(n2, sizeof(n2), g_yaw_base_rate * 57.29578f, 1);
+        snprintf(buf, sizeof(buf), "[PARAM] yawBaseFF %s wb %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), (float)g_speed_mode, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] motorMode 0x%s", n1);
+        gimbal_link_log_force(buf);
+        /* 驱动器错误码（每 2 秒刷新一次）。0x00000000 = 没报错；
+         * 现场"指令给着电机不动"时，先看这一行的 yaw 是不是非 0。*/
+        {
+            char e0[16], e1[16];
+            snprintf(e0, sizeof(e0), "0x%08lX", (unsigned long)g_yaw_err_code);
+            snprintf(e1, sizeof(e1), "0x%08lX", (unsigned long)g_pitch_err_code);
+            snprintf(buf, sizeof(buf), "[PARAM] err yaw=%s pit=%s", e0, e1);
+            gimbal_link_log_force(buf);
+        }
+        fmt_f(n1, sizeof(n1), (float)g_ctrl_period_ms, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] ctrlPeriod %s ms", n1);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), (float)g_yaw_torque, 0);
+        fmt_f(n2, sizeof(n2), g_rate_iq_ma, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] yawTorque %s iq(mA) %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_tq_kp / 1000.0f, 1);
+        fmt_f(n2, sizeof(n2), g_tq_kd / 1000.0f, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] tqKp(A/rad) %s tqKd %s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_tq_ki / 1000.0f, 1);
+        snprintf(buf, sizeof(buf), "[PARAM] tqKi(A/rads) %s", n1);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_rate_ilim_a, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] rateILim %s", n1);
         gimbal_link_log_force(buf);
         return;
 

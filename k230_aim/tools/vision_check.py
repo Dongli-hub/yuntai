@@ -161,7 +161,19 @@ PAPER_ASPECT_MAX = 2.00
 #   注：0.485 那个"实心矩形转 45°"的极端情况要靠**云台滚转≈0**（相机固定
 #   在云台上）来排除；真靶纸实测（含斜视）密 0.92~1.04，离 0.56 很远。
 PAPER_DENSITY_MIN = 0.56   # 兜底（没拟合出四边形时）下限
-PAPER_DENSITY_QUAD_MIN = 0.72  # 拟合出四边形后：像素/四边形面积
+# ⚠ 2026-10-11 现场(30号日志)：上面 0.56 这一刀**误伤了掠射**——近处直角转弯、
+#   激光路径与靶面夹角很小时，靶纸被压扁，外接框填充率只有 ~0.54（真纸！
+#   那一帧 内183 外110 暗边83% 对比73，其余判据全过），结果被"密度"挡死 -> 脱靶。
+#   而"木柜把纸当洞"的假块 对比 只有 53~65。所以按对比分档：
+#     对比 >= 70（内亮外黑极强，靶纸/胶带的特征）-> 密度下限放宽到 0.45
+#     否则                                     -> 仍用 0.56
+PAPER_DENSITY_MIN_STRONG = 0.45
+PAPER_CONTRAST_STRONG = 70
+# ⚠ 2026-10-11 现场(30号日志)：0.72 -> 0.65。掠射时像素/四边形面积天生偏低
+#   （亮块被阴影切窄、四边形摸到真实外沿，实测 px/qa ≈ 1/1.39 = 0.72，正好
+#   卡在门槛上）。放宽到 0.65（允许四边形比亮块大 1.54 倍）；
+#   反方向的"木柜把纸当洞"由下面的密度**上限 1.08** 拦（px/qa≈1.9 必拒）。
+PAPER_DENSITY_QUAD_MIN = 0.65
 # ⚠ 2026-10-09 现场实测（光线变亮后）：
 #   真靶纸 内−外 只有 32~43（亮光下"四周"也变亮），而背景块只有 21。
 #   之前设 45 会把真靶纸挡掉 -> "容易丢靶、开机难找靶"。
@@ -182,7 +194,13 @@ PAPER_DARK_FRAC_MIN = 0.55  # 外侧 12 点里至少这么多比例更暗
 QUAD_SCAN_N = 3            # 每边取几行/几列做扫描（2026-10-11: 5->3 再省一截）
 QUAD_PERP_PX = 1           # 扫描时垂直方向各看几像素
 QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
-QUAD_AREA_HI = 1.35
+# ⚠ 2026-10-11 现场(30号日志)：1.35 -> 1.60。掠射（激光路径与靶面夹角很小）时
+#   亮块会被"阴影/边缘软化"切窄，而边扫描会摸到靶纸真实外沿 —— 四边形比亮块大
+#   四成是**正常**的（实测 qa/px≈1.39），1.35 当场把四边形弃掉、退回外接框，
+#   再被密度门槛卡死 -> 脱靶。"木柜把纸当洞"那种假块会不会因此漏进来？
+#   不会：它恰好相反（四边形≈纸 而亮块=木柜，px/qa≈1.9），下面的密度上限
+#   1.08 那一闸专门拦它。
+QUAD_AREA_HI = 1.60
 # 扫描用的相对亮度门槛（纸面有阴影时固定阈值会把暗的那半边切掉）
 SCAN_TH_K = 0.68           # 现场实证：0.5 时柜子面(≈95)会时过时不过 -> 边飞出去
 SCAN_TH_LO = 65
@@ -226,7 +244,11 @@ LOST_FULL = 25
 #   一阶 EMA 的群延迟 ≈ (1-α)/α ÷ 帧率。α=0.55@45fps → 18ms；α=0.30 → 51ms！
 #   也就是说远处那 100ms 的"看不见的延迟"里，一大半是它自己加的。
 #   比赛时小车是连续运动的，目标本身很平滑，不需要这么重的滤波 —— 提高 α。
-SMOOTH = 0.80              # 平滑系数（0.55 -> 0.80：中心滞后 18ms -> 5.5ms）
+# ⚠ 2026-10-11 深夜(37)：0.80 -> 0.90。群延迟 ≈ (1-α)/α × 帧周期(30ms)：
+#   0.80→7.5ms、0.90→3.3ms。这条延迟**直接决定云台能用的环路增益上限**
+#   （相位余量），所以在打不动执行机构迟滞的前提下，每削几毫秒都是白赚。
+#   代价：中心噪声略大 —— 有 1.5px 死区 + 跟踪期防跳闸门兜着。
+SMOOTH = 0.90              # 平滑系数（越大越跟手、越小越稳）
 DEADBAND_PX = 1.5 * S_SCALE   # 平滑死区（小于它不动，画面不抖）
 # ⚠ 2026-10-10 两轮日志的教训：
 #   太严(0.55~1.45) -> 远距离纸面碎成小块时锁不上（卡"确认1/3"）；
@@ -341,6 +363,28 @@ def luma(r, g, b):
     return (r * 77 + g * 150 + b * 29) >> 8
 
 
+_PIXBUF = [0, 0, 0]
+_PIX_FAST = False      # get_pixel(x,y,buf) 这种"就地填"写法能不能用（见下）
+
+
+def px_probe_fast(img):
+    """启动时探一次：get_pixel 支不支持"传一个 buf 就地填"。
+
+    为什么值得做：px_luma 是四边形复测的**热路径**（每帧几百次调用），而
+    `img.get_pixel(x, y)` 每次都要新建一个 (r,g,b) 元组 —— MicroPython 里
+    一次分配就是几微秒，几百次就是 1~3ms/帧（占检测耗时的 10~20%）。
+    OpenMV/CanMV 的 get_pixel 支持 `get_pixel(x, y, rgbtuple)` 就地写，
+    我们探一下：能用就用（省掉分配 -> 帧率上去 -> 反应更快）。
+    """
+    global _PIX_FAST
+    try:
+        img.get_pixel(0, 0, _PIXBUF)
+        _PIX_FAST = True
+    except Exception:
+        _PIX_FAST = False
+    return _PIX_FAST
+
+
 def px_luma(img, x, y):
     """取某点亮度（0~255）。取不到返回 -1。"""
     if x < 0:
@@ -352,7 +396,10 @@ def px_luma(img, x, y):
     elif y >= IMG_H:
         y = IMG_H - 1
     try:
-        p = img.get_pixel(int(x), int(y))
+        if _PIX_FAST:
+            p = img.get_pixel(int(x), int(y), _PIXBUF)
+        else:
+            p = img.get_pixel(int(x), int(y))
     except Exception:
         return -1
     if p is None:
@@ -1267,13 +1314,13 @@ class PaperDetector(object):
                     corners, ctr, long_side, short_side, qa = q
                     if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
                         corners = None        # 拟合和亮块对不上，弃用
-                    elif long_side < 0.90 * box_long:
-                        # 2026-10-11：四边形比外接框小 15% 以上 = 边缘扫描在阴影/
-                        # 印刷圈处提前收住（2.7m 实测：框52px 而四边形长边 44px，
-                        # 正好被"长边>=45"卡死 -> 远处新进画面永远锁不上）。
-                        # 弃用四边形，退回外接框（中心略糙但拿得到目标）。
-                        # 0.85 -> 0.90（2026-10-11 深夜）：远处四边形普遍比外接框
-                        # 小 10%~15%，0.85 会把它放过去继续卡"长边"，0.90 才收得住。
+                    elif long_side < 0.70 * box_long:
+                        # 2026-10-11：四边形明显小于外接框 = 边缘扫描在阴影/印刷圈
+                        # 处提前收住（2.7m 实测 框52 而四边形 44），退回外接框。
+                        # ⚠ 0.90 -> 0.70（30 号日志）：**靶纸在画面里被转开/掠射时，
+                        #   外接框天生比纸大**（斜 30° 时 框297 而四边形长边 245，
+                        #   比值 0.82）—— 0.90 会把这种"好四边形"也弃掉，退回外接框
+                        #   再被密度门槛卡死。0.70 只拦真正塌缩的拟合。
                         corners = None
                     elif _quad_angle_bad(corners):
                         # QGimbal-Vision 同款"四角接近 90°"判据：斜得离谱/乱接边
@@ -1294,6 +1341,11 @@ class PaperDetector(object):
                     short_side = w if w < h else h
                     density = px / float(w * h)
                     dens_min = PAPER_DENSITY_MIN
+                    # 掠射/斜视时靶纸被压扁、外接框填充率会掉到 ~0.5，但它
+                    # "内亮外黑"极强（30 号日志：对比 73~92、暗边 83~100%）；
+                    # "木柜把纸当洞"的假块对比只有 53~65 —— 所以按对比分档。
+                    if (ins - outs) >= PAPER_CONTRAST_STRONG:
+                        dens_min = PAPER_DENSITY_MIN_STRONG
                     ctr = (x + w / 2.0, y + h / 2.0)
                 else:
                     density = px / max(1.0, qa)
@@ -1333,8 +1385,11 @@ class PaperDetector(object):
                 elif frac < PAPER_DARK_FRAC_MIN:
                     why = "暗边"
             if n <= 6:
-                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%%%s] " % (
-                    px, box_long, ins, outs, frac * 100.0,
+                # 带上密度 + 是"四"(四边形)还是"框"(外接框)——现场复盘时一眼看出
+                # 是哪条路被哪道闸门挡住（30 号日志那次就是因为没这个数，查了一轮）。
+                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
+                    px, box_long, ins, outs, frac * 100.0, density,
+                    ("四" if corners is not None else "框"),
                     (" ✗" + why) if why else " ✓")
             if len(self.cands) < 8:
                 self.cands.append((x, y, w, h, 0 if why else 1))
@@ -1493,6 +1548,11 @@ def main():
         print("显示: VIRT %dx%d -> IDE 帧缓冲区" % (DISPLAY_W, DISPLAY_H))
     MediaManager.init()
     sensor.run()
+    # 探一下"省分配的取像素"写法能不能用（px_luma 是复测热路径）
+    try:
+        px_probe_fast(sensor.snapshot(chn=CAM_CHN_ID_0))
+    except Exception:
+        pass
 
     # ---------- 预览缩放（把处理图像摆到 640x480 画布上）----------
     # 不放大（放大只会糊）；比画布小时居中摆放。

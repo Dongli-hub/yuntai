@@ -526,6 +526,10 @@ def run():
 
     src = open(MAIN_PY, "r", encoding="utf-8").read()
     src = src.replace('DISPLAY_MODE = "VIRT"', 'DISPLAY_MODE = "OFF"')
+    # 仿真永远测"整机闭环"：即便现场把 main.py 切成了 LOG_ONLY（只监听，
+    # 不发 SET_ZERO/AIM），这里也强制改回整机模式 —— 否则仿真的
+    # "闭环收敛 OK/未收敛"判据会永远落空（AIM 帧 0 条）。
+    src = re.sub(r"(?m)^LOG_ONLY\s*=\s*\w+", "LOG_ONLY = False", src)
 
     fake_t = [0.0]
 
