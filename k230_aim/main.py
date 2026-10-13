@@ -336,6 +336,29 @@ SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]   # 最近一次找到的激光点，主循
 #   （K=7.8px/°，10px ≈ 1.3°）。恢复检测把 USE_FIXED_LASER 改 False。
 USE_FIXED_LASER = True
 LASER_UV = (int(round(312 * S_SCALE)), int(round(252 * S_SCALE)))
+# --- 激光点"手动微调"（2026-10-13 加，治"总是往右下偏"）---
+# 现场规律：瞄准收敛后激光**总是落在靶心的右下方**（近处小、远处被放大）
+#   ⇒ 说明"我们假定的光斑位置(LASER_UV+trim)"在真实光斑的**左上方**。
+#   换算：1 px ≈ 0.128°（K=7.8），在 1.6m 处 1px ≈ 0.36cm；靶纸白面 27.5cm 在
+#   1.6m 处约 74px。所以"远距离能看出偏"通常对应 4~10px 的固定偏差。
+#   调法：先把 LASER_TRIM 设为 (0,0) 跑一次，看激光落点在靶心的哪一侧；
+#   落点在右下 → 把 trim 往右下加（+u,+v，一次加 2px 试）；直到落点居中。
+#   注意 trim 是**像素**、与距离无关（激光-相机的夹角是固定的），所以近处调准，
+#   远处自然就准。
+# ⚠⚠ 2026-10-13 现场实测修正（63 号日志："trim 加到 (8,8) 后落点越发向右下偏"）：
+#   实测结论：**trim 与落点是同向的** —— trim 往右下加，落点更往右下跑；
+#   所以修落点要往**反方向**调。我把之前那套"落点=真实光斑−假定点"的推导记在这里
+#   作为教训：现场以实测为准，不再按推导定方向。
+#   走过的一串（同一套观察约定下）：
+#       trim(0,0)  -> 落点"有点偏右下"（≈2px）
+#       trim(4,4)  -> "还是向右下偏，还有一点明显"（≈6px）
+#       trim(8,8)  -> "越发向右下偏得厉害"（≈10px）
+#   ⇒ 落点 ≈ 2px + trim，**最优 trim ≈ (−2,−2)**。这轮先给 (−4,−4)（略过头一点，
+#     宁可偏左上也不偏右下）；跑一次看落点：还偏右下就往 −6 走，变偏左上就往
+#     −2/−1 收。1.6m 处 1px≈0.36cm。
+# ⚠ 2026-10-13 六版（现场继续收敛）：(-4,-4) 还偏右下、(-8,-8) 偏左上、(-6,-6)
+#   "还有一点偏" ⇒ 用户定 **(-5,-5)**。以后除非动相机/激光安装，不用再调。
+LASER_TRIM = (-5, -5)      # (du, dv)：正值 = 往右/往下
 
 # --- 激光坐标"开机自标定"（2026-10-11 新增，用户：坐标不准、远距离会被放大）---
 # 黄圈画的就是 LASER_UV，整机瞄准时"靶心-光斑"用的也是它 —— 它偏 1px 就是
@@ -1938,26 +1961,37 @@ class SpotDetector(object):
     # ---- 原生 find_blobs 版（RGB565）----
     def _detect_blobs(self, img):
         x0, y0, w, h = self.roi()
-        best = None
-        # 两个阈值放一次调用（find_blobs 每次约 10ms 固定开销，能省则省）
-        for b in img.find_blobs(SPOT_THRESHOLDS, roi=(x0, y0, w, h),
-                                merge=True,
-                                pixels_threshold=SPOT_MIN_AREA,
-                                area_threshold=SPOT_MIN_AREA):
-            area = b[4]
-            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                continue
-            bw = b[2]
-            bh = b[3]
-            if bw < 1 or bh < 1:
-                continue
-            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                continue
-            bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
-            cx = bx + bw / 2.0
-            cy = by + bh / 2.0
-            if best is None or area > best[0]:
-                best = (area, cx, cy, (bx, by, bw, bh))
+        # ⚠ 2026-10-13：拆成两次调用、并**优先选"过曝白芯"**。
+        #   以前把两个阈值混在一起按面积挑最大块 —— 远距离时红色光晕(HALO)面积大，
+        #   常常盖过白芯被选中；而光晕是**偏离激光真实中心**的（纸面散射不对称），
+        #   于是"黄圈(假定光斑)与实际光斑"就有一个固定偏差，瞄准时激光整体偏一侧
+        #   （现场：总往右下偏）。白芯（L 88~100）才是激光真正打中的那一点。
+        best_core = None
+        best_halo = None
+        for ti in range(len(SPOT_THRESHOLDS)):
+            for b in img.find_blobs([SPOT_THRESHOLDS[ti]], roi=(x0, y0, w, h),
+                                    merge=True,
+                                    pixels_threshold=SPOT_MIN_AREA,
+                                    area_threshold=SPOT_MIN_AREA):
+                area = b[4]
+                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                    continue
+                bw = b[2]
+                bh = b[3]
+                if bw < 1 or bh < 1:
+                    continue
+                if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
+                    continue
+                bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+                if ti == 0:
+                    if best_core is None or area > best_core[0]:
+                        best_core = (area, cx, cy, (bx, by, bw, bh))
+                else:
+                    if best_halo is None or area > best_halo[0]:
+                        best_halo = (area, cx, cy, (bx, by, bw, bh))
+        best = best_core if best_core is not None else best_halo
         if best is None:
             return None
         area, cx, cy, rect = best
@@ -2366,7 +2400,8 @@ def main():
 
                 if USE_FIXED_LASER:
                     # 固定激光坐标（标定常数）：不再检测光斑，少一层不确定
-                    spot = {"uv": LASER_UV}
+                    spot = {"uv": (LASER_UV[0] + LASER_TRIM[0],
+                                   LASER_UV[1] + LASER_TRIM[1])}
                 if spot is not None:
                     n_spot += 1
                     su, sv = spot["uv"]

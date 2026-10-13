@@ -628,6 +628,7 @@ static uint8_t  g_yaw_torque_bak;    /* 力矩脚本启动前的模式设置（�
 static float    g_torque_sign = 1.0f;
 static uint8_t  g_torque_sign_checked;   /* 开机只自动查一次 */
 static float    g_sign_int_plus, g_sign_int_minus;
+static float    g_iq_filt;               /* 力矩指令一阶低通状态（防高频颤动）*/
 /* ---- 力矩指令下发节拍（2026-10-13，见控制环里的说明）----
  * 用户实测（上位机）：**0.02Nm 就能让这一轴动** —— 说明轴很轻、之前"推不动"
  * 不是摩擦，是**我们下发的力矩没落到电机上**。最大嫌疑：驱动器参数里的
@@ -817,16 +818,26 @@ static float   g_yaw_stict_a  = 2.0f;      /* 脱困电流上限：A（0x1D）�
  * （一顶就冲过去 = 粘滑的来源）；调小又在"坏角度"上推不动。
  * 自适应版：卡着时以 8A/s 往上爬，一动/误差一小就以 30A/s 掉下来 ——
  * 偏置总是"刚好够"，冲过头的余量最小。0x1D 只当上限用。*/
-#define YAW_BREAK_SLEW_A_PER_S    4.0f
+#define YAW_BREAK_SLEW_A_PER_S   10.0f
 #define YAW_BREAK_DECAY_A_PER_S  30.0f
+/* 误差到多大时脱困偏置给满（°）。0.3° 时给 1/3 的偏置，1.0° 以上给满 ——
+ * 这样"小误差轻推、大误差立刻重推"，既快又不自己造极限环。0x1D 仍是上限。*/
+#define YAW_BREAK_FULL_ERR_DEG    1.0f
 /* ⚠⚠ 2026-10-13（53 号日志："手放到电机上能感到高频振动"）：
  *   两个判据全部改成**施密特迟滞**。原来"误差>0.2° 且 平台速率<2.9°/s = 卡住"，
  *   而稳态时平台速率就在 ±3°/s 附近飘、误差也在 0.2° 上下跳 —— 两个条件都贴着
  *   阈值来回穿，补偿就以高频通断（4A/s 上、30A/s 下），电机跟着"嗡嗡"。
  *   平台惯量大、姿态看不出在动，但手摸电机能明显感觉到。
  *   迟滞之后，进入/退出只在明确跨门限时发生，中间不抖。*/
-#define YAW_BREAK_ERR_DEG       0.30f   /* 上沿：误差超过它才"想动"（°）*/
-#define YAW_BREAK_ERR_LO_DEG    0.12f   /* 下沿：误差低于它才放弃"想动" */
+/* ⚠⚠ 2026-10-13 七版（用户："振动没有减弱、幅度反倒增大"）—— 把"想动"门限**大幅
+ *   抬高**：0.5° 以下完全不出力，1.5° 才算"真想动"。
+ *   为什么：补偿改成连续量后，它在**小误差区也持续出力**（原来硬开关在小误差时是关
+ *   着的），于是靶心附近"推一下→过一点→反向推"自己造了个小极限环 —— 这正是
+ *   "幅度反倒增大"的来源。抬门限后：稳态（误差 ~0.2°，等于视觉死区 1.5px 的量级）
+ *   补偿完全不介入；只有在**移动/扰动**造成 0.5° 以上误差时才出来顶摩擦。
+ *   0x1D 仍是上限。*/
+#define YAW_BREAK_ERR_DEG       1.50f   /* 上沿：误差超过它算"真想动"（°）*/
+#define YAW_BREAK_ERR_LO_DEG    0.50f   /* 下沿：误差低于它完全不出力 */
 #define YAW_BREAK_RATE_RADS     0.15f   /* 上沿：速率超过它才判"动起来"（8.6°/s）*/
 #define YAW_BREAK_RATE_LO_RADS  0.04f   /* 下沿：速率低于它才判"卡住"（2.3°/s）*/
 static float   g_break_i;                  /* 自适应脱困电流（A，0..上限）*/
@@ -1222,12 +1233,18 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  *   现场 40Hz 示踪：误差以 **1.59Hz** 来回翻（81 次/51s），跟随时静差
  *   = (1+KD)/KP × 目标角速度 —— 16/1.60 = 10.0，与上一版 14/1.45 = 9.66 相当
  *   （速度不掉），但**超前量多了**（KD 从 0.45 到 0.60），压 1~2Hz 这种摆动更有效。*/
-#define VIS_KP_YAW          16.0f    /* 1/s：每 1° 误差给出的偏置角速度 */
+/* ⚠ 2026-10-13（61 号日志："远近都偏、远处左右摆得明显"）：16 → 12。
+ *   远处（1.5~1.6m）的左右摆 ±8~13px（±1~1.7°），先把外环比例收一档；
+ *   还摆就把内环速度反馈 0x11（KDc）往上加（200→250）。
+ *   0x0E 在线可改（1200 = 12）。*/
+#define VIS_KP_YAW          12.0f    /* 1/s：每 1° 误差给出的偏置角速度 */
 #define VIS_KP_PITCH        11.0f
 /* 微分阻尼（对应"微分滤波"：直接复用已经滤波的误差变化率 g_vis_rate_*）：
  *   rate += SIGN * KD * d(e_deg)/dt ，KD 单位 = 秒；置 0 = 关闭。
  * 作用：误差在快速收敛时提前"踩刹车"，压住过冲/来回摆。*/
-#define VIS_KD_YAW          0.60f
+#define VIS_KD_YAW          0.70f    /* 2026-10-13（62 号）：0.60->0.70 —— 远端
+                                      * 左右摆已明显改善，再把外环阻尼补一点，
+                                      * 压"移动云台那一下"的瞬时摆动。0x0F 可改 */
 #define VIS_KD_PITCH        0.45f
 #define VIS_D_LIMIT_DPS     40.0f    /* 微分项限幅（°/s）：防图像噪声喂进来 */
 #define VIS_SIGN_YAW       -1.0f     /* 与原 K230 的 SIGN_YAW/PITCH 一致 */
@@ -1237,7 +1254,10 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_LIMIT_YAW_DEG   120.0f   /* 偏置绝对限幅（与原 MAX_YAW_DEG 一致） */
 #define VIS_LIMIT_PITCH_DEG 20.0f
 #define VIS_FREEZE_MS       150u     /* 多久没有新帧 -> 冻住偏置 */
-#define VIS_DEADBAND_PX     3.0f     /* 像素死区（防图像噪声被积分） */
+/* ⚠ 2026-10-13：3.0 -> **1.5**。这是"终点精度"的直接限制：误差小于它就不再积分，
+ *   所以稳态落点天然带着 ±3px 的固定余量（1.6m 处 ≈±1.1cm）。检测噪声实测
+ *   只有 ~1px（[CALIB] 散布 0.0~0.5px），收到 1.5 更合适；若远端出现细抖再回 2.0。*/
+#define VIS_DEADBAND_PX     1.5f     /* 像素死区（防图像噪声被积分） */
 /* 像素误差一阶滤波：0.7 -> 0.8 -> 0.9（新帧才更新）。群延迟 =(1-α)/α×帧周期
  * （帧周期 ≈30ms）：0.7→12ms、0.8→6ms、0.9→3ms。
  * ⚠(37) 这条延迟直接决定"能用的环路增益上限"（相位余量），所以在
@@ -2221,30 +2241,35 @@ static void yuntai_control(uint32_t now)
             float err_deg = g_yaw_err_rad * 57.29578f;
             float aer = fabsf(err_deg);
             float gr  = fabsf(gyro_c[2]);
-            /* 施密特：误差与速率各自带迟滞，避免在阈值上高频通断 */
-            if (g_break_want)
+            /* ⚠ 2026-10-13 六版（用户："高频振动依然存在"）：把最后两处**硬判据**
+             * （want / stuck 的开关位）也做成**连续量**。
+             *   现场反馈：力矩模式下全程可感到高频颤动；而"卡住/动了"的开关在
+             *   陀螺噪声（±3°/s 量级）上通断，就会以同样的频率调制我们给的电流 ——
+             *   这正是我们这一侧能贡献的高频成分。改成连续因子后，噪声只造成
+             *   "斜坡快慢的轻微变化"，不再有开关边沿。
+             *   （如果这样改完颤动依旧，那它就来自驱动器电流环本身，见 0x1D=0 对照。）*/
+            float stuck_f = clampf((YAW_BREAK_RATE_RADS - gr) /
+                                   (YAW_BREAK_RATE_RADS - YAW_BREAK_RATE_LO_RADS),
+                                   0.0f, 1.0f);
+            float want_f  = clampf((aer - YAW_BREAK_ERR_LO_DEG) /
+                                   (YAW_BREAK_ERR_DEG - YAW_BREAK_ERR_LO_DEG),
+                                   0.0f, 1.0f);
             {
-                if (aer < YAW_BREAK_ERR_LO_DEG)  g_break_want = 0u;
-            }
-            else
-            {
-                if (aer > YAW_BREAK_ERR_DEG)     g_break_want = 1u;
-            }
-            if (g_break_stuck)
-            {
-                if (gr > YAW_BREAK_RATE_RADS)    g_break_stuck = 0u;
-            }
-            else
-            {
-                if (gr < YAW_BREAK_RATE_LO_RADS) g_break_stuck = 1u;
-            }
-            if ((g_break_want != 0u) && (g_break_stuck != 0u))
-            {
-                g_break_i += YAW_BREAK_SLEW_A_PER_S * dt;
-            }
-            else
-            {
-                g_break_i -= YAW_BREAK_DECAY_A_PER_S * dt;
+                float tgt_bias = g_yaw_stict_a *
+                                 clampf(aer / YAW_BREAK_FULL_ERR_DEG, 0.0f, 1.0f);
+                float drive = YAW_BREAK_SLEW_A_PER_S * want_f * stuck_f;
+                if (g_break_i < tgt_bias)
+                {
+                    g_break_i += drive * dt;
+                    if (g_break_i > tgt_bias)
+                    {
+                        g_break_i = tgt_bias;
+                    }
+                }
+                else
+                {
+                    g_break_i -= YAW_BREAK_DECAY_A_PER_S * dt;
+                }
             }
             g_break_i = clampf(g_break_i, 0.0f, g_yaw_stict_a);
             if (g_break_i > 0.0f)
@@ -2271,7 +2296,23 @@ static void yuntai_control(uint32_t now)
             g_rate_i = 0.0f;
             g_fault |= FAULT_YAW_RUNAWAY;
         }
+            else
+            {
+                /* 转速回落就清掉故障位：现场日志里 fault=8 一直挂着会看着吓人，
+                 * 其实那道闸只是"当时把力断了"，已经自恢复。 */
+                g_fault &= (uint8_t)~FAULT_YAW_RUNAWAY;
+            }
         /* A -> Nm×100：电流(mA)*0.001*力矩常数0.040Nm/A*100 = mA*0.004 */
+        /* ---- 力矩指令一阶低通（2026-10-13，治"全程可感觉到的高频颤动"）----
+         * 现场反馈：力矩模式下整个云台一直有高频颤动（速度模式时没有）。
+         * 两个可能的来源：① 驱动器电流环自身的纹波（我们管不了，只能靠它的
+         * "滤波带宽"参数）；② 我们指令里的高频成分（脱困补偿的斜坡/陀螺噪声）。
+         * 这里先把②这一半按掉：τ≈1ms 的一阶低通，对环路只加约 1ms 相位，可忽略。*/
+        {
+            float a = 0.5f;   /* 1kHz 下：τ = dt/(1-a) ≈ 1ms */
+            g_iq_filt += a * (g_rate_iq_ma - g_iq_filt);
+            g_rate_iq_ma = g_iq_filt;
+        }
         /* ---- 按节拍下发（见 g_torque_wr_ms 说明）----
          * 每拍都写会把驱动器的"力矩爬升率 5Nm/s"斜坡不停重置，力矩爬不上去。*/
         if ((g_torque_wr_ms == 0u) ||

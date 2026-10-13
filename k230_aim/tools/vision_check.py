@@ -1453,26 +1453,36 @@ class SpotDetector(object):
     # ---- 原生 find_blobs 版（RGB565）----
     def _detect_blobs(self, img):
         x0, y0, w, h = self.roi()
-        best = None
-        # 两个阈值放一次调用（find_blobs 每次约 10ms 固定开销，能省则省）
-        for b in img.find_blobs(SPOT_THRESHOLDS, roi=(x0, y0, w, h),
-                                merge=True,
-                                pixels_threshold=SPOT_MIN_AREA,
-                                area_threshold=SPOT_MIN_AREA):
-            area = b[4]
-            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                continue
-            bw = b[2]
-            bh = b[3]
-            if bw < 1 or bh < 1:
-                continue
-            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                continue
-            bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
-            cx = bx + bw / 2.0
-            cy = by + bh / 2.0
-            if best is None or area > best[0]:
-                best = (area, cx, cy, (bx, by, bw, bh))
+        # ⚠ 2026-10-13（与 main.py 同步）：拆成两次调用、**优先选"过曝白芯"**。
+        #   以前两个阈值混在一起按面积挑最大块 —— 远距离时红色光晕面积大，常常盖过
+        #   白芯被选中；光晕偏离激光真实中心（纸面散射不对称），于是"黄圈/假定光斑"
+        #   与实际光斑有固定偏差，激光整体偏一侧（现场：总往右下偏）。
+        best_core = None
+        best_halo = None
+        for ti in range(len(SPOT_THRESHOLDS)):
+            for b in img.find_blobs([SPOT_THRESHOLDS[ti]], roi=(x0, y0, w, h),
+                                    merge=True,
+                                    pixels_threshold=SPOT_MIN_AREA,
+                                    area_threshold=SPOT_MIN_AREA):
+                area = b[4]
+                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                    continue
+                bw = b[2]
+                bh = b[3]
+                if bw < 1 or bh < 1:
+                    continue
+                if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
+                    continue
+                bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+                if ti == 0:
+                    if best_core is None or area > best_core[0]:
+                        best_core = (area, cx, cy, (bx, by, bw, bh))
+                else:
+                    if best_halo is None or area > best_halo[0]:
+                        best_halo = (area, cx, cy, (bx, by, bw, bh))
+        best = best_core if best_core is not None else best_halo
         if best is None:
             return None
         area, cx, cy, rect = best

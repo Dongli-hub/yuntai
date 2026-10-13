@@ -554,6 +554,18 @@ def run():
 
     ex = SCENE.tgt_u - SCENE.spot_u
     ey = SCENE.tgt_v - SCENE.spot_v
+    # ⚠ 2026-10-13：扣掉"激光点固定微调 LASER_TRIM"。
+    #   整机把"靶心"驱动到 (假定光斑 = LASER_UV+trim) 上，所以控制的残差
+    #   应相对这个参考点来算；仿真里的 SCENE.spot 是理想光斑，不扣会把
+    #   现场标定值误判成"未收敛"。
+    try:
+        _m = re.search(r"(?m)^LASER_TRIM\s*=\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)",
+                       open(MAIN_PY, "r", encoding="utf-8").read())
+        if _m:
+            ex -= int(_m.group(1))
+            ey -= int(_m.group(2))
+    except Exception:
+        pass
     err = (ex * ex + ey * ey) ** 0.5
     print("-" * 66)
     print("仿真结束：虚拟时间 %.2fs" % (_vtime[0] / 1000.0))
