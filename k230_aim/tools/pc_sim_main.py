@@ -94,8 +94,11 @@ class Scene(object):
         self.tgt_u = 300.0 * S_SCALE
         self.tgt_v = 240.0 * S_SCALE
         # 与 main.py 的 USE_FIXED_LASER / LASER_UV 保持一致（激光在画面里的固定位置）
-        self.spot_u = 312.0 * S_SCALE
-        self.spot_v = 252.0 * S_SCALE
+        # ⚠ 2026-10-14：LASER_UV 已冻结为 71 号日志的自标定实测值 (315,246)，
+        #   这里的合成光斑要跟着改，否则"末端残差"会把 (3,-6) 这个口径差算进去、
+        #   看起来像仿真变差了（实际落点一点没变）。
+        self.spot_u = 315.0 * S_SCALE
+        self.spot_v = 246.0 * S_SCALE
 
     def render(self):
         img = np.full((IMG_H, IMG_W, 3), 190, np.uint8)

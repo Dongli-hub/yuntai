@@ -334,7 +334,9 @@ SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]   # 最近一次找到的激光点，主循
 #   联调时若发现打点有固定偏心（总偏右/偏上），直接把 x/y 改同样像素数即可
 #   （K=7.8px/°，10px ≈ 1.3°）。恢复检测把 USE_FIXED_LASER 改 False。
 USE_FIXED_LASER = True
-LASER_UV = (int(round(312 * S_SCALE)), int(round(252 * S_SCALE)))
+# ⚠ 2026-10-14：与 main.py 逐字同步（sync_check 会比对常量值）。
+#   取值 = 71 号日志自标定实测 (315,246)；真正用的激光坐标 = LASER_UV + LASER_TRIM。
+LASER_UV = (int(round(315 * S_SCALE)), int(round(246 * S_SCALE)))
 # --- 激光光斑标定（2026-10-11 用户："黄圈不准"）---
 # 黄圈画的就是 LASER_UV —— 它是**标定常数**，整机瞄准时"靶心-光斑"里的光斑
 # 就用它。所以这个数偏多少像素，激光最终就偏多少像素（K=7.8px/° 时 8px≈1°，
@@ -408,6 +410,11 @@ def px_luma(img, x, y):
 
 
 _scene_cache = [0, 0.0, 0.0]   # [帧计数, 上一次算出的阈值, 预留]
+# 分段耗时探针（2026-10-13 加，用来回答"目标 11ms 到底花在哪"）：
+#   [0] 预留  [1] find_blobs（C 搜索）累计 ms  [2] 预留  [3] 调用次数
+#   日志里的 `块x.x` 就是 [1]/[3] —— C 搜索快不快，一眼能看出来；
+#   若它只占 1~2ms，那"目标"时间的大头就是 Python 侧的四边形复测。
+_PROF = [0.0, 0.0, 0.0, 0]
 
 
 def scene_th(img, n_frame=0):
@@ -731,16 +738,26 @@ def _probe(img, x, y, dx, dy, th):
     沿射线取多数则与细线角度无关。
     ⚠ 2026-10-11 深夜提帧率：5 个采样 -> 3 个。复测里每帧要上千次 _probe，
     这一刀直接把四边形复测的开销砍掉四成（锁定帧 17ms 的大头就是它）。
+    ⚠ 2026-10-13：**再把热路径的内存分配砍掉**。原来是"先建 1 个外层元组 +
+    3 个点元组、再 for 循环"，每帧 ~100 次调用 = 400 次分配（MicroPython 里
+    一次分配要几微秒，攒起来 1~2ms/帧）。现在三个采样点手工展开，
+    语义一字不差：还是 (x-1,y)(x,y)(x+1,y)（竖着时是那三点）里 >=2 点亮。
     """
     if dx:
-        offs = ((x - 1, y), (x, y), (x + 1, y))
+        a0 = x - 1; b0 = y
+        a1 = x;     b1 = y
+        a2 = x + 1; b2 = y
     else:
-        offs = ((x, y - 1), (x, y), (x, y + 1))
+        a0 = x; b0 = y - 1
+        a1 = x; b1 = y
+        a2 = x; b2 = y + 1
     k = 0
-    for p in offs:
-        v = px_luma(img, p[0], p[1])
-        if v >= th:
-            k += 1
+    if px_luma(img, a0, b0) >= th:
+        k += 1
+    if px_luma(img, a1, b1) >= th:
+        k += 1
+    if px_luma(img, a2, b2) >= th:
+        k += 1
     return k >= 2
 
 
@@ -1270,6 +1287,7 @@ class PaperDetector(object):
         n = 0
         dbg = ""
         self.cands = []            # 本帧所有候选（预览画框用，见 __init__）
+        _t0 = time.ticks_ms()
         blobs = img.find_blobs(
             [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
               -PAPER_B_MAX, PAPER_B_MAX)],
@@ -1285,6 +1303,9 @@ class PaperDetector(object):
             roi=roi, merge=False,
             area_threshold=PAPER_MIN_AREA,
             pixels_threshold=PAPER_MIN_AREA)
+        # 分段探针：C 搜索到底占多少（见 _PROF 说明）
+        _PROF[1] += time.ticks_diff(time.ticks_ms(), _t0)
+        _PROF[3] += 1
         if not blobs:
             return None, 0, ""
         blobs = merge_fragments(blobs, roi)

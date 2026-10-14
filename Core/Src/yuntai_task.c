@@ -765,6 +765,55 @@ static float   g_tq_kd    = 2000.0f;   /* mA/(rad/s)（=2.0 A/(rad/s)；0x11）
                                         * 复查过相位余量：3ms 延迟下 25Hz 处环路增益只有
                                         * 0.21，稳。嫌顶不住往 0x11=250/300 加，嫌抖往 100 收。*/
 static float   g_tq_ki    = 8000.0f;   /* mA/(rad·s)（=8 A/(rad·s)；0x16）*/
+/* 积分项最大贡献（mA）= 1.5A。相当于给积分单独加一个"小盖子"（总输出另有 0x17 的
+ * 8A 限幅）：
+ *   · 这一轴摩擦只需要 ~0.5A，1.5A 有 3 倍余量，平时几乎不参与；
+ *   · 但它挡住最坏那条路：转弯时误差被底盘拖到 1~2°、积分一路卷到 8A、转弯一停
+ *     一次性释放 —— 那就是"转完再起步一甩"（70 号日志）。
+ * 0x21 在线可改（刻度 = A×100：1500 = 1.5A，500 = 0.5A，0 = 等于关掉积分）。*/
+static float   g_yaw_ilim_ma = 1500.0f;
+
+/* ============================================================================
+ * ⚠⚠ 2026-10-13 十二版：**参考档试过、失败、已回退**（72 号日志复盘）
+ * ============================================================================
+ * 一、参考代码的真实参数（这次是**读源码**得到的，不是推算；以后要再试以这段为准）
+ *   · UserLib/PID/PID.h —— 位置式 PID：
+ *         sum_error += error_;                          // 每 tick 累加，不乘 dt
+ *         out = kp*error_ + ki*sum_error + kd*(error_ - error);
+ *   · Applications/Src/GimbalTask.cpp —— 角度环构造：
+ *         PID{ position_type, GIMBAL_ANGLE_KP_YAW, GIMBAL_ANGLE_KI_YAW,
+ *              GIMBAL_ANGLE_KD_YAW, 1, 1.8f, -1.8f,
+ *              GIMBAL_MAX_CURRENT, -GIMBAL_MAX_CURRENT };
+ *         = kp 5.0 / ki 0.1 / kd 110 / 积分限幅 ±1.8 / 输出限幅 ±1.65A，Ts = 1ms
+ *   换算到我们 1kHz 的"角度误差 → 电流"：
+ *         kp = 5 A/rad、ki = 100 A/(rad·s)、kd = 0.11 A/(rad/s)、
+ *         积分项电流上限 = ki×1.8 = 0.18A、输出上限 1.65A
+ *
+ * 二、为什么"照搬参考参数"会把激光甩飞（是内外环**带宽不匹配**，不是参数好坏）
+ *   现象（72 号日志）：视觉外环偏置 off= 在 **+41.6 ~ −22.6°** 之间大幅来回，
+ *         平台绝对 yaw 被甩到 ±27°，电机位置爬到 316°，目标滑到画面边缘 → 丢靶。
+ *   机理：
+ *     · 参考那台惯量小、几乎无摩擦，kd 只要 0.11；我们这一轴实测要 2.0 量级。
+ *       kd 一降到 0.11，内环就成了"欠阻尼弹簧"——被扰动后以 ~1Hz 慢慢荡回来。
+ *     · 而 H723 的视觉外环是 kp=12 1/s（τ≈83ms ≈ 1.6Hz），当初是按"内环很快"设计的。
+ *       内环一软，**外环反而成了全系统最快的环**：用 1.6Hz 去追一个 1Hz 才荡回来的
+ *       对象，相位不够 → 偏置被一圈圈卷大 → 把平台甩出去。
+ *     · 结论：参考的参数必须**连同它的视觉外环一起搬**（那部分在 K230 的
+ *       QGimbal-Vision 里）。只搬内环，一定出事 —— 这是拿一次现场时间买到的教训。
+ *   如果还想再试参考内环：必须同时把外环降下来 —— (0x0E, 500) 外环kp=5、
+ *   (0x0F, 140) 外环kd=1.4。
+ *
+ * 三、当前取值 = 68 号日志那版（现场实测最好的一版，用户原话"转弯处的晃动减小了"）
+ *     kp 6 A/rad、kd 2.0 A/(rad/s)、ki 8 A/(rad·s)、积分上限 1.5A
+ *   这不是某次试验值，而是三次现场试错收敛回来的基线：
+ *     kd 砍到 1.0（70 号）→ "转完再起步晃得更明显"；
+ *     kd 砍到 0.11（72 号）→ 内环 1Hz 慢荡、外环卷偏置、激光甩飞；
+ *     ki 提到 30（69 号）→ "转弯时电机一段一段"。
+ * 现场旋钮（改 K230 的 PARAM_SEND 即可，不用重烧）：
+ *   (0x11,200) kd 2.0（默认）/ (0x11,300) 更硬 / (0x11,100) 更轻
+ *   (0x15,600) kp 6（默认）    (0x16,800) ki 8（默认）
+ *   (0x21,1500) 积分上限 1.5A（默认）/ (0x21,500) 0.5A（更保守）
+ *   (0x1D,250) 脱困补偿 2.5A（= 默认，2026-10-14 十三版）/ (0x1D,0) 关掉它*/
 static float   g_yaw_off_rate;         /* 视觉目标角速度（rad/s，AIM 才有）*/
 
 /* ---- 俯仰力矩模式——⚠⚠⚠ 2026-10-14 试过并**失败回退，默认关闭** ----
@@ -806,13 +855,26 @@ static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32
  * 滑环静摩擦大：线性环路要产生 0.2Nm 需要十几度误差，那就没法瞄准了。
  * 做法：误差超过死区、且平台几乎没在动时，**至少**往误差方向给这么多电流
  * （A）；一旦动起来就交回线性环路精修。0x1D 可在线改（单位 A×100）。*/
-static float   g_yaw_stict_a  = 2.0f;      /* 脱困电流上限：A（0x1D）→ 0.08 Nm
+/* ⚠⚠ 2026-10-14 十三版：**1.0A -> 2.5A**（38 号日志："远边晃动格外厉害"的根因）
+ *   证据（38 号日志，那条"远离靶面"的边）：
+ *     · 突发前 `e_u` 从 3px 涨到 24px（车在动、靶在走），而**电机位置一动不动**；
+ *     · 紧接着一帧 30ms 内平台绝对角跳 **7.2°**、陀螺冲到 **±123°/s**，误差到 −66px
+ *       （≈8.5°，1.3m 处约 20cm，差一点出靶），随后 5~8Hz 振铃约 0.5s 才收。
+ *     · 出事时 `[DBG] ym=1007.5°`（电机相对底盘已累到 2.8 圈）——滑环静摩擦
+ *       **随转角变化**，那条边正好停在摩擦最大的角度区。
+ *   机理：卡住 →（补偿封顶 1.0A 顶不开）→ 位置环只能靠 P 项硬憋（6A/rad，要 19° 误差
+ *   才够 2A）→ 外环把偏置卷到 −26° → 突然崩开 → 平台猛甩 → 振铃。就是"卡滞→崩开"。
+ *   为什么敢给 2.5A：这套补偿自带自限（见下面斜坡率那段）——
+ *     · 只在"误差>0.5° 且平台几乎不动"时才爬（10A/s，2.5A 需 250ms）；
+ *     · **平台一动就以 30A/s 收回**（83ms 掉光）。
+ *   所以摩擦小的角度区它涨到 ~0.5A 轴就动了、立刻收回，不会过推；只有真卡住的地方
+ *   才会爬满。现场旋钮：还卡就 (0x1D, 300)/(0x1D, 400)；反而过冲就往 (0x1D, 150) 收。*/
+static float   g_yaw_stict_a  = 2.5f;      /* 脱困电流上限：A（0x1D）→ 0.10 Nm
                                             * ⚠ 46 号日志：±4A 脉冲从静止推不动
                                             * 这一轴（两段积分都 0.00°），而 6A 能动
-                                            * ⚠ 2026-10-13 又降回 3A：用户上位机实测
-                                            * "0.02Nm 就能动"，说明这一轴本身很轻；
-                                            * 补偿给太猛反而自己制造来回冲 —— 先按
-                                            * 温和值跑，不够再 (0x1D, 500)。*/
+                                            * —— 那是"冷启动"数字；稳态下补偿只需
+                                            * 顶开静摩擦（0.5~1A 量级），2.5A 是
+                                            * 给"最坏角度段"留的余量。*/
 /* ---- 自适应脱困补偿的斜坡率（见控制环里那段）----
  * 固定偏置的两难：滑环静摩擦随角度变，固定 4A 在"好角度"上远大于需要
  * （一顶就冲过去 = 粘滑的来源）；调小又在"坏角度"上推不动。
@@ -1251,8 +1313,53 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_SIGN_PITCH     -1.0f
 #define VIS_RATE_YAW_DPS    120.0f   /* 偏置角速度限幅（°/s） */
 #define VIS_RATE_PITCH_DPS  60.0f
-#define VIS_LIMIT_YAW_DEG   120.0f   /* 偏置绝对限幅（与原 MAX_YAW_DEG 一致） */
+/* ⚠⚠ 2026-10-14 十五版：120 -> **190**，并做成在线可调（0x27）。
+ *   42 号日志的证据：剩下 4 个"大误差段"里偏置全顶在这条限幅上
+ *   （off = -77.5 / -113.5 / **-120.0** ...），而场地是**绕靶一圈**——
+ *   需要的方位偏置能到 ±180°。被削掉的那几度 = 剩下那几个事件的来源。
+ *   滑环 360° 无绕线风险，解绕是独立模式（只在需要时由上位机下令），所以放宽安全。
+ *   现场旋钮：0x27（编码 = 真实值×100，例 19000 = 190°）。*/
+#define VIS_LIMIT_YAW_DEG   190.0f   /* 偏置绝对限幅（原来的 120 太紧）*/
 #define VIS_LIMIT_PITCH_DEG 20.0f
+/* ---- 外环"速度记忆"（2026-10-14 十四版：照参考代码的结构补上那一层积分）----
+ * 参考的视觉外环是  rpm = 140·e + 40·∫e + 1.4·ė —— 误差里**还套了一层积分**，
+ * 所以对"匀速变化的目标"是**零稳态滞后**（II 型环）。
+ * 我们的外环只有一层积分（off' = KP·e + KD·ė），要跟随一个以 R 变化的方位角，
+ * 就必须靠一个正比误差去驱动 -> **稳态滞后 = R / KP**。
+ * 38~40 号日志实测：过弯时平台补上来的速度 R≈112°/s，KP=12 -> 预测滞后 9.3°，
+ * 而同一时刻实测横向误差 **9.4°**，数字完全对得上 —— 这就是"掉队再猛追"的真身
+ * （不是摩擦、不是识别）。近边事件最多（R ∝ 1/距离）、远处最容易出靶
+ * （同样的角度在纸面上位移更大），也全由这一条解释。
+ * 加的这一项就是那层积分（"速度记忆"）：
+ *      iv' = KII · e        （iv 单位 °/s，直接加进偏置速率）
+ *      iv 限幅 ±VIS_IV_LIM_DPS，且偏置已顶限幅时不再累积（防卷）
+ * 稳定性：闭环特征多项式变成 (1+KD)s² + KP·s + KII，系数全正 -> 连续域恒稳；
+ * ω_n = sqrt(KII/(1+KD)) ≈ 0.4Hz，远低于"视觉延迟 40~50ms"咬人的频段。
+ * 在线旋钮：0x22（偏航 KII）、0x23（俯仰 KII）；给 0 = 关掉、回到老行为。
+ * 调法：转弯/快跑时还有"掉队"就往 10~15 加；出现 0.3~0.5Hz 慢慢来回荡就收小。*/
+#define VIS_KII_YAW          6.0f    /* 1/s²（0x22 在线可改；默认开）*/
+#define VIS_KII_PITCH        3.0f    /* 1/s²（0x23 在线可改）*/
+#define VIS_IV_LIM_DPS       90.0f   /* iv 项最大贡献（°/s）*/
+/* ⚠⚠ 2026-10-14 十四版补记（41 号日志："左右摆动更厉害了"）——
+ *   上面这套"速度记忆"是**默认开**的（因为它的符号不依赖跨设备约定）；
+ *   而下面那套"方位变化率前馈"（用陀螺估 R）**默认关**：
+ *   41 号日志实测它变成了**正反馈**（平台转速与像素误差变化率的相关性从 0.44 涨到 0.73，
+ *   大误差段 17%->45%、剧烈段 9%->39%）。根因：第一项"陀螺"的符号跨了三个子系统
+ *   （K230 像素轴 / H723 的 SIGN_YAW / IMU 安装方向与 Mahony 轴序），我在纸面上定不了，
+ *   结果两项没有"自相抵消"而是相加 = +2×平台转速。要用它必须先现场定符号（0x26）。*/
+#define VIS_IV_TAU           4.0f    /* 速度记忆的慢泄漏（s）：防止"学到不再需要的速度" */
+/* ---- 外环"目标方位变化率前馈"（2026-10-14 十四版，治 R/KP 稳态滞后）----
+ * 稳态滞后 = R/KP，其中 R = 目标方位的变化率。而 R 是**可以直接估出来**的：
+ *        R ≈ 平台自身角速度(陀螺) + 残余像差变化率/K
+ *   推导（φ = 平台指向、D = 需要指向、eu = 像素误差 = K·SIGN·(D−φ)）：
+ *        Ḋ = φ' + SIGN·(ėu/K) = 陀螺 + SIGN·(像素变化率/K)
+ *   两项都在手边；而且这个估计**自洽**：目标不动时平台一转，两项恰好抵消 -> R=0，
+ *   所以它对"扰动"不响应（不像积分那样会记错账）。
+ * 用途：把 R 直接加进偏置速率 -> 外环不必再靠一个正比误差去"挣"这个速度。
+ * 噪声：陀螺 ±3~5°/s、像素率 ±4°/s -> 先过 VIS_FF_TAU 低通再用。
+ * 在线旋钮：0x25 = 前馈增益（默认 60 = 0.6，给 0 = 关）。嫌不够给 100；反效果给 0。*/
+#define VIS_FF_TAU           0.12f   /* 前馈低通时间常数（s）*/
+#define VIS_FF_GAIN_YAW      0.0f    /* 前馈增益（0~2；0x25 在线可改）。**默认关**，见上面补记 */
 #define VIS_FREEZE_MS       150u     /* 多久没有新帧 -> 冻住偏置 */
 /* ⚠ 2026-10-13：3.0 -> **1.5**。这是"终点精度"的直接限制：误差小于它就不再积分，
  *   所以稳态落点天然带着 ±3px 的固定余量（1.6m 处 ≈±1.1cm）。检测噪声实测
@@ -1297,7 +1404,12 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  *     正常情况下（不超限）= 1.0，一点不影响灵敏度。
  *   "被甩时不要把假误差卷进偏置"的保护还在：①这个连续缩放；②偏置
  *   anti-windup（指令顶限幅时不再往同方向涨）。参考代码里没有这一层。*/
-#define VIS_GATE_DPS        35.0f    /* 平台自转角速度门限（°/s） */
+/* ⚠⚠ 2026-10-13 十二版：35 -> **150°/s**（= 68 号日志里验收过的那一档）。
+ *   这个门限一超就把视觉外环增益按 35/ω 压小 —— 小车转弯时平台转速 50~200°/s，
+ *   外环增益被压到 35%~17%，**转弯全程环路都在"半瘫"**，现场就是"转弯时晃、
+ *   转完才追上来"。它当年的用途是防"我们自己快速扫掠时外环跟内环打架"；
+ *   现在内环是 1kHz 电流环、外环又是积分型（天生不会过冲），放开到 150°/s 够用。*/
+#define VIS_GATE_DPS        150.0f   /* 平台自转角速度门限（°/s） */
 
 static float    g_vis_eu, g_vis_ev;              /* 滤波后的像素误差 */
 static float    g_vis_yaw_off, g_vis_pitch_off;  /* 外环输出：偏置（度） */
@@ -1317,6 +1429,19 @@ static float    g_vis_kd_yaw = VIS_KD_YAW;       /* 可在线改（PARAM 0x0F）
  *     KD 0.45→0.7（补阻尼）。分别用 0x1F / 0x20 在线改。*/
 static float    g_vis_kp_pitch = 4.5f;           /* 可在线改（PARAM 0x1F） */
 static float    g_vis_kd_pitch = 0.85f;          /* 可在线改（PARAM 0x20） */
+/* 外环"速度记忆"（见 VIS_KII_YAW 说明）——2026-10-14 十四版新增 */
+static float    g_vis_kii_yaw = VIS_KII_YAW;     /* 可在线改（PARAM 0x22）*/
+static float    g_vis_kii_pitch = VIS_KII_PITCH; /* 可在线改（PARAM 0x23）*/
+static float    g_vis_iv_u = 0.0f;               /* 偏航速度记忆状态（°/s）*/
+static float    g_vis_iv_v = 0.0f;               /* 俯仰速度记忆状态（°/s）*/
+/* 目标方位变化率前馈（见 VIS_FF_TAU 说明）——2026-10-14 十四版新增 */
+static float    g_vis_ff_gain_yaw = VIS_FF_GAIN_YAW;  /* 可在线改（PARAM 0x25）*/
+static float    g_vis_ff_sign_yaw = 1.0f;        /* ±1（PARAM 0x26）：现场定符号用 */
+static float    g_vis_ff_u = 0.0f;               /* 前馈低通状态（°/s）*/
+/* 偏置速率限幅改成变量（0x24 在线可改）：它可能正在卡住"快跑时的大方位变化" */
+static float    g_vis_rateyaw_dps   = VIS_RATE_YAW_DPS;
+static float    g_vis_ratepitch_dps = VIS_RATE_PITCH_DPS;
+static float    g_vis_limyaw_deg    = VIS_LIMIT_YAW_DEG;  /* 可在线改（PARAM 0x27）*/
 static float    g_yaw_out_rpm = YAW_OUT_RPM;     /* 可在线改（PARAM 0x10） */
 /* 偏航指令是否已经贴着限幅（+1/-1/0），给下面的视觉偏置做 anti-windup。
  * 现场日志(25)：被扰动那 2 秒里 Yc 一直贴在 ±48（限幅 ±50），而视觉偏置
@@ -1357,6 +1482,9 @@ static void vis_outer_reset(void)
     g_vis_eu_prev = 0.0f;
     g_vis_ev_prev = 0.0f;
     g_vis_gate_scale = 1.0f;
+    g_vis_iv_u = 0.0f;              /* 速度记忆也清零（重锁时"从零起步"）*/
+    g_vis_iv_v = 0.0f;
+    g_vis_ff_u = 0.0f;              /* 前馈低通也清零 */
 }
 
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
@@ -1441,18 +1569,51 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             }
         }
     }
-    /* ---- 500Hz 连续积分出偏置（P + 微分阻尼，见宏说明）---- */
+    /* ---- 连续积分出偏置（P + 微分阻尼 + 速度记忆，见宏说明）---- */
     {
+        float eu_deg = g_vis_eu / k;               /* 误差换算成"度" */
+        float ev_deg = g_vis_ev / k;
         float du_dps = clampf(g_vis_rate_u / k, -200.0f, 200.0f);
         float dv_dps = clampf(g_vis_rate_v / k, -200.0f, 200.0f);
         float du_d = clampf(g_vis_kd_yaw * du_dps,
                             -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
         float dv_d = clampf(g_vis_kd_pitch * dv_dps,
                             -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
-        float ru = gate_scale * VIS_SIGN_YAW * (g_vis_kp_yaw * (g_vis_eu / k) +
-                                                du_d);
-        float rv = gate_scale * VIS_SIGN_PITCH * \
-                   (g_vis_kp_pitch * (g_vis_ev / k) + dv_d);
+        /* ---- 速度记忆（II 型环的那层积分，见 VIS_KII_YAW 说明）----
+         * 先按"实际作用方向"累积（乘过 VIS_SIGN_*），这样下面 anti-windup 的
+         * "是不是还在往限幅方向推"才判断得对。 */
+        {
+            float ivu = VIS_SIGN_YAW * g_vis_kii_yaw * eu_deg * dt;
+            float ivv = VIS_SIGN_PITCH * g_vis_kii_pitch * ev_deg * dt;
+            if (!(((g_vis_yaw_off >= g_vis_limyaw_deg) && (ivu > 0.0f)) ||
+                  ((g_vis_yaw_off <= -g_vis_limyaw_deg) && (ivu < 0.0f))))
+            {
+                g_vis_iv_u += ivu;
+            }
+            if (!(((g_vis_pitch_off >= VIS_LIMIT_PITCH_DEG) && (ivv > 0.0f)) ||
+                  ((g_vis_pitch_off <= -VIS_LIMIT_PITCH_DEG) && (ivv < 0.0f))))
+            {
+                g_vis_iv_v += ivv;
+            }
+            g_vis_iv_u = clampf(g_vis_iv_u, -VIS_IV_LIM_DPS, VIS_IV_LIM_DPS);
+            g_vis_iv_v = clampf(g_vis_iv_v, -VIS_IV_LIM_DPS, VIS_IV_LIM_DPS);
+            /* 慢泄漏（τ=4s）：防止"学到一个不再需要的速度"之后一直推着平台走 */
+            g_vis_iv_u -= g_vis_iv_u * (dt / VIS_IV_TAU);
+            g_vis_iv_v -= g_vis_iv_v * (dt / VIS_IV_TAU);
+        }
+        /* ---- 目标方位变化率前馈（见 VIS_FF_TAU 说明）----
+         * Ḋ = 陀螺 + SIGN·(像素变化率/K)：目标不动时两项自相抵消 -> 0，
+         * 所以它只反映"目标（相对世界）真的在动"那部分需求。*/
+        {
+            float bdot = gyro_z_dps + VIS_SIGN_YAW * (g_vis_rate_u / k);
+            float a = dt / (VIS_FF_TAU + dt);
+            g_vis_ff_u += a * (bdot - g_vis_ff_u);
+        }
+        float ru = gate_scale * (VIS_SIGN_YAW * (g_vis_kp_yaw * eu_deg + du_d) +
+                                 g_vis_iv_u) +
+                   gate_scale * g_vis_ff_sign_yaw * g_vis_ff_gain_yaw * g_vis_ff_u;
+        float rv = gate_scale * (VIS_SIGN_PITCH * (g_vis_kp_pitch * ev_deg + dv_d) +
+                                 g_vis_iv_v);
         /* ---- 偏航 anti-windup：指令已经顶着限幅时，不许再往同一方向加偏置
          * （反向的修正照收）。没有这一条：平台满舵期间偏置一直涨，
          * 扰动结束后要花好几秒把这些虚账收回来（现场：甩出去又慢慢回正）。*/
@@ -1461,10 +1622,12 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         {
             ru = 0.0f;
         }
-        ru = clampf(ru, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS);
-        rv = clampf(rv, -VIS_RATE_PITCH_DPS, VIS_RATE_PITCH_DPS);
+        /* ⚠ 2026-10-14 十四版：限幅改成变量（0x24 在线可改）——快跑/过弯时
+         * 需要的偏置速率能到 150°/s 以上，原来写死 120 会在这里悄悄削掉。*/
+        ru = clampf(ru, -g_vis_rateyaw_dps, g_vis_rateyaw_dps);
+        rv = clampf(rv, -g_vis_ratepitch_dps, g_vis_ratepitch_dps);
         g_vis_yaw_off = clampf(g_vis_yaw_off + ru * dt,
-                               -VIS_LIMIT_YAW_DEG, VIS_LIMIT_YAW_DEG);
+                               -g_vis_limyaw_deg, g_vis_limyaw_deg);
         g_vis_pitch_off = clampf(g_vis_pitch_off + rv * dt,
                                  -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
     }
@@ -2206,7 +2369,8 @@ static void yuntai_control(uint32_t now)
         }
         /* ⚠ 积分（mA）：对"角度误差"积分（原来是转速误差）——消静差用 */
         g_rate_i += g_tq_ki * g_yaw_err_rad * dt;
-        g_rate_i = clampf(g_rate_i, -ilim_ma, ilim_ma);
+        /* ⚠ 2026-10-13 十二版：积分单独限幅（原来是整条 8A），见 g_yaw_ilim_ma 说明 */
+        g_rate_i = clampf(g_rate_i, -g_yaw_ilim_ma, g_yaw_ilim_ma);
         g_rate_iq_ma = clampf(g_tq_kp * g_yaw_err_rad
                               - g_tq_kd * (gyro_c[2] - g_yaw_off_rate)
                               + g_rate_i,
@@ -3064,6 +3228,48 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         g_vis_kd_pitch = clampf(v, 0.0f, 1.0f);
         break;
 
+    case GP_PARAM_TQ_I_LIM:
+        /* 偏航力矩环"积分项最大贡献"（2026-10-13 十二版新增，见 g_yaw_ilim_ma 说明）。
+         * 刻度与 0x11/0x15/0x16 一致：value = 真实值(A) × 100（v 已经是 A）。
+         *   1500 = 1.5A（默认，几乎不参与）
+         *    500 = 0.5A（更保守：正好是这一轴的静摩擦量级）
+         * 上限 5A：比参考(0.18A)大 28 倍，再大就不叫"限幅"了；总输出另有 0x17。*/
+        g_yaw_ilim_ma = clampf(v, 0.0f, 5.0f) * 1000.0f;
+        break;
+
+    case GP_PARAM_VIS_KII_YAW:
+        /* 视觉外环"速度记忆"（1/s²，见 VIS_KII_YAW 说明）。0 = 关。*/
+        g_vis_kii_yaw = clampf(v, 0.0f, 60.0f);
+        break;
+
+    case GP_PARAM_VIS_KII_PITCH:
+        g_vis_kii_pitch = clampf(v, 0.0f, 60.0f);
+        break;
+
+    case GP_PARAM_VIS_RATE_LIM:
+        /* 外环偏置速率限幅（°/s）。编码 = 真实值×100（15000 = 150°/s）。
+         * 下限 40 别把自己锁死，上限 400；俯仰按一半一起改（它的角速度本来小）。*/
+        g_vis_rateyaw_dps = clampf(v, 40.0f, 400.0f);
+        g_vis_ratepitch_dps = clampf(v * 0.5f, 20.0f, 200.0f);
+        break;
+
+    case GP_PARAM_VIS_FF_GAIN:
+        /* 目标方位变化率前馈增益（0~2）。0 = 关；1 = 全前馈。见 VIS_FF_TAU 说明。*/
+        g_vis_ff_gain_yaw = clampf(v, 0.0f, 2.0f);
+        break;
+
+    case GP_PARAM_VIS_FF_SIGN:
+        /* 前馈符号（±1）。41 号日志证明默认那个符号是正反馈，所以要用前馈
+         * 就先现场定符号：正反各跑一圈，哪个更稳留哪个。 */
+        g_vis_ff_sign_yaw = (v >= 0.0f) ? 1.0f : -1.0f;
+        break;
+
+    case GP_PARAM_VIS_YAW_LIM:
+        /* 偏航偏置绝对限幅（°）。编码 = 真实值×100（19000 = 190°）。
+         * 十五版默认 190（绕靶一圈需要 ±180）；40~350 可调。 */
+        g_vis_limyaw_deg = clampf(v, 40.0f, 350.0f);
+        break;
+
     case GP_PARAM_YAW_OUT_RPM:
         /* 偏航输出限幅（rpm）。下限 20（别锁死自己），上限 150（≈900°/s，
          * 再大纯粹是给跑飞留空间）。*/
@@ -3073,9 +3279,10 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
     case GP_PARAM_YAW_RATE_DAMP:
         /* ⚠ 2026-10-14 起是"双语义"：
          *   · 力矩模式（默认）：**速度反馈 KDc，A/(rad/s)**，值=A/(rad/s)×100。
-         *     默认 150 = 1.5 A/(rad/s)。**这条就是"速度前馈"的等价物** ——
-         *     "转底盘顶不住"就往上加（200/250），"高频抖"就往下收（100）。
-         *   · 速度模式：仍是 rpm per rad/s（bf3bf46 那条 66.85 的老语义）。*/
+         *     默认 **200 = 2.0 A/(rad/s)**（2026-10-13 十二版：回到 68 号那版）。
+         *    **这条就是“速度前馈”的等价物** —— “转底盘顶不住”就往上加（300），
+         *    “高频抖”就往下收（100）。⚠ 别往 0.11（参考值）方向砍：69/70/72 号
+         *    日志三次证明这一轴没有它就不行（内环欠阻尼 → 外环卷偏置 → 甩飞）。*/
         if (g_yaw_torque != 0u)
         {
             g_tq_kd = clampf(v, 0.0f, 100.0f) * 1000.0f;
@@ -3341,10 +3548,27 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         snprintf(buf, sizeof(buf), "[PARAM] tqKp(A/rad) %s tqKd %s", n1, n2);
         gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_tq_ki / 1000.0f, 1);
-        snprintf(buf, sizeof(buf), "[PARAM] tqKi(A/rads) %s", n1);
+        fmt_f(n2, sizeof(n2), g_yaw_ilim_ma, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] tqKi(A/rads) %s ILim(mA) %s",
+                 n1, n2);
         gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_rate_ilim_a, 2);
         snprintf(buf, sizeof(buf), "[PARAM] rateILim %s", n1);
+        gimbal_link_log_force(buf);
+        /* 十四版新增的视觉外环旋钮（速度记忆 / 速率限幅 / 方位变化率前馈）*/
+        fmt_f(n1, sizeof(n1), g_vis_kii_yaw, 1);
+        fmt_f(n2, sizeof(n2), g_vis_kii_pitch, 1);
+        snprintf(buf, sizeof(buf), "[PARAM] visKII y=%s p=%s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_vis_rateyaw_dps, 0);
+        fmt_f(n2, sizeof(n2), g_vis_ratepitch_dps, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] visRateLim y=%s p=%s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_vis_ff_gain_yaw, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] visFFGain %s", n1);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_vis_limyaw_deg, 0);
+        snprintf(buf, sizeof(buf), "[PARAM] visYawLim %s", n1);
         gimbal_link_log_force(buf);
         return;
 
