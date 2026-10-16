@@ -154,6 +154,19 @@ GY_TH = 72
 #      的四成。th=72 时白带本身已经很宽，close 只是把边沿各补 1~2px；
 #      [MT] 表里也能看出开运算只改 0.5% 像素。要重新补断口就改回 1（+29ms/次）。
 GY_CLOSE_SIZE = 0
+# 锁定后"只在上一帧框周围找"的 ROI（cv_lite 耗时 ∝ 面积）：
+#   ROI 边长 = 上一帧长边 × CROP_K + 2×CROP_MARGIN_PX（再加运动量）。
+#   只在 ROI 面积 <= CROP_MAX_FRAC×全图 时才裁（否则省不了多少、还要多一次复制），
+#   裁完找不到 / 这版 cv_lite 不吃裁剪缓冲 -> 自动退回全图（一次性日志），
+#   绝不会因为省时间把识别搞死。0 = 不裁。
+CROP_K = 1.6
+CROP_MARGIN_PX = 60
+CROP_MAX_FRAC = 0.55
+# 预览融合图的分辨率除数（2026-10-16）：cv_lite/形态学的耗时**与像素数成正比**，
+#   半分辨率（320x240）= 1/4 像素 = 快 ~4 倍，贴回画布时按 2 倍放大画，
+#   二值图放大 2 倍肉眼几乎看不出差别。只在 vision_check 里生效
+#   （整机 _WANT_MASK=False，根本不建这张预览图）。1 = 全分辨率。
+MASK_SCALE = 2
 GY_AREA_MIN_RATIO = 0.0003  # ⑥ cv_lite 的"最小面积"是**相对比例**：国一 100px²/307200
 GY_MAX_COS = 0.3           # ⑥ 角度判据（cv_lite 参数；国一 ANGLE_TOLERANCE=30°）
 GY_CANNY1 = 50             # ⑤ Canny(50, 150) —— 在**灰度图**上做
@@ -290,22 +303,11 @@ _PROF = [0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0]
 
 def prof_line():
     """分段探针拼成一行（只读，不清零）。"""
-    nm = _PROF[5] if _PROF[5] > 0 else 1
-    nf = _PROF[7] if _PROF[7] > 0 else 1
-    nb = _PROF[3] if _PROF[3] > 0 else 1
-    nc = _PROF[13] if _PROF[13] > 0 else 1
     n2 = _PROF[15] if _PROF[15] > 0 else 1
-    return ("掩码%.0fms/次x%d[灰%.1f 二值形态%.1f 边%.1f 还原%.1f] "
-            "find_blobs%.1fms/次x%d _find%.0fms/次x%d cv矩%.0fms/次x%d "
-            "国一%.0fms/次x%d[建图%.0f 矩形%.0f]"
-            % (_PROF[4] / float(nm), _PROF[5],
-               _PROF[8] / float(nm), _PROF[9] / float(nm),
-               _PROF[10] / float(nm), _PROF[11] / float(nm),
-               _PROF[1] / float(nb), _PROF[3],
-               _PROF[6] / float(nf), _PROF[7],
-               _PROF[12] / float(nc), _PROF[13],
-               _PROF[14] / float(n2), _PROF[15],
-               _PROF[0] / float(n2), _PROF[2] / float(n2)))
+    return ("国一%.0fms/次x%d[建图%.0f 矩形%.0f 喂像素%.0f万px]"
+            % (_PROF[14] / float(n2), _PROF[15],
+               _PROF[0] / float(n2), _PROF[2] / float(n2),
+               _PROF[1] / float(n2) / 10000.0))
 
 
 def prof_reset():
@@ -323,6 +325,8 @@ _LAST_MASK = None
 #    所以下面每一步都用 cv_lite / image 模块实现，等价于国一原文那 7 步。）
 # ============================================================================
 _GY_ERR = [0]
+_CROP_ERR = [0]            # ROI 裁剪本身报错次数（第 1 次打日志；-1 = 已停用）
+_CROP_MISS = [0]           # ROI 里连续没找到几次（连续 3 次就永久退回全图）
 # 要不要建"预览那张融合图"（反向二值化 ∪ Canny）。
 #   ⚠ 整机 main.py **不需要**（它推画面推的是原始帧，没人看掩码），
 #     所以这里默认关 —— 省 40~60ms/次（国一那条链的大头）。
@@ -403,7 +407,7 @@ def _gy_centroid4(c):
     return (cx / (3.0 * a2), cy / (3.0 * a2))
 
 
-def _cv2_find(img, prefer_long=0.0):
+def _cv2_find(img, hint=None):
     """「国一那套」矩形检测 —— 用板上自带的 OpenCV 接口（cv_lite）跑国一的每一步。
 
     ① 灰度        init_camera() 按 CVLITE_ON 出 GRAYSCALE，to_numpy_ref()
@@ -423,8 +427,11 @@ def _cv2_find(img, prefer_long=0.0):
                     改回**统一用内框**（纸的边界）—— 胶带的外沿在斜视/反光下时有时无，
                     有它时框画在胶带外沿、没它时画在纸边，就来回跳了；纸边一直很稳。
                     内外配对判据照旧（它保证"内框在外框里"这件事成立）。
-    prefer_long：上一帧被采纳的长边。斜视时画面里常同时存在"纸边/胶带外沿"两套
-                    尺寸，用它做时间一致性偏好，避免在两个尺寸之间来回切。
+    hint：(长边, 中心x, 中心y) —— 上一帧被采纳的那个框。两个用途：
+      ① 斜视时画面里常同时存在"纸边/胶带外沿"两套尺寸，用它做时间一致性偏好；
+      ② **锁定后只在它周围一块 ROI 里跑 cv_lite**（耗时 ∝ 面积）：目标远、框小
+         时 ROI 只占画面几个百分点 -> 那一步从 24ms 掉到几 ms；目标近、框大时
+         直接不裁（省不了多少还多一次复制）。裁剪不受支持/裁完没找到就退回全图。
     返回与 _find0 同格式的候选元组；认不出返回 None。
     """
     global _LAST_MASK
@@ -449,20 +456,40 @@ def _cv2_find(img, prefer_long=0.0):
         #   帧率（搜索阶段国一每帧都跑，省得最多）。
         fi = None
         if _WANT_MASK[0]:
+            # 预览用**半分辨率**（MASK_SCALE=2）：二值化/闭运算/Canny 的耗时都
+            #   与像素数成正比，1/4 像素 = 快约 4 倍；贴回画布时放大 2 倍画。
             # ②/③ 反向二值化 + 闭运算：**在副本上做**（img.copy()）——
             #   ① 不能污染 gray_np：cv_lite 的矩形检测要的是原始灰度图；
             #   ② 不能别名帧缓冲：_LAST_MASK 会缓存这张图给预览用，若它指的就是
             #      帧缓冲，下一帧 sensor.snapshot() 一覆盖，预览就变成别的画面
             #      （现场"两种二值化来回闪"里也有它的份）。
+            _mw = IMG_W // MASK_SCALE
+            _mh = IMG_H // MASK_SCALE
             gi = None
-            try:
-                gi = img.copy()
-            except Exception:
-                gi = None
+            if MASK_SCALE > 1:
+                try:
+                    gi = img.copy(x_scale=1.0 / MASK_SCALE,
+                                  y_scale=1.0 / MASK_SCALE)
+                except Exception:
+                    gi = None
+                    _mw, _mh = IMG_W, IMG_H
+            if gi is None:
+                _mw, _mh = IMG_W, IMG_H
+                try:
+                    gi = img.copy()
+                except Exception:
+                    gi = None
             if gi is None:
                 gi = img.to_grayscale()      # 兜底①：至少换一张图
             if gi is None:
                 gi = img                      # 兜底②：实在没有副本，就地做
+            # 小图的灰度引用要在二值化**之前**取（同一块缓冲，之后会被改写）
+            _gsn = None
+            if (_mw != IMG_W) or (_mh != IMG_H):
+                try:
+                    _gsn = gi.to_numpy_ref()
+                except Exception:
+                    _gsn = None
             # ② 反向二值化：白 = 暗（比 GY_TH 暗的都变白 → 黑胶带成前景）
             if GY_TH <= 1:
                 gi.binary([(0, 0)])
@@ -472,8 +499,9 @@ def _cv2_find(img, prefer_long=0.0):
             if GY_CLOSE_SIZE > 0:
                 gi.close(GY_CLOSE_SIZE)
             # ④ Canny 在灰度图上做（不是二值图上）
-            edges_np = cv_lite.grayscale_find_edges([IMG_H, IMG_W], gray_np,
-                                                    GY_CANNY1, GY_CANNY2)
+            edges_np = cv_lite.grayscale_find_edges(
+                [_mh, _mw], _gsn if _gsn is not None else gray_np,
+                GY_CANNY1, GY_CANNY2)
             # ⑤ 融合：闭运算二值图 ∪ Canny 边缘
             #   ⚠ b_or 要求两张图**同格式** —— 二值化后 gi 是"按位打包"的
             #   掩码图，直接和灰度边缘图做 OR 会不生效（现场"看不到融合"就
@@ -488,7 +516,7 @@ def _cv2_find(img, prefer_long=0.0):
                     if gtmp is not None:
                         gi = gtmp
                         fi = gtmp
-                    ei = image.Image(IMG_W, IMG_H, image.GRAYSCALE,
+                    ei = image.Image(_mw, _mh, image.GRAYSCALE,
                                      alloc=image.ALLOC_REF, data=edges_np)
                     try:
                         gi.b_or(ei)           # ① 按位或（就地改）
@@ -532,10 +560,80 @@ def _cv2_find(img, prefer_long=0.0):
             pass
         # ⑥ 矩形（cv_lite 的 C 实现：Canny+轮廓+approxPolyDP+几何校验）
         _t2 = time.ticks_ms()
-        rects = cv_lite.grayscale_find_rectangles_with_corners(
-            [IMG_H, IMG_W], gray_np, GY_CANNY1, GY_CANNY2,
-            GY_EPS, GY_AREA_MIN_RATIO, GY_MAX_COS, GY_BLUR)
+        #    ⚠ 这一步实测 24ms/次 —— 和官方文档里"480x640 灰度 find_rectangles
+        #      40fps（≈25ms）"完全一致，**已经到 C 库的极限**，再快只能少喂像素：
+        #      · 锁定后用 hint 在上一帧框周围裁一块 ROI（目标越远省得越多）；
+        #      · 裁不了 / 裁完一个都没找到 -> 这一帧退回全图，绝不因此丢识别。
+        rects = None
+        _rx = _ry = 0
+        _rw, _rh = IMG_W, IMG_H
+        if (CROP_K > 0.0) and (_CROP_ERR[0] >= 0) and (hint is not None) and \
+                (hint[0] > 8.0):
+            _hl, _hx, _hy = hint[0], hint[1], hint[2]
+            _side = int(_hl * CROP_K) + 2 * CROP_MARGIN_PX
+            x0 = int(_hx - _side * 0.5)
+            y0 = int(_hy - _side * 0.5)
+            x1 = x0 + _side
+            y1 = y0 + _side
+            if x0 < 0:
+                x0 = 0
+            if y0 < 0:
+                y0 = 0
+            if x1 > IMG_W:
+                x1 = IMG_W
+            if y1 > IMG_H:
+                y1 = IMG_H
+            _rw = x1 - x0
+            _rh = y1 - y0
+            if ((_rw * _rh) > CROP_MAX_FRAC * IMG_W * IMG_H) or \
+                    (_rw < 48) or (_rh < 48):
+                _rw, _rh = IMG_W, IMG_H        # 框太大/太小：不裁
+            else:
+                try:
+                    _sub = gray_np[y0:y0 + _rh, x0:x0 + _rw]
+                    rects = cv_lite.grayscale_find_rectangles_with_corners(
+                        [_rh, _rw], _sub, GY_CANNY1, GY_CANNY2,
+                        GY_EPS, GY_AREA_MIN_RATIO, GY_MAX_COS, GY_BLUR)
+                    _rx, _ry = x0, y0
+                    if (rects is not None) and (len(rects) > 0):
+                        _CROP_MISS[0] = 0
+                        # ROI 内部坐标 -> 全图坐标（角点/外接框一起挪）
+                        _out = []
+                        for _r in rects:
+                            _q = list(_r)
+                            _q[0] += _rx
+                            _q[1] += _ry
+                            for _k in (4, 6, 8, 10):
+                                _q[_k] += _rx
+                            for _k in (5, 7, 9, 11):
+                                _q[_k] += _ry
+                            _out.append(_q)
+                        rects = _out
+                    else:
+                        _CROP_MISS[0] += 1
+                        if _CROP_MISS[0] >= 3:
+                            # 连 3 帧在 ROI 里一个矩形都没有 = 目标已经不在
+                            # 上一帧框附近了（或者裁剪缓冲这版 cv_lite 不认）——
+                            # 退回全图，别再省这点时间。
+                            _CROP_ERR[0] = -1
+                            log("[CV2] ROI 连续 3 帧没找到 -> 退回全图检测")
+                        rects = None
+                except Exception as e:
+                    _CROP_ERR[0] += 1
+                    if _CROP_ERR[0] == 1:
+                        log("[CV2] ROI 裁剪不可用(%s) -> 以后都跑全图" % e)
+                    rects = None
+        if rects is None:
+            _rw, _rh = IMG_W, IMG_H
+            rects = cv_lite.grayscale_find_rectangles_with_corners(
+                [IMG_H, IMG_W], gray_np, GY_CANNY1, GY_CANNY2,
+                GY_EPS, GY_AREA_MIN_RATIO, GY_MAX_COS, GY_BLUR)
         _PROF[2] += time.ticks_diff(time.ticks_ms(), _t2)
+        _PROF[3] += 1
+        if (_rw != IMG_W) or (_rh != IMG_H):
+            _PROF[1] += _rw * _rh        # 这一拍实际喂了多少像素（[PERF] 里看）
+        else:
+            _PROF[1] += IMG_W * IMG_H
         if (rects is None) or (len(rects) < 1):
             return None
         # ⑦ 内外双轮廓配对：内框在外框里、面积比 ≥ GY_AREA_RATIO
@@ -604,6 +702,7 @@ def _cv2_find(img, prefer_long=0.0):
             _iys = (_ic[0][1], _ic[1][1], _ic[2][1], _ic[3][1])
             _il = max(max(_ixs) - min(_ixs), max(_iys) - min(_iys))
             _stable = 0
+            prefer_long = hint[0] if hint is not None else 0.0
             if (prefer_long > 1.0) and \
                     (abs(_il - prefer_long) <= 0.18 * prefer_long):
                 _stable = 1
@@ -886,7 +985,9 @@ class PaperDetector(object):
             return self.last_res
         cand = None
         try:
-            cand = _cv2_find(img, self.last_long if self.have else 0.0)
+            # hint = (上一帧长边, 中心x, 中心y)：既做时间一致性偏好，也用来裁 ROI
+            cand = _cv2_find(img, (self.last_long, self.u, self.v)
+                             if self.have else None)
         except Exception as e:
             self.err += 1
             if self.err_msg != str(e):
@@ -1187,6 +1288,7 @@ def main():
     _oy = int((DISPLAY_H - IMG_H * _sy) * 0.5)
     _preview_scaled = True        # draw_image 的缩放万一不支持 -> 退回推原图
     _bin_mode = ""                # 二值预览走哪条路（下面探测；"" = 用不了）
+    _msc = 1.0                    # 预览图的缩放倍数（半分辨率掩码 = MASK_SCALE）
     _cv_shape = False             # 画布上能不能画图形（下面探测）
     _cv_text = False              # 画布上能不能写字
     _ov_bad = []                  # 哪些绘制调用这版固件不支持（每个只报一次）
@@ -1622,10 +1724,13 @@ def main():
                             if _mg is None:
                                 _mg = _LAST_MASK
                             if _mg is None:
+                                _msc = 1.0
                                 _bin_mode = ""
                                 print("检测图预览: 还没建出来 -> 改彩色预览")
                             else:
                                 img = _mg
+                                # 掩码是半分辨率建的（MASK_SCALE）-> 贴回画布放大画
+                                _msc = float(MASK_SCALE)
                         except Exception as e:
                             _bin_mode = ""
                             print("检测图预览失败(%s) -> 改彩色预览" % einfo(e))
@@ -1633,7 +1738,8 @@ def main():
                     try:
                         if _bin_mode == "bin":
                             _canvas.draw_image(img, _ox, _oy,
-                                               x_scale=_sx, y_scale=_sy)
+                                               x_scale=_sx * _msc,
+                                               y_scale=_sy * _msc)
                         elif _bin_mode == "copy":
                             img.copy_to(_bin_rgb)
                             _canvas.draw_image(_bin_rgb, _ox, _oy,

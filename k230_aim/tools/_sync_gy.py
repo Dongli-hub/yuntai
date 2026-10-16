@@ -23,14 +23,20 @@ MAIN = os.path.join(ROOT, "k230_aim", "main.py")
 TOOL = os.path.join(ROOT, "k230_aim", "tools", "vision_check.py")
 
 # 要搬的模块级"简单赋值"名字（连同它头顶的注释块一起搬）
-CONSTS = ["GY_TH", "GY_CLOSE_SIZE", "CV2_EVERY", "PAPER_RING_RISE_MIN"]
+CONSTS = ["GY_TH", "GY_CLOSE_SIZE", "CV2_EVERY", "PAPER_RING_RISE_MIN",
+          "MASK_SCALE", "CROP_K", "CROP_MARGIN_PX", "CROP_MAX_FRAC"]
 # 目标文件还没有这条常量时，插到哪个常量后面（保持和 main.py 同样的位置）
-INSERT_AFTER = {"PAPER_RING_RISE_MIN": "PAPER_CONTRAST_MIN"}
+INSERT_AFTER = {"PAPER_RING_RISE_MIN": "PAPER_CONTRAST_MIN",
+                "MASK_SCALE": "GY_CLOSE_SIZE",
+                "CROP_K": "GY_CLOSE_SIZE",
+                "CROP_MARGIN_PX": "CROP_K",
+                "CROP_MAX_FRAC": "CROP_MARGIN_PX"}
 # 要搬的"整行"定义（注释 + 赋值，看名字在两边各出现一次）
-EXTRA_LINES = ["_GY_FUSE_ERR", "_GY_MASK_CACHE", "_WANT_MASK"]
+EXTRA_LINES = ["_GY_FUSE_ERR", "_GY_MASK_CACHE", "_WANT_MASK",
+               "_CROP_MISS", "_CROP_ERR"]
 # 要搬的函数/类（整块替换，含头顶注释）
 BLOCKS = ["_cv2_find", "PaperDetector", "SpotDetector", "log_scene", "px_luma",
-          "paper_contrast"]
+          "paper_contrast", "prof_line"]
 
 
 def read(path):
@@ -59,7 +65,7 @@ def block_span(lines, name):
     raise SystemExit("找不到 %s" % name)
 
 
-def const_span(lines, name):
+def const_span(lines, name, quiet=False):
     """顶层简单赋值（含头顶注释块）的 (起点, 终点)。"""
     tree = ast.parse("\n".join(lines))
     for node in tree.body:
@@ -67,6 +73,8 @@ def const_span(lines, name):
                 isinstance(node.targets[0], ast.Name) and \
                 node.targets[0].id == name:
             return head_start(lines, node.lineno - 1), node.end_lineno
+    if quiet:
+        return None
     raise SystemExit("找不到常量 %s" % name)
 
 
@@ -89,17 +97,23 @@ def insert_span(lines, anchor):
 def main():
     m = read(MAIN)
     t = read(TOOL)
+    # ---- 第一遍：目标文件还缺的常量，按 INSERT_AFTER 逐个插进去 ----
+    #   （一次只插一条、插完重新定位 —— 否则同一锚点上的多条会插错位置）
+    for name in CONSTS:
+        if name not in INSERT_AFTER:
+            continue
+        if const_span(t, name, quiet=True) is not None:
+            continue
+        anchor = INSERT_AFTER[name]
+        a1, b1 = const_span(m, name)
+        _a, _b = const_span(t, anchor)
+        print("  [插入] %-18s 在 %s 之后" % (name, anchor))
+        t = t[:_b] + m[a1:b1] + t[_b:]
+    # ---- 第二遍：常量/小变量/大块，从文件末尾往前替换 ----
     jobs = []
     for name in CONSTS:
         a1, b1 = const_span(m, name)
-        dst = const_span(t, name) if name not in INSERT_AFTER else None
-        if dst is None:
-            anchor = INSERT_AFTER.get(name)
-            if anchor is None:
-                raise SystemExit("目标文件里没有 %s" % name)
-            _a, _b = const_span(t, anchor)
-            dst = (_b, _b)          # 插在锚点后面
-        jobs.append(("const:" + name, (a1, b1), dst))
+        jobs.append(("const:" + name, (a1, b1), const_span(t, name)))
     for name in EXTRA_LINES:
         job = line_span(t, name)
         if job is None:

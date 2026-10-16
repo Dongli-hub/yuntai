@@ -90,6 +90,25 @@ def main():
     cv2.rectangle(plain, (200, 120), (420, 360), (225, 225, 225), -1)
     run("D 无靶(只有白块)", plain, "none")
 
+    # E ROI 裁剪路径：给一个"上一帧小框"的 hint，应只在框周围找 ——
+    #   结果一样准，但喂给 cv_lite 的像素要明显少于全图（PROF[1] 记账）
+    #   （用远处小纸的场景：ROI 才真正比全图小；近处大纸按设计就不裁）
+    f = frame_from(np.ascontiguousarray(canvas), g)
+    g["_PROF"][1] = 0.0
+    g["_PROF"][3] = 0
+    r = g["_cv2_find"](f, (122.0, 105.0, 84.0))
+    fed = g["_PROF"][1] / max(1, g["_PROF"][3])
+    if r is None:
+        print("E ROI 路径: FAIL（没找到）")
+        ok = False
+    else:
+        d = max(abs(r[11] - 105.0), abs(r[12] - 84.0))
+        good = (d <= 6.0) and (fed < 0.35 * W * H)
+        print("E ROI 路径: %s 误差=%.1fpx 喂像素=%.0f万 (全图 %.0f万)"
+              % ("OK" if good else "FAIL", d, fed / 10000.0,
+                 W * H / 10000.0))
+        ok = ok and good
+
     print("结果：%s" % ("检测回归 OK" if ok else "检测回归有问题"))
     return 0 if ok else 1
 
