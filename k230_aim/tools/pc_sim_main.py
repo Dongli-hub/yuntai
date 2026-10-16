@@ -101,18 +101,47 @@ class Scene(object):
         self.spot_v = 246.0 * S_SCALE
 
     def render(self):
-        img = np.full((IMG_H, IMG_W, 3), 190, np.uint8)
+        # ⚠ 2026-10-15：场景**现实化**（原来背景和"纸面"一样亮 190，
+        #   二值化时"纸"和背景根本分不开，Otsu 只能靠兜底值；而且激光点画成
+        #   暗红实心盘，落在"纸"里面就成了块内的一坨厚黑 -> 新加的内轮廓校验
+        #   必拒收）。现在照现场的样子铺三层：
+        #     背景(白墙/木柜) 150、纸面 235、黑胶带 25 —— 阈值有真正的落脚处；
+        #     激光点 = 白芯 + 淡红光晕（真实激光打在白纸上就是过曝的白点，
+        #     不是黑点）。这样仿真才验得了"Otsu + 开/腐 + Canny"这条新链。
+        # ⚠ 2026-10-16：背景 70 -> **120**，对齐"国一那套"的物理前提 ——
+        #   反向二值化(CV2_TH=89)只把**比阈值暗**的东西变白：胶带(25~)变白、
+        #   背景(120)与纸(235)保持黑。这样胶带圈才是**孤立的一条白带**，
+        #   内外双轮廓(内框=纸的洞)才配得上对；背景若比阈值还暗，它会和胶带
+        #   连成一片、把圈吞掉（那是仿真场景失真，不是算法问题）。
+        img = np.full((IMG_H, IMG_W, 3), 120, np.uint8)
         w = int(200 * S_SCALE)
         h = int(330 * S_SCALE)
         t = int(round(20 * S_SCALE))
         x0 = int(self.tgt_u - w / 2)
         y0 = int(self.tgt_v - h / 2)
         cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (25, 25, 30), t)
-        # 激光点：红边要够红（a>=25、b>=-20）才能过 SPOT_THRESHOLDS 第二档。
-        # 2026-10-11：原来的 (250,190,250) 算出来 b=-21，正好差 1 检不出来。
+        # 圈内 = 白纸（比背景亮一大截，这就是"内亮外黑"的来源）
+        cv2.rectangle(img, (x0 + t, y0 + t), (x0 + w - t, y0 + h - t),
+                      (235, 235, 235), -1)
+        # 激光点：白芯 + 淡红光晕（BGR；光晕 luma≈216，仍在纸面之上，
+        # 不会在块里形成"厚黑"）。红边保持 a 分量够红，万一开光斑检测也能用。
+        _su = int(self.spot_u)
+        _sv = int(self.spot_v)
+        cv2.circle(img, (_su, _sv), int(round(5 * S_SCALE)),
+                   (200, 200, 255), -1)
         cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
-                   int(round(5 * S_SCALE)),
-                   (120, 120, 255), -1)
+                   int(round(2 * S_SCALE)), (245, 245, 255), -1)
+        # 低对比"假白块"（回归用）：一块亮底里挖一圈暗槽，槽里的白块也是候选，
+        # 但它"外侧"采样点落在亮底上（几乎一样亮）-> 必然在"对比"这道便宜
+        # 闸门上被拒。⚠ 2026-10-15 那版"闸门前置"的 UnboundLocalError 就是
+        # 因为仿真场景里从来没有候选走到这条早退路（真机上一跑就 候选0）。
+        _px0 = x0 + w + 30
+        _py0 = max(0, y0 + 20)
+        if (_px0 + 150) < IMG_W and (_py0 + 110) < IMG_H:
+            cv2.rectangle(img, (_px0, _py0), (_px0 + 150, _py0 + 110),
+                          (200, 200, 200), -1)
+            cv2.rectangle(img, (_px0 + 6, _py0 + 6), (_px0 + 144, _py0 + 104),
+                          (60, 60, 60), 4)
         return img
 
 
@@ -192,10 +221,17 @@ class FakeFrame(object):
         L = lab[:, :, 0].astype(np.float32) / 2.55      # 0~100（同 CanMV）
         A = lab[:, :, 1].astype(np.int16) - 128
         B = lab[:, :, 2].astype(np.int16) - 128
+        # 2026-10-15：**两种阈值元组都接** —— 6 元组 = LAB（彩色图）；
+        # 2 元组 = (lo,hi) 亮度（灰度图；CVLITE_ON 时 sensor 出灰度图走这条）。
+        gray = cv2.cvtColor(self.np, cv2.COLOR_BGR2GRAY).astype(np.float32)
         mask = np.zeros(L.shape, np.uint8)
-        for (l0, l1, a0, a1, b0, b1) in thresholds:
-            m = ((L >= l0) & (L <= l1) & (A >= a0) & (A <= a1) &
-                 (B >= b0) & (B <= b1))
+        for _t in thresholds:
+            if len(_t) == 2:
+                m = (gray >= _t[0]) & (gray <= _t[1])
+            else:
+                l0, l1, a0, a1, b0, b1 = _t
+                m = ((L >= l0) & (L <= l1) & (A >= a0) & (A <= a1) &
+                     (B >= b0) & (B <= b1))
             mask[m] = 255
         if roi is not None:
             rx, ry, rw, rh = roi
@@ -246,6 +282,109 @@ class FakeFrame(object):
     def get_pixel(self, x, y):
         p = self.np[int(y), int(x)]
         return (int(p[2]), int(p[1]), int(p[0]))
+
+    def to_grayscale(self):
+        """对应 CanMV 的 img.to_grayscale()：**返回新图**，原图不动。"""
+        return FakeGrayFrame(self)
+
+    def to_numpy_ref(self):
+        """对应 CanMV 的 img.to_numpy_ref()：返回 ndarray 引用（仿真里就是 np）。"""
+        return self.np
+
+
+class FakeGrayFrame(object):
+    """仿真版灰度图（形态学预处理路径用）：
+    支持 close(size) 闭运算、灰度语义 find_blobs([(lo, hi)])、get_pixel 返回单值。"""
+
+    def __init__(self, src):
+        self.np = cv2.cvtColor(src.np, cv2.COLOR_BGR2GRAY)
+
+    def close(self, size):
+        k = 2 * int(size) + 1
+        kern = np.ones((k, k), np.uint8)
+        self.np = cv2.morphologyEx(self.np, cv2.MORPH_CLOSE, kern)
+        return self
+
+    def open(self, size, **kw):
+        k = 2 * int(size) + 1
+        kern = np.ones((k, k), np.uint8)
+        self.np = cv2.morphologyEx(self.np, cv2.MORPH_OPEN, kern)
+        return self
+
+    def gaussian(self, size, **kw):
+        k = 2 * int(size) + 1
+        self.np = cv2.GaussianBlur(self.np, (k, k), 0)
+        return self
+
+    def erode(self, size, **kw):
+        """对应 CanMV img.erode(size)：核 (2*size+1)²。"""
+        k = 2 * int(size) + 1
+        kern = np.ones((k, k), np.uint8)
+        self.np = cv2.erode(self.np, kern)
+        return self
+
+    def copy(self):
+        """对应 CanMV img.copy()：返回一份独立副本（不改原图）。"""
+        n = FakeGrayFrame.__new__(FakeGrayFrame)
+        n.np = self.np.copy()
+        return n
+
+    def find_edges(self, edge_type, threshold=None, **kw):
+        """对应 CanMV img.find_edges(image.EDGE_CANNY, (lo, hi))：
+        把图像变成"黑底白线"的边缘图（原图就地改）。"""
+        if threshold is None:
+            threshold = kw.get("threshold", (100, 200))
+        lo, hi = int(threshold[0]), int(threshold[1])
+        self.np = cv2.Canny(self.np, lo, hi)
+        return self
+
+    def b_or(self, other):
+        """对应 CanMV img.b_or(other)：逐像素按位或（就地改）。"""
+        self.np = cv2.bitwise_or(self.np, other.np)
+        return self
+
+    def binary(self, thresholds, **kw):
+        lo = thresholds[0][0]
+        hi = thresholds[0][1]
+        m = (self.np >= lo) & (self.np <= hi)
+        self.np = np.where(m, 255, 0).astype(np.uint8)
+        return self
+
+    def to_grayscale(self):
+        # 已经是灰度格式：仿真里直接共用（对应板上"再转一次灰度"那步）
+        return self
+
+    def get_pixel(self, x, y):
+        return int(self.np[int(y), int(x)])
+
+    def find_blobs(self, thresholds, roi=None, merge=True, margin=4,
+                   pixels_threshold=3, area_threshold=3):
+        lo = thresholds[0][0]
+        hi = thresholds[0][1]
+        mask = np.zeros(self.np.shape, np.uint8)
+        mask[(self.np >= lo) & (self.np <= hi)] = 255
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            keep = np.zeros_like(mask)
+            y1 = max(0, min(IMG_H, ry + rh))
+            x1 = max(0, min(IMG_W, rx + rw))
+            keep[max(0, ry):y1, max(0, rx):x1] = \
+                mask[max(0, ry):y1, max(0, rx):x1]
+            mask = keep
+        if merge and (margin > 0):
+            k = np.ones((2 * margin + 1, 2 * margin + 1), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        n, _labels, stats, _cents = cv2.connectedComponentsWithStats(mask, 4)
+        out = []
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < max(int(pixels_threshold), int(area_threshold)):
+                continue
+            out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
+                                int(stats[i, cv2.CC_STAT_TOP]),
+                                int(stats[i, cv2.CC_STAT_WIDTH]),
+                                int(stats[i, cv2.CC_STAT_HEIGHT]), area))
+        return out
 
 
 class FakeSensor(object):
@@ -307,9 +446,14 @@ class FakeMediaManager(object):
 class FakeImage(object):
     RGB565 = 0
     RGB888 = 1
+    GRAYSCALE = 2
+    ALLOC_REF = 3              # 对应 image.ALLOC_REF：引用外部 buffer
 
-    def __init__(self, w, h, fmt):
+    def __init__(self, w, h, fmt, alloc=None, data=None, **kw):
         self.w, self.h, self.fmt = w, h, fmt
+        self.alloc = alloc
+        # ALLOC_REF 语义：直接引用传进来的 ndarray（cv_lite 返回的边缘图就这么用）
+        self.np = data
 
     def clear(self):
         pass
@@ -320,6 +464,57 @@ class FakeImage(object):
 
 def install_fake_modules():
     machine = types.ModuleType("machine")
+
+    # ---- cv_lite 的假实现（资料《06.1 CV_lite图像处理专题》里的函数）----
+    # 只实现 main.py 用到的那一个：grayscale_find_rectangles_with_corners，
+    # 返回格式照抄例程 06.1/5 的注释：
+    #   [[x,y,w,h, c1x,c1y, c2x,c2y, c3x,c3y, c4x,c4y], ...]
+    def _fake_find_rects_corners(shape, np_img, c1, c2, eps, area_ratio,
+                                 max_cos, blur):
+        g = np_img
+        if g.ndim == 3:
+            g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+        g = np.ascontiguousarray(g.astype(np.uint8))
+        k = int(blur) | 1
+        if k >= 3:
+            g = cv2.GaussianBlur(g, (k, k), 0)
+        e = cv2.Canny(g, int(c1), int(c2))
+        # ⚠ RETR_LIST（不是 RETR_EXTERNAL）：靶子是"黑胶带圈套着白纸"，
+        #   圈的外沿和内沿是两条轮廓，国一那套要靠**内外双轮廓**配对取内框。
+        cnts, _ = cv2.findContours(e, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        H = int(shape[0])
+        W = int(shape[1])
+        amin = max(1.0, float(area_ratio) * H * W)
+        out = []
+        for c in cnts:
+            if cv2.contourArea(c) < amin:
+                continue
+            peri = cv2.arcLength(c, True)
+            ap = cv2.approxPolyDP(c, float(eps) * peri, True)
+            if (len(ap) != 4) or (not cv2.isContourConvex(ap)):
+                continue
+            x, y, w, h = cv2.boundingRect(ap)
+            p = [tuple(int(v) for v in q[0]) for q in ap]
+            out.append([x, y, w, h,
+                        p[0][0], p[0][1], p[1][0], p[1][1],
+                        p[2][0], p[2][1], p[3][0], p[3][1]])
+        return out
+
+    cvl = types.ModuleType("cv_lite")
+    cvl.grayscale_find_rectangles_with_corners = _fake_find_rects_corners
+
+    def _fake_find_edges(shape, np_img, t1, t2):
+        """对应 cv_lite.grayscale_find_edges（资料 06.1/7）：Canny 边缘图。"""
+        g = np_img
+        if g.ndim == 3:
+            g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+        g = np.ascontiguousarray(g.astype(np.uint8))
+        e = cv2.Canny(g, int(t1), int(t2))
+        return np.dstack([e, e, e]) if g.ndim == 3 else e
+
+    cvl.grayscale_find_edges = _fake_find_edges
+    sys.modules["cv_lite"] = cvl
 
     class Pin(object):
         def __init__(self, n):
@@ -371,6 +566,10 @@ def install_fake_modules():
     image_mod.Image = FakeImage
     image_mod.RGB565 = FakeImage.RGB565
     image_mod.RGB888 = FakeImage.RGB888
+    image_mod.GRAYSCALE = FakeImage.GRAYSCALE
+    image_mod.ALLOC_REF = FakeImage.ALLOC_REF
+    image_mod.EDGE_CANNY = 1
+    image_mod.EDGE_SIMPLE = 2
     sys.modules["image"] = image_mod
 
 
