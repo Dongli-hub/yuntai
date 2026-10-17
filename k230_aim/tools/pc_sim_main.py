@@ -30,7 +30,24 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
-MAIN_PY = os.path.join(ROOT, "k230_aim", "main.py")
+# main.py 的位置**多找几个地方**（2026-10-17）：
+#   仓库里      = <repo>/k230_aim/main.py
+#   桌面副本    = Desktop/K230代码/main.py（PC 工具和 main.py 摆在一起时）
+# 以前只认第一种，桌面那份 pc_* 脚本一跑就说找不到 —— 这里按顺序找第一个存在的。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_MAIN_CANDIDATES = [
+    os.path.join(ROOT, "k230_aim", "main.py"),
+    os.path.join(os.path.dirname(_HERE), "main.py"),
+    os.path.join(_HERE, "main.py"),
+]
+MAIN_PY = None
+for _c in _MAIN_CANDIDATES:
+    if os.path.isfile(_c):
+        MAIN_PY = _c
+        break
+if MAIN_PY is None:
+    raise SystemExit("找不到 main.py，找过这些地方：%s"
+                     % "; ".join(_MAIN_CANDIDATES))
 
 
 def _read_proc_size():
@@ -99,8 +116,95 @@ class Scene(object):
         #   看起来像仿真变差了（实际落点一点没变）。
         self.spot_u = 315.0 * S_SCALE
         self.spot_v = 246.0 * S_SCALE
+        # 2026-10-16：用户换成**印刷靶**（黑框直接印在纸上，纸中间还有几圈
+        #   印刷的同心环）—— 和"黑胶带贴在白纸上"是两种画面。置 True 就渲染
+        #   印刷靶（pc_vision_test 的 H 例）。
+        self.printed = False
+        # 2026-10-16 晚：用户现场那张图 —— **墙是暗的**（反向二值化后墙也是白的！），
+        #   靶纸边缘有一圈很窄的黑缝把它和墙分开。J 例专门用它压这个场景。
+        self.deadwall = False
+        # B 例（斜视）只考几何：把右侧那块"假白块"关掉，免得它在透视变换后
+        #   和靶框粘成一个分量（那是另一个用例的题目）。
+        self.no_clutter = False
 
     def render(self):
+        if self.deadwall:
+            return self.render_deadwall()
+        if self.printed:
+            return self.render_printed()
+        return self.render_tape()
+
+    def render_deadwall(self):
+        """用户现场那张图：**暗墙**（反向二值化后墙也是白的）+ 靶纸。
+
+        要点：靶纸边缘留一圈很窄的**亮缝**（现实里是纸和框之间那条白边），
+        在反向二值化里它是黑的 —— 正好把"靶框"和"暗墙"分开。
+        它们一旦被粘成一个分量，四点拟合必然失败（122r 现场就是 b37 个分量、
+        33 个栽在"拟"这一关）。
+        """
+        img = np.full((IMG_H, IMG_W, 3), 70, np.uint8)      # 暗墙 -> 二值化后是白的
+        w = int(220 * S_SCALE)
+        h = int(340 * S_SCALE)
+        t = int(round(26 * S_SCALE))                        # 印刷框宽度
+        x0 = int(self.tgt_u - w / 2)
+        y0 = int(self.tgt_v - h / 2)
+        # 纸外的亮缝（= 二值化里的黑缝）：把纸和暗墙隔开
+        cv2.rectangle(img, (x0 - 6, y0 - 6), (x0 + w + 6, y0 + h + 6),
+                      (150, 150, 150), -1)
+        # ⚠ 框要**画在纸里面**（先整张填框色、再把纸填回去）—— cv2.rectangle 的
+        #   描边是以边线为中心画的，直接画会往外扩半个线宽、把"亮缝"盖掉，
+        #   结果墙和框在二值图里粘成一个分量（那就不是要考的场景了）。
+        cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (60, 60, 60), -1)
+        cv2.rectangle(img, (x0 + t, y0 + t), (x0 + w - t, y0 + h - t),
+                      (235, 235, 235), -1)
+        _cu = int(self.tgt_u)
+        _cv = int(self.tgt_v)
+        _r0 = int(0.40 * min(w, h))
+        for _i in range(4):
+            _rr = int(_r0 * (1.0 - 0.22 * _i))
+            cv2.circle(img, (_cu, _cv), _rr, (70, 70, 70),
+                       max(2, int(4 * S_SCALE)))
+        cv2.circle(img, (_cu, _cv), max(2, int(2 * S_SCALE)),
+                   (70, 70, 70), -1)
+        cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
+                   int(round(5 * S_SCALE)), (200, 200, 255), -1)
+        cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
+                   int(round(2 * S_SCALE)), (245, 245, 255), -1)
+        return img
+
+    def render_printed(self):
+        """印刷靶：白纸 + **印上去的**黑框 + 纸中间几圈印刷同心环。
+
+        2026-10-16 现场：用户把靶纸换成了整张打印的版本 ——
+          · 框和纸的对比度比黑胶带低（打印黑 ~60，不是胶带的 25）；
+          · 纸中间还有 4 圈印刷同心环（比纸暗得多，反向二值化后是白圈）；
+          · 纸边到框之间只有很窄的白边。
+        这正是"二值化图看着挺好、矩形却认不出来"的那张画面，H 例专门用它。
+        """
+        img = np.full((IMG_H, IMG_W, 3), 150, np.uint8)     # 背景：白墙/柜面
+        w = int(200 * S_SCALE)
+        h = int(330 * S_SCALE)
+        t = int(round(10 * S_SCALE))                        # 印刷框宽度 px
+        x0 = int(self.tgt_u - w / 2)
+        y0 = int(self.tgt_v - h / 2)
+        cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (235, 235, 235), -1)
+        cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (60, 60, 60), t)
+        _cu = int(self.tgt_u)
+        _cv = int(self.tgt_v)
+        _r0 = int(0.40 * min(w, h))
+        for _i in range(4):
+            _rr = int(_r0 * (1.0 - 0.22 * _i))
+            cv2.circle(img, (_cu, _cv), _rr, (70, 70, 70),
+                       max(2, int(3 * S_SCALE)))
+        cv2.circle(img, (_cu, _cv), max(2, int(2 * S_SCALE)),
+                   (70, 70, 70), -1)
+        cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
+                   int(round(5 * S_SCALE)), (200, 200, 255), -1)
+        cv2.circle(img, (int(self.spot_u), int(self.spot_v)),
+                   int(round(2 * S_SCALE)), (245, 245, 255), -1)
+        return img
+
+    def render_tape(self):
         # ⚠ 2026-10-15：场景**现实化**（原来背景和"纸面"一样亮 190，
         #   二值化时"纸"和背景根本分不开，Otsu 只能靠兜底值；而且激光点画成
         #   暗红实心盘，落在"纸"里面就成了块内的一坨厚黑 -> 新加的内轮廓校验
@@ -113,7 +217,10 @@ class Scene(object):
         #   背景(120)与纸(235)保持黑。这样胶带圈才是**孤立的一条白带**，
         #   内外双轮廓(内框=纸的洞)才配得上对；背景若比阈值还暗，它会和胶带
         #   连成一片、把圈吞掉（那是仿真场景失真，不是算法问题）。
-        img = np.full((IMG_H, IMG_W, 3), 120, np.uint8)
+        # 2026-10-17：背景 120 -> **140**。自适应阈值是 0.515×纸面(P90)，
+        #   现场木柜/纸 ≥0.56；140/235=0.60 才符合现场（120 只有 0.51，
+        #   会被自适应阈值切成白，属于仿真场景失真）。
+        img = np.full((IMG_H, IMG_W, 3), 140, np.uint8)
         w = int(200 * S_SCALE)
         h = int(330 * S_SCALE)
         t = int(round(20 * S_SCALE))
@@ -123,6 +230,19 @@ class Scene(object):
         # 圈内 = 白纸（比背景亮一大截，这就是"内亮外黑"的来源）
         cv2.rectangle(img, (x0 + t, y0 + t), (x0 + w - t, y0 + h - t),
                       (235, 235, 235), -1)
+        # 2026-10-17：**靶纸内部加同心环** —— 现场目标（印刷+胶带）内侧就有
+        #   4 圈同心圆，检测链的 INTERIOR_TRANS_MIN 判据就是靠它区分
+        #   "靶纸"和"灯/窗这种均匀亮块"。仿真场景必须一致，否则 A/B/C/G
+        #   这些用例会被误判成"没有内部结构"。
+        _cu = int(self.tgt_u)
+        _cv = int(self.tgt_v)
+        _r0 = int(0.40 * min(w, h))
+        for _i in range(4):
+            _rr = int(_r0 * (1.0 - 0.22 * _i))
+            cv2.circle(img, (_cu, _cv), _rr, (70, 70, 70),
+                       max(2, int(3 * S_SCALE)))
+        cv2.circle(img, (_cu, _cv), max(2, int(2 * S_SCALE)),
+                   (70, 70, 70), -1)
         # 激光点：白芯 + 淡红光晕（BGR；光晕 luma≈216，仍在纸面之上，
         # 不会在块里形成"厚黑"）。红边保持 a 分量够红，万一开光斑检测也能用。
         _su = int(self.spot_u)
@@ -137,7 +257,8 @@ class Scene(object):
         # 因为仿真场景里从来没有候选走到这条早退路（真机上一跑就 候选0）。
         _px0 = x0 + w + 30
         _py0 = max(0, y0 + 20)
-        if (_px0 + 150) < IMG_W and (_py0 + 110) < IMG_H:
+        if (not self.no_clutter) and (_px0 + 150) < IMG_W and \
+                (_py0 + 110) < IMG_H:
             cv2.rectangle(img, (_px0, _py0), (_px0 + 150, _py0 + 110),
                           (200, 200, 200), -1)
             cv2.rectangle(img, (_px0 + 6, _py0 + 6), (_px0 + 144, _py0 + 104),
@@ -149,13 +270,32 @@ SCENE = Scene()
 
 
 class FakeBlob(object):
-    """复现 CanMV blob 的下标访问：b[0..3]=x,y,w,h  b[4]=面积  b[5/6]=中心"""
+    """复现 CanMV blob 的下标访问 + 质心接口。
 
-    def __init__(self, x, y, w, h, area):
+    b[0..3]=x,y,w,h  b[4]=面积  b[5/6]=**外接框中心**（和 OpenMV 一致）；
+    另外 cx()/cy()/cxf()/cyf() 是**质心**（2026-10-17 加：纸块兜底用的是质心，
+    外接框中心在透视下会偏 10px 量级）。
+    """
+
+    def __init__(self, x, y, w, h, area, cx=None, cy=None):
         self._v = (x, y, w, h, area, x + w // 2, y + h // 2)
+        self._cx = float(x + w / 2.0) if cx is None else float(cx)
+        self._cy = float(y + h / 2.0) if cy is None else float(cy)
 
     def __getitem__(self, i):
         return self._v[i]
+
+    def cx(self):
+        return int(self._cx)
+
+    def cy(self):
+        return int(self._cy)
+
+    def cxf(self):
+        return self._cx
+
+    def cyf(self):
+        return self._cy
 
 
 class FakeFrame(object):
@@ -253,7 +393,8 @@ class FakeFrame(object):
             out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
                                 int(stats[i, cv2.CC_STAT_TOP]),
                                 int(stats[i, cv2.CC_STAT_WIDTH]),
-                                int(stats[i, cv2.CC_STAT_HEIGHT]), area))
+                                int(stats[i, cv2.CC_STAT_HEIGHT]), area,
+                                float(_cents[i][0]), float(_cents[i][1])))
         return out
 
     def get_histogram(self, *a, **kw):
@@ -329,6 +470,22 @@ class FakeGrayFrame(object):
         n.np = self.np.copy()
         return n
 
+    def draw_image(self, src, x, y, x_scale=1.0, y_scale=1.0, **kw):
+        """对应 CanMV img.draw_image(小图, x, y, x_scale=, y_scale=)：贴回原图。
+
+        2026-10-16 加：预览图的大核闭运算走"降采样 -> close -> 放大贴回"
+        （见 main.py _cv2_find ③），这一步要用它。"""
+        s = src.np
+        if (x_scale != 1.0) or (y_scale != 1.0):
+            h = max(1, int(s.shape[0] * y_scale))
+            w = max(1, int(s.shape[1] * x_scale))
+            s = cv2.resize(s, (w, h), interpolation=cv2.INTER_NEAREST)
+        h2 = min(s.shape[0], self.np.shape[0] - int(y))
+        w2 = min(s.shape[1], self.np.shape[1] - int(x))
+        if (h2 > 0) and (w2 > 0):
+            self.np[int(y):int(y) + h2, int(x):int(x) + w2] = s[:h2, :w2]
+        return self
+
     def find_edges(self, edge_type, threshold=None, **kw):
         """对应 CanMV img.find_edges(image.EDGE_CANNY, (lo, hi))：
         把图像变成"黑底白线"的边缘图（原图就地改）。"""
@@ -353,6 +510,12 @@ class FakeGrayFrame(object):
     def to_grayscale(self):
         # 已经是灰度格式：仿真里直接共用（对应板上"再转一次灰度"那步）
         return self
+
+    def to_numpy_ref(self):
+        """对应 CanMV 灰度图的 img.to_numpy_ref()：**单通道** ndarray 引用。
+        （板上 sensor 配的是 GRAYSCALE，所以整条链拿到的就是 1 通道；
+          轮廓扫描那套是按 1 通道写的，仿真里必须一致。）"""
+        return self.np
 
     def get_pixel(self, x, y):
         return int(self.np[int(y), int(x)])
@@ -383,7 +546,8 @@ class FakeGrayFrame(object):
             out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
                                 int(stats[i, cv2.CC_STAT_TOP]),
                                 int(stats[i, cv2.CC_STAT_WIDTH]),
-                                int(stats[i, cv2.CC_STAT_HEIGHT]), area))
+                                int(stats[i, cv2.CC_STAT_HEIGHT]), area,
+                                float(_cents[i][0]), float(_cents[i][1])))
         return out
 
 
@@ -458,6 +622,24 @@ class FakeImage(object):
     def clear(self):
         pass
 
+    def to_grayscale(self):
+        """对应 image.Image(...).to_grayscale()（软件曝光后的 RGB -> 灰度）。"""
+        f = FakeGrayFrame.__new__(FakeGrayFrame)
+        if self.np is None:
+            f.np = np.zeros((self.h, self.w), np.uint8)
+        elif self.np.ndim == 3:
+            f.np = cv2.cvtColor(self.np, cv2.COLOR_BGR2GRAY)
+        else:
+            f.np = self.np
+        return f
+
+    def get_pixel(self, x, y):
+        p = self.np[int(y), int(x)]
+        try:
+            return (int(p[2]), int(p[1]), int(p[0]))
+        except Exception:
+            return int(p)
+
     def draw_string_advanced(self, *a, **kw):
         pass
 
@@ -494,6 +676,29 @@ def install_fake_modules():
             ap = cv2.approxPolyDP(c, float(eps) * peri, True)
             if (len(ap) != 4) or (not cv2.isContourConvex(ap)):
                 continue
+            # ⚠ 2026-10-17：**max_angle_cos 这一关必须在仿真里也做掉** ——
+            #   板上 C 函数有这个角度闸门（"越小越接近矩形"），以前的假实现
+            #   把它漏了，所以"板上认不出、仿真全绿"。语义：四个内角里
+            #   任何一个和 90° 的 |cos| 超过 max_cos 就丢
+            #   （0.3 = 只放 72.5°~107.5°；0.5 = 放 ±30°，国一的口径）。
+            pts4 = [np.array(q[0], np.float32) for q in ap]
+            _bad = False
+            for _i in range(4):
+                _p0 = pts4[(_i - 1) % 4]
+                _p1 = pts4[_i]
+                _p2 = pts4[(_i + 1) % 4]
+                _v1 = _p0 - _p1
+                _v2 = _p2 - _p1
+                _n1 = float(np.linalg.norm(_v1))
+                _n2 = float(np.linalg.norm(_v2))
+                if (_n1 < 1e-9) or (_n2 < 1e-9):
+                    _bad = True
+                    break
+                if abs(float(np.dot(_v1, _v2)) / (_n1 * _n2)) > float(max_cos):
+                    _bad = True
+                    break
+            if _bad:
+                continue
             x, y, w, h = cv2.boundingRect(ap)
             p = [tuple(int(v) for v in q[0]) for q in ap]
             out.append([x, y, w, h,
@@ -503,6 +708,27 @@ def install_fake_modules():
 
     cvl = types.ModuleType("cv_lite")
     cvl.grayscale_find_rectangles_with_corners = _fake_find_rects_corners
+
+    def _fake_grayscale_find_blobs(shape, np_img, lo, hi, min_area, kernel):
+        """对应 cv_lite.grayscale_find_blobs：inRange -> findContours(EXTERNAL)."""
+        g = np.asarray(np_img)
+        if g.ndim == 3:
+            g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+        binary = np.where((g >= int(lo)) & (g <= int(hi)), 255, 0).astype(np.uint8)
+        if int(kernel) > 1:
+            k = np.ones((int(kernel), int(kernel)), np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for c in cnts:
+            if cv2.contourArea(c) < float(min_area):
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            out.extend([int(x), int(y), int(w), int(h)])
+        return out
+
+    cvl.grayscale_find_blobs = _fake_grayscale_find_blobs
 
     def _fake_find_edges(shape, np_img, t1, t2):
         """对应 cv_lite.grayscale_find_edges（资料 06.1/7）：Canny 边缘图。"""
@@ -514,6 +740,14 @@ def install_fake_modules():
         return np.dstack([e, e, e]) if g.ndim == 3 else e
 
     cvl.grayscale_find_edges = _fake_find_edges
+
+    def _fake_adjust_exposure(shape, np_img, gain):
+        """对应 cv_lite.rgb888_adjust_exposure_fast（厂家软件曝光，像素乘系数）。"""
+        g = np.asarray(np_img).astype(np.float32) * float(gain)
+        return np.clip(g, 0, 255).astype(np.uint8)
+
+    cvl.rgb888_adjust_exposure_fast = _fake_adjust_exposure
+    cvl.rgb888_adjust_exposure = _fake_adjust_exposure
     sys.modules["cv_lite"] = cvl
 
     class Pin(object):
@@ -571,6 +805,14 @@ def install_fake_modules():
     image_mod.EDGE_CANNY = 1
     image_mod.EDGE_SIMPLE = 2
     sys.modules["image"] = image_mod
+
+    # ---- ulab.numpy：板上是内置的微型 numpy；PC 上直接用真 numpy 顶上 ----
+    #   轮廓扫描那套（切片 / 比较 / argmax）用的是 ulab 支持的那一小撮接口，
+    #   numpy 全部兼容 —— 所以离线回归跑的算法和板上是同一份代码。
+    ulab_mod = types.ModuleType("ulab")
+    ulab_mod.numpy = np
+    sys.modules["ulab"] = ulab_mod
+    sys.modules["ulab.numpy"] = np
 
 
 # ----------------------------------------------------------------------
@@ -727,7 +969,6 @@ def run():
     install_fake_modules()
 
     src = open(MAIN_PY, "r", encoding="utf-8").read()
-    src = src.replace('DISPLAY_MODE = "VIRT"', 'DISPLAY_MODE = "OFF"')
     # 仿真永远测"整机闭环"：即便现场把 main.py 切成了 LOG_ONLY（只监听，
     # 不发 SET_ZERO/AIM），这里也强制改回整机模式 —— 否则仿真的
     # "闭环收敛 OK/未收敛"判据会永远落空（AIM 帧 0 条）。
