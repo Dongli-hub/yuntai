@@ -8,7 +8,7 @@
   *   gimbal_link.c   —— 本文件：UART7 中断收发、命令解释、遥测上报、看门狗
   *
   * 三种数据方向：
-  *   下行（地瓜派 -> H723）：AIM 偏置(100Hz) / MODE / SET_ZERO / UNWIND / 心跳
+ *   下行（地瓜派 -> H723）：AIM 像素坐标(30Hz 保持) / MODE / SET_ZERO / UNWIND / 心跳
   *   上行（H723 -> 地瓜派）：GIMBAL_STATE 遥测(50Hz) / ACK / TEXT 调试文本
   *
   * 为什么调试文本要走协议发（而不是直接 printf 到串口）：
@@ -36,11 +36,12 @@ typedef struct
     uint8_t drawing;           /* 正在画圆 */
     uint8_t locked;            /* 上位机已锁定靶心 */
     uint8_t quality;           /* 0~255 跟踪质量 */
+    uint8_t vision_seq;        /* AIM 帧序号：K230 每产生一帧新视觉结果 +1 */
     uint8_t unwind_dps;        /* 解绕速度 (°/s)，来自 UNWIND 消息 */
     uint16_t px_ut, px_vt;     /* 靶心像素坐标（K230 上报） */
     uint16_t px_us, px_vs;     /* 激光光斑像素坐标 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
-    uint32_t px_ms;            /* 本帧到达时刻（视觉外环判"冻住"用） */
+    uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */
 } GimbalCmd_t;
 

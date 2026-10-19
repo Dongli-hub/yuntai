@@ -4,3 +4,6 @@ __pycache__/
 
 # 板子上跑出来的图片输出
 out/
+
+# 视觉回归工具跑出来的叠加图（pc_field_test.py 每次都会重写）
+tools/field_out_*.png

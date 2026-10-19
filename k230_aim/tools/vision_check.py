@@ -1,93 +1,124 @@
 # -*- coding: utf-8 -*-
 """vision_check.py —— K230 视觉调试工具
 
-在 CanMV IDE 中运行，只做图像显示和识别验证，不与 H723 通信。
-视觉处理与 main.py 保持同步，显示和预览逻辑只存在于本文件。
+流程:
+  RGB888 640x480 -> 固定130二值化 -> image.close(1) 3x3
+  -> find_blobs 白块 -> 激光点附近目标筛选
+  -> 二值 mask 四边扫描/最小二乘 -> 对角线交点
+  -> 尺寸/比例/密度/对比度/黑框闸门
 
-画面：融合图预览，绿框为外框四边形，红十为靶心，黄圈为激光位置。
-终端：帧率、目标、光斑、各阶段耗时及无靶原因。
+画面: 闭运算后的二值图; 橙框=白块候选; 绿框=拟合/锁定四边形; 红十字=靶心; 黄圈=激光.
+纯视觉: 不与 H723 通信; 整机联调请用 main.py.
 """
 import os
 import time
 import math
+import image
 
-# ============================ 画面 / 显示 ============================
-# --- 相机 / 处理分辨率 ---
-# 像素常数按 S_SCALE 自动缩放；PROC_W 需要按 ISP 要求对齐。
+# 全帧闭运算：二值化阈值 130，close(1) 对应 3x3。
+USE_CLOSE_ROI = True
+FULL_FRAME_CLOSE = True
+GRAY_DIRECT = True
+CLOSE_FRAME_COS = 0.65
+CLOSE_ROI_KERNEL = 3
+CLOSE_ROI_ITERS = 1
+CLOSE_ROI_TH = 0
+CLOSE_ROI_K = 0.52
+CLOSE_FULL_PREVIEW = True
+CLOSE_PREVIEW_ANY = True
+try:
+    import cv_lite as _cv_lite
+except Exception as _e:
+    _cv_lite = None
+    USE_CLOSE_ROI = False
+    print("cv_lite 不可用(%s) -> 关闭 ROI 闭运算" % _e)
+
 PROC_W = 640
 PROC_H = 480
 IMG_W = PROC_W
 IMG_H = PROC_H
-S_SCALE = PROC_W / 640.0    # 像素常数缩放系数（640 档 = 1.0，800 档 = 1.25）
-VIS_K = 7.8 * S_SCALE       # px/°（现场标定 7.8 @640x480，随分辨率同比缩放）
-# --- 显示画布 ---
-# 板载显示固定 640x480；处理图按比例缩放后绘制。
+CLOSE_BIN_TH = 130
+CLOSE_MORPH_SIZE = 1
+S_SCALE = PROC_W / 640.0
+CLOSE_ROI_PAD = int(round(18 * S_SCALE))
+CLOSE_ROI_MIN_LONG = int(round(100 * S_SCALE))
+VIS_K = 7.8 * S_SCALE
 DISPLAY_W = 640
 DISPLAY_H = 480
 DISPLAY_QUALITY = 40
-# True 显示反向二值化与 Canny 的融合图，False 显示原始画面。
-BIN_PREVIEW = True
-# True 显示未二值化的灰度图，用于检查各区域亮度。
-GRAY_PREVIEW = False
-# 短暂丢检时继续绘制上一帧框，仅影响预览。
-DRAW_HOLD = 3
-# --- 曝光 ---
-# AE 先运行到稳定，再通过 VICAP dev attr 冻结；冻结后明显变暗则恢复 AE。
-# 软件曝光使用 cv_lite，启动时标定一次固定 gain。
-EXPO_FIX = True
-EXPO_SETTLE_MS = 1200      # run() 后先让 AE 自适应多久再冻结
-EXPO_DARK_RATIO = 0.55     # 冻结后亮度 < 冻结前×这个比例 -> 判定"变暗了"，回滚
-EXPO_SW_GAIN = 1.0          # 运行时固定使用的软件曝光增益（自动标定会改写它）
-EXPO_AUTO_GAIN = True       # 启动时按 EXPO_TARGET_MEAN 自动算 EXPO_SW_GAIN
-EXPO_SW_MIN = 0.50          # 自动增益下限（再暗细节就没了）
-EXPO_SW_MAX = 1.60          # 自动增益上限（别把噪声放大太多）
-EXPO_HW_GAIN = 0            # 模拟增益（厂家示例 20；0 = 保持冻结值）
-EXPO_TARGET_MEAN = 92.0     # 冻结后把 10x10 网格均亮度闭环到这个值
-# 每隔几帧向 IDE 推送一次预览。
-PREVIEW_EVERY = 1
-CAM_VFLIP = True           # 画面上下颠倒 -> True
-CAM_HMIRROR = False        # 画面左右镜像 -> True
-# --- 检测频率 ---
-CV2_EVERY = 1              # 每隔几帧运行一次目标检测
+BIN_PREVIEW = not FULL_FRAME_CLOSE
+ALLOW_COLOR_FALLBACK = False
+EXPO_FIX = False
+EXPO_US = 8000
+SHOW_EVERY = 2
+CAM_VFLIP = True
+CAM_HMIRROR = False
 
-# --- 融合图与四边形参数 ---
-GY_TH = 45
-GY_TH_FAR = 45
-GY_CLOSE_SIZE = 3
-GY_CLOSE_RETRY = 5
-GY_CANNY1 = 50
-GY_CANNY2 = 150
-PAPER_MIN_SIDE = int(round(20 * S_SCALE))
-QUAD_ANGLE_COS_MAX = 0.50       # 相邻角 90°±30°
-QUAD_OPPOSITE_DIFF_MAX = 0.40   # 对边长度差比例
-QUAD_SIDE_RATIO_MAX = 10.0      # 最长边/最短边
-GY_AREA_RATIO = 0.70            # 内框/外框面积比
-# --- 激光（固定坐标）---
-USE_FIXED_LASER = True
-LASER_UV = (int(round(315 * S_SCALE)), int(round(246 * S_SCALE)))
-PAPER_MIN_LONG = int(round(28 * S_SCALE))
-PAPER_MAX_LONG = int(round(460 * S_SCALE))
+PAPER_TH = 50
+PAPER_TH_FIXED = 0
+PAPER_TH_NEAR_FIXED = 0
+PAPER_A_MAX = 32
+PAPER_B_MAX = 32
+PAPER_MIN_AREA = int(350 * S_SCALE * S_SCALE)
+PAPER_MAX_AREA_RATIO = 0.50
+PAPER_MIN_LONG = int(round(36 * S_SCALE))
+PAPER_MAX_LONG = int(round(480 * S_SCALE))
 PAPER_ASPECT_MIN = 0.70
 PAPER_ASPECT_MAX = 2.00
-PAPER_CONTRAST_MIN = 20         # 内侧亮度 - 外侧亮度
-PAPER_DARK_MARGIN = 25          # 外侧点相对内部至少暗多少
-PAPER_DARK_FRAC_MIN = 0.20
-PAPER_INNER_MAX = 235           # 饱和亮块检查阈值
-INTERIOR_TRANS_MIN = 4
+PAPER_DENSITY_MIN = 0.56
+PAPER_DENSITY_MIN_STRONG = 0.45
+PAPER_CONTRAST_STRONG = 70
+PAPER_DENSITY_QUAD_MIN = 0.65
+PAPER_DENSITY_NEAR_MIN = 0.72
+PAPER_CONTRAST_MIN = 30
+PAPER_DARK_MARGIN = 25
+PAPER_DARK_FRAC_MIN = 0.55
+QUAD_SCAN_N = 3
+QUAD_PERP_PX = 1
+QUAD_AREA_LO = 0.50
+QUAD_AREA_HI = 1.60
+QUAD_NEAR_LONG = int(round(190 * S_SCALE))
+QUAD_NEAR_SIDE_K = 0.70
+QUAD_NEAR_FILL_K = 0.50
+QUAD_NEAR_EDGE_K = 0.30
+QUAD_NEAR_DENSITY_HI = 1.30
+QUAD_NEAR_COS_LIM = 0.42
+SCAN_TH_K = 0.68
+SCAN_TH_LO = 65
+SCAN_TH_HI = 125
+QUAD_LIM_PAD = int(round(18 * S_SCALE))
 PROBE_OFF_PX = int(round(5 * S_SCALE))
+TRACK_K = 0.50
+TRACK_PAD = int(round(35 * S_SCALE))
+TRACK_PAD_FAR = int(round(90 * S_SCALE))
+MERGE_RING_DENSITY_MAX = 0.72
+MERGE_CENTER_K = 0.15
+MERGE_INNER_AREA_MIN = 0.03
+SEED_EVERY = 16
+RE_CHECK_EVERY = 40
+HOLD_FRAMES = 25
 LOST_FULL = 25
-SMOOTH = 0.90              # 平滑系数（越大越跟手、越小越稳）
-DEADBAND_PX = 1.5 * S_SCALE   # 平滑死区（小于它不动，画面不抖）
-# 连续拒收后允许重新锁定。
-ACCEPT_RELOCK_N = 4
-JUMP_REJECT_BASE = int(round(35 * S_SCALE))
+SMOOTH = 0.90
+SMOOTH_NEAR = 0.90
+DEADBAND_PX = 1.5 * S_SCALE
+SIZE_GATE_LO = 0.50
+SIZE_GATE_HI = 1.35
+SIZE_RESCUE_DENSITY = 0.88
+SIZE_RESCUE_CONTRAST = 30
+SIZE_RESCUE_MAX = 2.50
+CONFIRM_N = 1
+CONFIRM_DXY = int(round(60 * S_SCALE))
+CONFIRM_DSIZE = 1.00
+PENDING_MISS = 8
+JUMP_REJECT_PX = int(round(100 * S_SCALE))
 SMOOTH_FAR = 0.60
 FAR_LONG_PX = 120.0 * S_SCALE
 PAPER_LONG_M = 0.275
+
 SPOT_ROI_HALF = int(round(45 * S_SCALE))
 SPOT_THRESHOLDS = [
-    (88, 100, -40, 90, -50, 90),   # 过曝白芯（纸面 LAB-L≈78 到不了）
-    (58, 100, 25, 90, -20, 70),    # 红色光晕
+    (88, 100, -40, 90, -50, 90),
+    (58, 100, 25, 90, -20, 70),
 ]
 SPOT_MIN_AREA = 2
 SPOT_MAX_AREA = 6000
@@ -95,28 +126,81 @@ SPOT_MAX_ASPECT = 3.0
 SPOT_EVERY = 4
 SPOT_ADAPT_GAIN = 0.06
 SPOT_ADAPT_LIMIT = 6.0
-SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]   # 最近一次找到的激光点，主循环每帧更新
-# 可选阈值扫描：数值越大，反向二值图里的白色区域越多。
-GY_TH_SWEEP = False
-GY_TH_SWEEP_SEC = 5
-GY_TH_SWEEP_LIST = [30, 35, 40, 45, 50, 56, 64]
-# 激光位置默认使用 LASER_UV。开启标定后显示检测到的光斑并打印中位数；
-# 标定值需要同步写回 main.py。
+SPOT_PREF_PX = int(round(70 * S_SCALE))
+SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]
+USE_FIXED_LASER = True
+LASER_UV = (int(round(312 * S_SCALE)), int(round(252 * S_SCALE)))
 CALIB_LASER = False
 
 
-# --- 距离估计 ---
 FX_PX = 445.0 * S_SCALE
 
-# ============================ 时序 ============================
 PRINT_MS = 500
-GC_EVERY = 30
+GC_EVERY = 2 if FULL_FRAME_CLOSE else 10
 
 def luma(r, g, b):
     return (r * 77 + g * 150 + b * 29) >> 8
 
+
+_PIXBUF = [0, 0, 0]
+_PIX_FAST = False
+_ARR_MODE = 0
+
+
+def px_probe_fast(img):
+    """启动时探一次：get_pixel 支不支持"传一个 buf 就地填"。
+
+    为什么值得做：px_luma 是四边形复测的**热路径**（每帧几百次调用），而
+    `img.get_pixel(x, y)` 每次都要新建一个 (r,g,b) 元组 —— MicroPython 里
+    一次分配就是几微秒，几百次就是 1~3ms/帧（占检测耗时的 10~20%）。
+    OpenMV/CanMV 的 get_pixel 支持 `get_pixel(x, y, rgbtuple)` 就地写，
+    我们探一下：能用就用（省掉分配 -> 帧率上去 -> 反应更快）。
+    """
+    global _PIX_FAST
+    try:
+        img.get_pixel(0, 0, _PIXBUF)
+        _PIX_FAST = True
+    except Exception:
+        _PIX_FAST = False
+    return _PIX_FAST
+
+
 def px_luma(img, x, y):
-    """取指定像素亮度；优先读零拷贝数组，失败时退回 get_pixel。"""
+    """取某点亮度（0~255）。取不到返回 -1。"""
+    if x < 0:
+        x = 0
+    elif x >= IMG_W:
+        x = IMG_W - 1
+    if y < 0:
+        y = 0
+    elif y >= IMG_H:
+        y = IMG_H - 1
+    try:
+        p = None
+        if _PIX_FAST:
+            try:
+                p = img.get_pixel(int(x), int(y), _PIXBUF)
+            except Exception:
+                p = None
+        if p is None:
+            p = img.get_pixel(int(x), int(y))
+    except Exception:
+        return -1
+    if p is None:
+        return -1
+    if type(p) is int:
+        return p
+    try:
+        if len(p) == 1:
+            return p[0]
+    except Exception:
+        pass
+    return luma(p[0], p[1], p[2])
+
+
+def px_luma_arr(arr, x, y):
+    """直接从 RGB888 ndarray 取亮度，避免 RGB888 get_pixel 失效。"""
+    global _ARR_MODE
     if x < 0:
         x = 0
     elif x >= IMG_W:
@@ -127,1103 +211,167 @@ def px_luma(img, x, y):
         y = IMG_H - 1
     x = int(x)
     y = int(y)
-    # ① 数组快路径（零拷贝）
-    _arr = None
-    try:
-        _arr = img.to_numpy_ref()
-    except Exception:
-        _arr = None
-    if _arr is not None:
+    if (_ARR_MODE == 0) or (_ARR_MODE == 1):
         try:
-            p = _arr[y, x]
-            try:
-                n = len(p)
-            except TypeError:
-                return int(p)          # 灰度图：标量
-            if n >= 3:
+            p = arr[y][x]
+            if len(p) >= 3:
+                _ARR_MODE = 1
                 return luma(int(p[0]), int(p[1]), int(p[2]))
-            if n == 1:
-                return int(p[0])
         except Exception:
             pass
-    # 兼容不支持数组访问的帧对象。
+    if (_ARR_MODE == 0) or (_ARR_MODE == 3):
+        try:
+            p = arr[y, x]
+            if len(p) >= 3:
+                _ARR_MODE = 3
+                return luma(int(p[0]), int(p[1]), int(p[2]))
+        except Exception:
+            pass
     try:
-        p = img.get_pixel(x, y)
+        row = arr[y]
+        i = x * 3
+        _ARR_MODE = 2
+        return luma(int(row[i]), int(row[i + 1]), int(row[i + 2]))
     except Exception:
         return -1
-    if p is None:
-        return -1
+
+
+_scene_cache = [0, 0.0, 0.0]
+
+
+def scene_th(img, n_frame=0):
+    """按直方图用大津法决定白纸的 LAB-L 阈值（0~100）。
+
+    优先设备 Otsu；结果不可用或不在 [38,62] 时用采样 Otsu；
+    仍不可用则回退“画面均值 + 8”并夹到 [PAPER_TH,72]。
+    每 10 帧重算一次，避免逐帧抖动。
+    """
+    if PAPER_TH_FIXED > 0:
+        _scene_cache[1] = float(PAPER_TH_FIXED)
+        _scene_cache[2] = 4.0
+        return int(PAPER_TH_FIXED)
+    if (n_frame % 10) != 0 and _scene_cache[1] > 0:
+        return int(_scene_cache[1])
+    t = -1.0
+    src = 3.0
     try:
-        n = len(p)
-    except TypeError:
-        try:
-            return int(p)
-        except Exception:
-            return -1
-    if n >= 3:
-        return luma(int(p[0]), int(p[1]), int(p[2]))
-    if n == 1:
-        return int(p[0])
-    return -1
-# 分段耗时探针：建图、轮廓拟合和整条检测链。
-_PROF = [0.0, 0, 0.0, 0, 0.0, 0]
-
-def prof_line():
-    """分段探针拼成一行（只读，不清零）。"""
-    n2 = _PROF[5] if _PROF[5] > 0 else 1
-    return ("轮廓%.0fms/次x%d[建图%.0f 拟合%.0f 扫描%.0f万px]"
-            % (_PROF[4] / float(n2), _PROF[5],
-               _PROF[0] / float(n2), _PROF[2] / float(n2),
-               _PROF[1] / float(n2) / 10000.0))
-
-
-def prof_reset():
-    for _i in range(len(_PROF)):
-        _PROF[_i] = 0
-# ============================================================================
-#  融合图矩形检测
-# ============================================================================
-_GY_ERR = [0]
-# 本帧实际使用的反向二值化阈值。
-_GY_TH_NOW = [0]
-_SW_SCALED = [False]
-_SW_FRAME = [0]
-
-_SW_EXPO_ERR = [0]
-_GY_SRC_DBG = [""]
-# 融合失败计数（只报第一次）。
-_GY_FUSE_ERR = [0]
-# 融合图是否已成功建立。
-_GY_MASK_OK = [False]
-# 最近一次融合图，供预览和离线测试复用。
-_GY_MASK_CACHE = [None]
-# 最近一次检测的拒收原因。
-_GY_DBG = [""]
-# 闭运算异常计数（只报第一次）。
-_CLOSE_ERR = [0]
-# 输出护栏的拒收原因和连续拒收次数。
-_ACC_DBG = [""]
-
-def _pt_in_quad(p, c):
-    """射线法判断点是否在四边形内。"""
-    x, y = p[0], p[1]
-    inside = False
-    j = 3
-    for i in range(4):
-        xi, yi = c[i]
-        xj, yj = c[j]
-        if (yi > y) != (yj > y):
-            _t = (xj - xi) * (y - yi) / (yj - yi) + xi
-            if x < _t:
-                inside = not inside
-        j = i
-    return inside
-
-def _gy_sort_cyclic(c):
-    """按绕质心的方位角排序，保证四个角点构成环序。"""
-    cx = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4.0
-    cy = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4.0
-    return sorted(c, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-
-def _gy_quad_area(c):
-    """四边形面积（鞋带公式）。"""
-    _s = 0.0
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        _s += x1 * y2 - x2 * y1
-    return abs(_s) * 0.5
-
-def _gy_centroid4(c):
-    """用鞋带公式计算四边形面积加权重心。"""
-    a2 = 0.0
-    cx = 0.0
-    cy = 0.0
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        _cr = x1 * y2 - x2 * y1
-        a2 += _cr
-        cx += (x1 + x2) * _cr
-        cy += (y1 + y2) * _cr
-    if abs(a2) < 1e-9:
-        return None
-    return (cx / (3.0 * a2), cy / (3.0 * a2))
-
-def _frame_gray(img):
-    """应用软件曝光并转换为灰度图；不支持时退回原始帧转灰度。"""
-    _g = None
-    if (EXPO_SW_GAIN > 0) and (abs(EXPO_SW_GAIN - 1.0) > 1e-6):
-        try:
-            import cv_lite
-            import image
-            _rgb = img.to_numpy_ref()
-            _ok = False
-            try:
-                _ok = (len(_rgb.shape) == 3) and \
-                    (int(_rgb.shape[0]) == IMG_H) and \
-                    (int(_rgb.shape[1]) == IMG_W)
-            except Exception:
-                _ok = False
-            if _ok:
-                _out = cv_lite.rgb888_adjust_exposure_fast(
-                    [IMG_H, IMG_W], _rgb, float(EXPO_SW_GAIN))
-                if _out is not None:
-                    _eimg = image.Image(IMG_W, IMG_H, image.RGB888,
-                                        alloc=image.ALLOC_REF, data=_out)
-                    try:
-                        _g = _eimg.to_grayscale()
-                    except Exception:
-                        _g = None
-                    if _g is None:
-                        # 部分固件不支持 ALLOC_REF 图直接转灰度。
-                        try:
-                            _gs = image.Image(IMG_W, IMG_H, image.GRAYSCALE)
-                            _eimg.copy_to(_gs)
-                            _g = _gs
-                        except Exception:
-                            _g = None
-                    try:
-                        del _eimg
-                        del _out
-                    except Exception:
-                        pass
-                    # 限制频繁回收造成的帧延迟。
-                    _SW_FRAME[0] += 1
-                    if (_SW_FRAME[0] & 3) == 0:
-                        try:
-                            import gc as _gc
-                            _gc.collect()
-                        except Exception:
-                            pass
-        except Exception as e:
-            _SW_EXPO_ERR[0] += 1
-            if _SW_EXPO_ERR[0] == 1:
-                log("[EXPO] 软件曝光不可用(%s) -> 用原始帧转灰度" % e)
-    if _g is None:
-        try:
-            _g = img.to_grayscale()
-        except Exception:
-            _g = None
-    return _g
-
-def _interior_trans(img, x, y, w, h):
-    """统计内框水平/垂直中线的明暗翻转次数，用于排除均匀灯窗。"""
-    _tot = 0
-    for _h in (1, 0):
-        _vals = []
-        for _i in range(32):
-            _f = _i / 31.0
-            if _h:
-                _px = int(x + w * _f)
-                _py = int(y + h * 0.5)
-            else:
-                _px = int(x + w * 0.5)
-                _py = int(y + h * _f)
-            _vals.append(px_luma(img, _px, _py))
-        _signs = []
-        for _i in range(1, 32):
-            _d = (_vals[_i] if _vals[_i] >= 0 else 0) - \
-                (_vals[_i - 1] if _vals[_i - 1] >= 0 else 0)
-            if abs(_d) >= 8:
-                _signs.append(1 if _d > 0 else -1)
-        for _i in range(1, len(_signs)):
-            if _signs[_i] != _signs[_i - 1]:
-                _tot += 1
-    return _tot
-
-def _mask_runs(np_img, fixed, row_mode, lo, hi, min_run):
-    """在融合图的某一行/列上找连续白段（只认足厚的白带）。
-
-    输入已经是「反向二值化 ∪ Canny」后的 0/255 图，不再回灰度。
-    Canny 本身留下的细线只有 1~2px，而黑胶带在掩码里是一条厚白带；
-    `min_run` 用来把 Canny 细线和真正胶带区分开。
-    """
-    runs = []
-    start = -1
-    i = lo
-    while i < hi:
-        if row_mode:
-            v = int(np_img[fixed, i])
-        else:
-            v = int(np_img[i, fixed])
-        if v >= 128:
-            if start < 0:
-                start = i
-        elif start >= 0:
-            if (i - start) >= min_run:
-                runs.append((start, i - 1))
-            start = -1
-        i += 1
-    if (start >= 0) and ((hi - start) >= min_run):
-        runs.append((start, hi - 1))
-    return runs
-
-def _fit_line_pts(pts):
-    """最小二乘/PCA 直线 A*x+B*y+C=0（对竖线、斜线都不退化）。"""
-    n = len(pts)
-    if n < 4:
-        return None
-    mx = 0.0
-    my = 0.0
-    for p in pts:
-        mx += p[0]
-        my += p[1]
-    mx /= n
-    my /= n
-    sxx = 0.0
-    sxy = 0.0
-    syy = 0.0
-    for p in pts:
-        dx = p[0] - mx
-        dy = p[1] - my
-        sxx += dx * dx
-        sxy += dx * dy
-        syy += dy * dy
-    if (sxx + syy) < 1e-6:
-        return None
-    ang = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
-    dx = math.cos(ang)
-    dy = math.sin(ang)
-    a = -dy
-    b = dx
-    c = -(a * mx + b * my)
-    return (a, b, c)
-
-def _fit_line_pts_robust(pts):
-    """外轮廓边线专用：去掉约 1/3 最远点后再拟合。
-
-    行/列扫描在靶框旋转或背景有竖直白边时会在个别扫描线摸到另一条边；
-    外轮廓必须由多数点决定，内轮廓仍用普通最小二乘。
-    """
-    if len(pts) < 5:
-        return None
-    line = _fit_line_pts(pts)
-    if line is None:
-        return None
-    a, b, c = line
-    norm = math.sqrt(a * a + b * b) + 1e-9
-    scored = []
-    for p in pts:
-        d = abs(a * p[0] + b * p[1] + c) / norm
-        scored.append((d, p))
-    scored.sort(key=lambda q: q[0])
-    keep = max(5, (len(scored) * 2) // 3)
-    return _fit_line_pts([q[1] for q in scored[:keep]])
-
-def _line_isect(l1, l2):
-    if (l1 is None) or (l2 is None):
-        return None
-    a1, b1, c1 = l1
-    a2, b2, c2 = l2
-    det = a1 * b2 - a2 * b1
-    if abs(det) < 1e-6:
-        return None
-    x = (-c1 * b2 + b1 * c2) / det
-    y = (-a1 * c2 + c1 * a2) / det
-    return (x, y)
-
-def _quad_convex(c):
-    """四个点按环序排列时是否始终同向转弯。"""
-    if c is None:
-        return False
-    pos = 0
-    neg = 0
-    for i in range(4):
-        ax, ay = c[i]
-        bx, by = c[(i + 1) % 4]
-        cx, cy = c[(i + 2) % 4]
-        z = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
-        if z > 0.5:
-            pos += 1
-        elif z < -0.5:
-            neg += 1
-    return (pos == 4) or (neg == 4)
-
-def _quad_sides(c):
-    out = []
-    for i in range(4):
-        ax, ay = c[i]
-        bx, by = c[(i + 1) % 4]
-        dx = bx - ax
-        dy = by - ay
-        out.append(math.sqrt(dx * dx + dy * dy))
-    return out
-
-def _quad_geom_ok(c):
-    """旋转不变的四边形检查：边长、邻角和对边比例。"""
-    if (c is None) or (not _quad_convex(c)):
-        return False
-    s = _quad_sides(c)
-    smin = min(s)
-    smax = max(s)
-    if (smin < PAPER_MIN_SIDE) or (smax > QUAD_SIDE_RATIO_MAX * smin):
-        return False
-    # 对边：s0/s2、s1/s3
-    if abs(s[0] - s[2]) > QUAD_OPPOSITE_DIFF_MAX * max(s[0], s[2]):
-        return False
-    if abs(s[1] - s[3]) > QUAD_OPPOSITE_DIFF_MAX * max(s[1], s[3]):
-        return False
-    # 相邻边夹角余弦（内角 90°±30°）
-    for i in range(4):
-        ax, ay = c[i]
-        bx, by = c[(i + 1) % 4]
-        px, py = c[(i - 1) % 4]
-        v1x = bx - ax
-        v1y = by - ay
-        v2x = px - ax
-        v2y = py - ay
-        n1 = math.sqrt(v1x * v1x + v1y * v1y)
-        n2 = math.sqrt(v2x * v2x + v2y * v2y)
-        if (n1 < 1e-6) or (n2 < 1e-6):
-            return False
-        if abs((v1x * v2x + v1y * v2y) / (n1 * n2)) > QUAD_ANGLE_COS_MAX:
-            return False
-    return True
-
-def _boundary_points(np_img, bx, by, bw, bh, hi=True):
-    """在连通域框内取外边界采样点（行左右沿 + 列上下沿）。"""
-    pts = []
-    x0 = max(1, int(bx))
-    y0 = max(1, int(by))
-    x1 = min(IMG_W - 2, int(bx + bw) - 1)
-    y1 = min(IMG_H - 2, int(by + bh) - 1)
-    if (x1 - x0 < 8) or (y1 - y0 < 8):
-        return pts
-    step = max(1, int(max(bw, bh) / 40.0))
-    y = y0
-    while y <= y1:
-        left = -1
-        right = -1
-        x = x0
-        while x <= x1:
-            v = int(np_img[y, x])
-            on = (v >= 128) if hi else (v < 128)
-            if on:
-                if left < 0:
-                    left = x
-                right = x
-            x += 1
-        if left >= 0:
-            pts.append((left, y))
-            pts.append((right, y))
-        y += step
-    x = x0
-    while x <= x1:
-        top = -1
-        bot = -1
-        y = y0
-        while y <= y1:
-            v = int(np_img[y, x])
-            on = (v >= 128) if hi else (v < 128)
-            if on:
-                if top < 0:
-                    top = y
-                bot = y
-            y += 1
-        if top >= 0:
-            pts.append((x, top))
-            pts.append((x, bot))
-        x += step
-    if len(pts) < 8:
-        return pts
-    # 用中位数中心做一次径向离群过滤，避免粘连背景把凸包拉偏。
-    _xs = sorted(p[0] for p in pts)
-    _ys = sorted(p[1] for p in pts)
-    _mx = _xs[len(_xs) // 2]
-    _my = _ys[len(_ys) // 2]
-    _scored = []
-    for p in pts:
-        _dx = p[0] - _mx
-        _dy = p[1] - _my
-        _scored.append((math.sqrt(_dx * _dx + _dy * _dy), p))
-    _scored.sort(key=lambda q: q[0])
-    _r = _scored[int((len(_scored) - 1) * 0.85)][0] * 1.15
-    return [p for d, p in _scored if d <= _r]
-
-def _cross3(o, a, b):
-    return (a[0] - o[0]) * (b[1] - o[1]) - \
-           (a[1] - o[1]) * (b[0] - o[0])
-
-def _convex_hull(points):
-    pts = sorted(set(points))
-    if len(pts) < 3:
-        return pts
-    lower = []
-    for p in pts:
-        while (len(lower) >= 2) and \
-                (_cross3(lower[-2], lower[-1], p) <= 0):
-            lower.pop()
-        lower.append(p)
-    upper = []
-    for p in reversed(pts):
-        while (len(upper) >= 2) and \
-                (_cross3(upper[-2], upper[-1], p) <= 0):
-            upper.pop()
-        upper.append(p)
-    return lower[:-1] + upper[:-1]
-
-def _pt_seg_dist(p, a, b):
-    dx = b[0] - a[0]
-    dy = b[1] - a[1]
-    den = dx * dx + dy * dy
-    if den <= 1e-9:
-        return math.sqrt((p[0] - a[0]) ** 2 + (p[1] - a[1]) ** 2)
-    t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / den
-    if t < 0.0:
-        t = 0.0
-    elif t > 1.0:
-        t = 1.0
-    qx = a[0] + t * dx
-    qy = a[1] + t * dy
-    return math.sqrt((p[0] - qx) ** 2 + (p[1] - qy) ** 2)
-
-def _rdp_open(pts, eps):
-    if len(pts) < 3:
-        return list(pts)
-    dmax = -1.0
-    idx = 0
-    a = pts[0]
-    b = pts[-1]
-    for i in range(1, len(pts) - 1):
-        d = _pt_seg_dist(pts[i], a, b)
-        if d > dmax:
-            dmax = d
-            idx = i
-    if dmax > eps:
-        left = _rdp_open(pts[:idx + 1], eps)
-        right = _rdp_open(pts[idx:], eps)
-        return left[:-1] + right
-    return [a, b]
-
-def _approx_quad(points):
-    hull = _convex_hull(points)
-    if len(hull) < 4:
-        return None
-    peri = 0.0
-    for i in range(len(hull)):
-        a = hull[i]
-        b = hull[(i + 1) % len(hull)]
-        peri += math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
-    # 从最远点把闭合轮廓拆成两条开放链，分别 RDP（等价 approxPolyDP 闭轮廓）。
-    i0 = hull[0]
-    far = 1
-    fd = -1.0
-    for i in range(1, len(hull)):
-        d = (hull[i][0] - i0[0]) ** 2 + (hull[i][1] - i0[1]) ** 2
-        if d > fd:
-            fd = d
-            far = i
-    for ratio in (0.005, 0.008, 0.01, 0.015, 0.02, 0.025, 0.03,
-                  0.04, 0.05):
-        eps = peri * ratio
-        c1 = _rdp_open(hull[:far + 1], eps)
-        c2 = _rdp_open(hull[far:] + [hull[0]], eps)
-        ap = c1[:-1] + c2[:-1]
-        if len(ap) == 4:
-            q = _gy_sort_cyclic(ap)
-            if _quad_convex(q):
-                return q
-        if len(ap) < 4:
-            continue
-    return None
-
-def _hull_quad_from_bbox(np_img, bx, by, bw, bh, hi=True):
-    pts = _boundary_points(np_img, bx, by, bw, bh, hi)
-    if len(pts) < 12:
-        return None
-    return _approx_quad(pts)
-
-def _mask_hull_pair(np_img, bx, by, bw, bh, inner_blob):
-    """由外边界拟合四边形，再用内孔中心和面积比生成内四边形。"""
-    qo = _hull_quad_from_bbox(np_img, bx, by, bw, bh, True)
-    if (qo is None) or (not _quad_geom_ok(qo)):
-        return None
-    if inner_blob is None:
-        return None
-    ix, iy, iw, ih = inner_blob[0], inner_blob[1], inner_blob[2], inner_blob[3]
-    if (iw < 8) or (ih < 8):
-        return None
-    co = _gy_centroid4(qo)
-    if co is None:
-        return None
-    cx = ix + iw * 0.5
-    cy = iy + ih * 0.5
-    if not _pt_in_quad((cx, cy), qo):
-        return None
-    _br = (iw * ih) / float(max(1, bw * bh))
-    _scl = math.sqrt(max(0.10, min(0.95, _br)))
-    qi = _gy_sort_cyclic([
-        (cx + (p[0] - co[0]) * _scl,
-         cy + (p[1] - co[1]) * _scl) for p in qo])
-    if (qi is None) or (not _quad_convex(qi)):
-        return None
-    ao = _gy_quad_area(qo)
-    ai = _gy_quad_area(qi)
-    if (ao < 1.0) or (ai < 1.0):
-        return None
-    ratio = ai / ao
-    if (ratio < GY_AREA_RATIO) or (ratio > 0.97):
-        return None
-    ci = _gy_centroid4(qi)
-    if (ci is None) or (not _pt_in_quad(ci, qo)):
-        return None
-    return (qo, qi)
-
-def _pick_inner_blob(inv_blobs, bx, by, bw, bh):
-    """在外框 bbox 内选最大的、未触边界的黑色内孔连通域。"""
-    best = None
-    if not inv_blobs:
-        return None
-    for b in inv_blobs:
-        ix = int(b[0])
-        iy = int(b[1])
-        iw = int(b[2])
-        ih = int(b[3])
-        ia = int(b[4])
-        if (ix <= bx + 2) or (iy <= by + 2) or \
-                (ix + iw >= bx + bw - 2) or \
-                (iy + ih >= by + bh - 2):
-            continue
-        asp = max(iw, ih) / float(max(1, min(iw, ih)))
-        if (asp < 0.30) or (asp > 3.2):
-            continue
-        if (best is None) or (ia > best[4]):
-            best = (ix, iy, iw, ih, ia)
-    return best
-
-def _mask_band_quad(np_img, bx, by, bw, bh):
-    """细框断口兜底：扫描行/列白带并拟合内外四边形。
-
-    正常路径使用 `_mask_hull_pair`；只有内孔没有形成独立连通域时才调用。
-    """
-    x0 = max(2, int(bx))
-    y0 = max(2, int(by))
-    x1 = min(IMG_W - 3, int(bx + bw) - 1)
-    y1 = min(IMG_H - 3, int(by + bh) - 1)
-    if (x1 - x0 < 12) or (y1 - y0 < 12):
-        return None
-    # 收集白行程，并把相邻 3px 内的 Canny 线并入同一条边带。
-    min_run = 1
-    ns = 14
-    left_o = []
-    left_i = []
-    right_i = []
-    right_o = []
-    top_o = []
-    top_i = []
-    bot_i = []
-    bot_o = []
-    for k in range(ns):
-        f = 0.12 + 0.76 * k / float(ns - 1)
-        y = int(y0 + (y1 - y0) * f)
-        runs = _mask_runs(np_img, y, True, x0, x1 + 1, min_run)
-        if len(runs) >= 2:
-            # 从外侧向内合并相邻白段。
-            li_ix = 0
-            l_end = runs[0][1]
-            while (li_ix + 1 < len(runs)) and \
-                    (runs[li_ix + 1][0] - l_end <= 3):
-                li_ix += 1
-                l_end = runs[li_ix][1]
-            # 从右侧向内合并相邻白段。
-            ri_ix = len(runs) - 1
-            r_start = runs[ri_ix][0]
-            while (ri_ix > 0) and \
-                    (r_start - runs[ri_ix - 1][1] <= 3):
-                ri_ix -= 1
-                r_start = runs[ri_ix][0]
-            l_out = runs[0][0]
-            r_out = runs[-1][1]
-            l_in = l_end
-            r_in = r_start
-            # 细框的内外边缘可能是两条独立的 Canny 线。
-            _span = max(8, int(round(30 * S_SCALE)))
-            if (l_end - l_out <= 2) and (li_ix + 1 < len(runs)) and \
-                    (runs[li_ix + 1][0] - l_end <= _span):
-                l_in = runs[li_ix + 1][1]
-            if (r_out - r_start <= 2) and (ri_ix > 0) and \
-                    (r_start - runs[ri_ix - 1][1] <= _span):
-                r_in = runs[ri_ix - 1][0]
-            if (l_in + 2) < r_in:
-                left_o.append((l_out, y))
-                left_i.append((l_in, y))
-                right_i.append((r_in, y))
-                right_o.append((r_out, y))
-        x = int(x0 + (x1 - x0) * f)
-        runs = _mask_runs(np_img, x, False, y0, y1 + 1, min_run)
-        if len(runs) >= 2:
-            ti_ix = 0
-            t_end = runs[0][1]
-            while (ti_ix + 1 < len(runs)) and \
-                    (runs[ti_ix + 1][0] - t_end <= 3):
-                ti_ix += 1
-                t_end = runs[ti_ix][1]
-            bi_ix = len(runs) - 1
-            b_start = runs[bi_ix][0]
-            while (bi_ix > 0) and \
-                    (b_start - runs[bi_ix - 1][1] <= 3):
-                bi_ix -= 1
-                b_start = runs[bi_ix][0]
-            t_out = runs[0][0]
-            b_out = runs[-1][1]
-            t_in = t_end
-            b_in = b_start
-            _span = max(8, int(round(30 * S_SCALE)))
-            if (t_end - t_out <= 2) and (ti_ix + 1 < len(runs)) and \
-                    (runs[ti_ix + 1][0] - t_end <= _span):
-                t_in = runs[ti_ix + 1][1]
-            if (b_out - b_start <= 2) and (bi_ix > 0) and \
-                    (b_start - runs[bi_ix - 1][1] <= _span):
-                b_in = runs[bi_ix - 1][0]
-            if (t_in + 2) < b_in:
-                top_o.append((x, t_out))
-                top_i.append((x, t_in))
-                bot_i.append((x, b_in))
-                bot_o.append((x, b_out))
-    if (len(left_o) < 5) or (len(right_o) < 5) or \
-            (len(top_o) < 5) or (len(bot_o) < 5):
-        return None
-    lo = _fit_line_pts_robust(left_o)
-    li = _fit_line_pts(left_i)
-    ri = _fit_line_pts(right_i)
-    ro = _fit_line_pts_robust(right_o)
-    to = _fit_line_pts_robust(top_o)
-    ti = _fit_line_pts(top_i)
-    bi = _fit_line_pts(bot_i)
-    bo = _fit_line_pts_robust(bot_o)
-    if None in (lo, li, ri, ro, to, ti, bi, bo):
-        return None
-
-    def _mkq(lt, lb, ll, lr):
-        p1 = _line_isect(lt, ll)
-        p2 = _line_isect(lt, lr)
-        p3 = _line_isect(lb, lr)
-        p4 = _line_isect(lb, ll)
-        if None in (p1, p2, p3, p4):
-            return None
-        return _gy_sort_cyclic([p1, p2, p3, p4])
-
-    qo = _mkq(to, bo, lo, ro)
-    qi = _mkq(ti, bi, li, ri)
-    if (qo is None) or (qi is None):
-        return None
-    # 外框做完整几何检查；内框来自面积比缩放，只检查凸性和包含关系。
-    if not _quad_geom_ok(qo):
-        return None
-    if not _quad_convex(qi):
-        return None
-    ao = _gy_quad_area(qo)
-    ai = _gy_quad_area(qi)
-    if (ao < 1.0) or (ai < 1.0):
-        return None
-    ratio = ai / ao
-    if (ratio < 0.45) or (ratio > 0.96):
-        return None
-    co = _gy_centroid4(qo)
-    ci = _gy_centroid4(qi)
-    if (co is None) or (ci is None):
-        return None
-    if not _pt_in_quad(ci, qo):
-        return None
-    # 透视下允许少量偏移，但内外框仍应基本同心。
-    if abs(co[0] - ci[0]) + abs(co[1] - ci[1]) > 0.35 * max(bw, bh):
-        return None
-    return (qo, qi)
-
-def _mask_band_quads(fi, np_img, hint=None):
-    """从融合图提取独立连通域，并拟合内外四边形。"""
-    raw = None
-    blobs = []
-    seen = {}
-    try:
-        # 连通域来自低阈值二值区与 Canny 边缘的融合图。
-        import cv_lite
-        raw = cv_lite.grayscale_find_blobs(
-            [IMG_H, IMG_W], np_img, 128, 255, 80, 1)
+        thr = img.get_histogram().get_threshold().value()
+        t = float(thr) * 100.0 / 255.0
+        src = 1.0
     except Exception:
-        raw = None
-    if raw is not None:
-        for _i in range(0, len(raw) - 3, 4):
-            _b4 = (int(raw[_i]), int(raw[_i + 1]),
-                   int(raw[_i + 2]), int(raw[_i + 3]))
-            if _b4 not in seen:
-                seen[_b4] = 1
-                blobs.append(_b4)
-    # 两套连通域实现的面积定义不同，并联可补回细轮廓。
-    try:
-        _ib = fi.find_blobs([(128, 255)], roi=None, merge=False,
-                            margin=0, pixels_threshold=80,
-                            area_threshold=80)
-    except Exception:
-        _ib = None
-    if _ib:
-        for b in _ib:
-            _b4 = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
-            if _b4 not in seen:
-                seen[_b4] = 1
-                blobs.append(_b4)
-    if not blobs:
-        # 两块中心 ROI 仍会在下面执行，不在这里提前返回。
-        blobs = []
-    # 反相后的内孔白块用于定位内框。
-    inv_blobs = []
-    try:
-        _inv = fi.copy()
-        _inv.binary([(0, 127)])
-        inv_blobs = _inv.find_blobs([(128, 255)], roi=None, merge=False,
-                                    margin=0, pixels_threshold=60,
-                                    area_threshold=60)
-    except Exception:
-        inv_blobs = []
-    cand = []
-    pref = hint[0] if hint is not None else 0.0
-    hu = hint[1] if hint is not None else SPOT_UV[0]
-    hv = hint[2] if hint is not None else SPOT_UV[1]
-    for b in blobs:
-        bx, by, bw, bh = b
-        _long = max(bw, bh)
-        _short = min(bw, bh)
-        if (_short < 12) or (_long < PAPER_MIN_LONG) or \
-                (_long > PAPER_MAX_LONG):
-            continue
-        _asp = _long / float(_short)
-        if (_asp < 0.55) or (_asp > 2.4):
-            continue
-        _cx = bx + bw * 0.5
-        _cy = by + bh * 0.5
-        _sim = -abs(_long - pref) if (pref > 1.0) else 0.0
-        _dc = abs(_cx - hu) + abs(_cy - hv)
-        cand.append(((_sim, bw * bh, -_dc), bx, by, bw, bh))
-    cand.sort(reverse=True)
-    out = []
-    # 锁定态只拟合前 4 个；搜索态保留 8 个覆盖同心环/杂波。
-    _limit = 4 if hint is not None else 8
-    for _key, bx, by, bw, bh in cand[:_limit]:
-        _inner_blob = _pick_inner_blob(inv_blobs, bx, by, bw, bh)
-        q = _mask_hull_pair(np_img, bx, by, bw, bh, _inner_blob) \
-            if (_inner_blob is not None) else None
-        if q is None:
-            # 没有闭合内孔时才使用边带扫描。
-            q = _mask_band_quad(np_img, bx, by, bw, bh)
-        if q is not None:
-            out.append(q)
-            if hint is not None:
-                _qxs = [p[0] for p in q[0]]
-                _qys = [p[1] for p in q[0]]
-                _ql = max(max(_qxs) - min(_qxs), max(_qys) - min(_qys))
-                if abs(_ql - hint[0]) <= 0.06 * max(1.0, hint[0]):
-                    break
-    # 白框与背景粘连时，围绕激光点/上一帧中心补两块 ROI。
-    if not out:
-        for _rw, _rh in ((int(IMG_W * 0.82), int(IMG_H * 0.84)),
-                         (int(IMG_W * 0.68), int(IMG_H * 0.70))):
-            _bx = int(max(2, min(IMG_W - _rw - 2, hu - _rw * 0.5)))
-            _by = int(max(2, min(IMG_H - _rh - 2, hv - _rh * 0.5)))
-            _inner_blob = _pick_inner_blob(inv_blobs, _bx, _by, _rw, _rh)
-            q = _mask_hull_pair(np_img, _bx, _by, _rw, _rh, _inner_blob) \
-                if (_inner_blob is not None) \
-                else None
-            if q is None:
-                q = _mask_band_quad(np_img, _bx, _by, _rw, _rh)
-            if q is not None:
-                out.append(q)
-    return out
+        t = -1.0
+    if (t < 38.0) or (t > 62.0):
+        t = _otsu_from_samples(img)
+        if (t >= 38.0) and (t <= 62.0):
+            src = 2.0
+    if (t < 38.0) or (t > 62.0):
+        s = 0
+        k = 0
+        for gy in range(5):
+            y = int(IMG_H * (gy + 0.5) / 5)
+            for gx in range(6):
+                x = int(IMG_W * (gx + 0.5) / 6)
+                v = px_luma(img, x, y)
+                if v >= 0:
+                    s += v
+                    k += 1
+        if k <= 0:
+            return PAPER_TH
+        t = (s / float(k)) * 100.0 / 255.0 + 8.0
+        if t < PAPER_TH:
+            t = PAPER_TH
+        elif t > 72.0:
+            t = 72.0
+        src = 3.0
+    _scene_cache[1] = t
+    _scene_cache[2] = src
+    return int(t)
 
-def _cv2_find(img, hint=None, th=None, mask_out=None):
-    """在融合图上检测靶纸，返回外框、靶心和形状指标。
 
-    流程：灰度 -> 反向二值化 -> 闭运算 -> Canny -> 融合图
-          -> 白色连通域 -> 外边界凸包/RDP 四边 -> 内孔与几何过滤。
-
-    hint 仅用于候选排序；mask_out 非空时返回融合图供调试工具使用。
-    识别失败返回 None。
-    """
-    try:
-        import cv_lite
-        import image
-    except Exception as e:
-        _GY_ERR[0] += 1
-        if _GY_ERR[0] == 1:
-            log("[CV2] cv_lite/image 不可用(%s) -> 退回色块/矩形候选路" % e)
-        return None
-    _t = time.ticks_ms()
-    try:
-        # 当前帧已经是软件曝光后的灰度图。
-        gray_np = img.to_numpy_ref()
-        gi = None
-        try:
-            gi = img.copy()          # 在副本上处理，不修改相机帧
-        except Exception:
-            gi = None
-        if gi is None:
-            gi = img.to_grayscale()  # 兜底：至少换一张图
-        if gi is None:
-            gi = img
-        edges_np = None
-        try:
-            edges_np = cv_lite.grayscale_find_edges(
-                [IMG_H, IMG_W], gray_np, GY_CANNY1, GY_CANNY2)
-        except Exception:
-            edges_np = None
-        # 反向二值化：暗部变为白色前景。
-        _th = GY_TH if th is None else int(th)
-        _GY_TH_NOW[0] = _th
-        if _th <= 1:
-            gi.binary([(0, 0)])
-        else:
-            gi.binary([(0, _th - 1)])
-        # 闭运算补断口。
-        if GY_CLOSE_SIZE > 0:
-            try:
-                gi.close(GY_CLOSE_SIZE)
-            except Exception as e:
-                if _CLOSE_ERR[0] == 0:
-                    _CLOSE_ERR[0] = 1
-                    log("[CV2] close(%d) 失败(%s) -> 跳过闭运算"
-                        % (GY_CLOSE_SIZE, e))
-        # 解包为 8bit 0/255 灰度，供连通域和融合使用。
-        gn = gi
-        try:
-            _g2 = gi.to_grayscale()
-            if _g2 is not None:
-                gn = _g2
-        except Exception:
-            pass
-        fi = gn
-        if edges_np is not None:
-            try:
-                _fc = gn.copy()
-                if _fc is not None:
-                    fi = _fc
-            except Exception:
-                fi = gn
-            _ferr = None
-            try:
-                ei = image.Image(IMG_W, IMG_H, image.GRAYSCALE,
-                                 alloc=image.ALLOC_REF, data=edges_np)
-                fi.b_or(ei)                   # 首选：按位或（就地改）
-            except Exception as e:
-                _ferr = e
-                try:
-                    _r = fi.add(ei)           # 兜底：饱和加（白+白=白）
-                    if _r is not None:
-                        fi = _r
-                    _ferr = None
-                except Exception:
-                    pass
-            if _ferr is not None:
-                _GY_FUSE_ERR[0] += 1
-                if _GY_FUSE_ERR[0] == 1:
-                    log("[CV2] 融合(b_or/add)失败(%s) -> 只用二值图" % _ferr)
-        _PROF[0] += time.ticks_diff(time.ticks_ms(), _t)
-        try:
-            if (mask_out is not None) and (fi is not None):
-                mask_out[0] = fi
-            if not _GY_MASK_OK[0]:
-                if fi is not None:
-                    log("[CV2] 融合图就绪 th=%d" % _th)
-                else:
-                    log("[CV2] 融合图没建起来（异常），本帧不检测")
-            _GY_MASK_OK[0] = True
-        except Exception:
-            pass
-        # 后续检测只读取这张融合图，不再回灰度重跑 Canny。
-        dnp = None
-        try:
-            _dc = fi.copy()
-            if _dc is not None:
-                dnp = _dc.to_numpy_ref()
-        except Exception:
-            dnp = None
-        if dnp is not None:
-            # 只接受与处理分辨率一致的整幅灰度数组。
-            try:
-                if (int(dnp.shape[0]) != IMG_H) or \
-                        (int(dnp.shape[1]) != IMG_W):
-                    dnp = None
-            except Exception:
-                dnp = None
-        _GY_SRC_DBG[0] = "融"
-        if dnp is None:
-            _GY_DBG[0] = "r0掩"
-            return None
-        _t2 = time.ticks_ms()
-        bands = _mask_band_quads(fi, dnp, hint)
-        _PROF[3] += 1
-        _PROF[1] += IMG_W * IMG_H
-        # 主核未检出时，用备用闭运算核重建一次融合图。
-        if (not bands) and \
-                (GY_CLOSE_RETRY > 0) and \
-                (GY_CLOSE_RETRY != GY_CLOSE_SIZE):
-            _g2i = None
-            try:
-                _g2i = img.copy()
-            except Exception:
-                _g2i = None
-            if _g2i is not None:
-                try:
-                    _g2i.binary([(0, _th - 1)])
-                    _g2i.close(GY_CLOSE_RETRY)
-                    _gn2 = _g2i.to_grayscale()
-                    if _gn2 is None:
-                        _gn2 = _g2i
-                    _f2 = _gn2
-                    try:
-                        _f2 = _gn2.copy()
-                    except Exception:
-                        _f2 = _gn2
-                    if edges_np is not None:
-                        try:
-                            _e2 = image.Image(IMG_W, IMG_H, image.GRAYSCALE,
-                                              alloc=image.ALLOC_REF,
-                                              data=edges_np)
-                            _f2.b_or(_e2)
-                        except Exception:
-                            pass
-                    _n2 = _f2.to_numpy_ref()
-                    bands = _mask_band_quads(_f2, _n2, hint)
-                    _PROF[3] += 1
-                    _PROF[1] += IMG_W * IMG_H
-                    if bands:
-                        _GY_SRC_DBG[0] = "融5"
-                except Exception:
-                    pass
-                try:
-                    del _g2i
-                except Exception:
-                    pass
-        _PROF[2] += time.ticks_diff(time.ticks_ms(), _t2)
-        try:
-            del _dc
-        except Exception:
-            pass
-        if not bands:
-            _GY_DBG[0] = "r0%s" % _GY_SRC_DBG[0]
-            return None
-
-        # 每个候选已经包含同组内外四边形。
-        _pairs = []
-        for _qo, _qi in bands:
-            _pairs.append((_gy_quad_area(_qi), _qi, _qo))
-        if not _pairs:
-            _GY_DBG[0] = "p0"
-            return None
-        # 多个候选按对比度、暗边、尺度和中心位置筛选。
-        _best = None
-        for _pj in _pairs:
-            _ci = _pj[1]
-            _xs = (_ci[0][0], _ci[1][0], _ci[2][0], _ci[3][0])
-            _ys = (_ci[0][1], _ci[1][1], _ci[2][1], _ci[3][1])
-            _bx = int(min(_xs))
-            _by = int(min(_ys))
-            _bw = int(max(_xs)) - _bx
-            _bh = int(max(_ys)) - _by
-            if (_bw < 8) or (_bh < 8):
-                continue
-            _i2, _o2, _f2 = paper_contrast(img, _bx, _by, _bw, _bh)
-            if (_i2 < 0) or ((_i2 - _o2) < PAPER_CONTRAST_MIN):
-                _GY_DBG[0] = "c"
-                continue
-            if _f2 < PAPER_DARK_FRAC_MIN:
-                _GY_DBG[0] = "d"
-                continue
-            # 饱和且内部完全均匀的亮块通常是灯或窗。
-            if (_i2 >= PAPER_INNER_MAX) and \
-                    (_interior_trans(img, _bx, _by, _bw, _bh) <
-                     INTERIOR_TRANS_MIN):
-                _GY_DBG[0] = "t"
-                continue
-            _cx = _bx + _bw / 2.0
-            _cy = _by + _bh / 2.0
-            _dc = abs(_cx - SPOT_UV[0]) + abs(_cy - SPOT_UV[1])
-            _oc = _pj[2]
-            _oxs = (_oc[0][0], _oc[1][0], _oc[2][0], _oc[3][0])
-            _oys = (_oc[0][1], _oc[1][1], _oc[2][1], _oc[3][1])
-            _ol = max(max(_oxs) - min(_oxs), max(_oys) - min(_oys))
-            prefer_long = hint[0] if hint is not None else 0.0
-            if prefer_long > 1.0:
-                _sim = -abs(_ol - prefer_long)
-            else:
-                _sim = 0.0
-            _dp = 0.0
-            if (hint is not None) and (hint[0] > 1.0):
-                _dp = abs(_cx - hint[1]) + abs(_cy - hint[2])
-            # 优先同尺度、嵌套关系和大面积。
-            _key = (_sim, 1 if _pj[1] is not _pj[2] else 0,
-                    _gy_quad_area(_pj[1]), -_dc, -_dp)
-            if (_best is None) or (_key > _best[0]):
-                _best = (_key, _pj)
-        if _best is None:
-            return None          # _GY_DBG 上一轮循环里已经写好了
-        _inner = _best[1][1]          # 内框（纸的边界）
-        _outer = _best[1][2]          # 对外输出的外框
-        _ci = _gy_centroid4(_inner)   # 靶心 = 内框重心
-        if _ci is None:
-            return None
-        _xs = (_outer[0][0], _outer[1][0], _outer[2][0], _outer[3][0])
-        _ys = (_outer[0][1], _outer[1][1], _outer[2][1], _outer[3][1])
-        _bx = int(min(_xs))
-        _by = int(min(_ys))
-        _bw = int(max(_xs)) - _bx
-        _bh = int(max(_ys)) - _by
-        if (_bw < 8) or (_bh < 8):
-            _GY_DBG[0] = "s1"
-            return None
-        _long = max(_bw, _bh)
-        _short = max(1, min(_bw, _bh))
-        _aspect = _long / float(_short)
-        if (_long < PAPER_MIN_LONG) or (_long > PAPER_MAX_LONG):
-            _GY_DBG[0] = "s%d" % _long
-            return None
-        if (_aspect < PAPER_ASPECT_MIN) or (_aspect > PAPER_ASPECT_MAX):
-            _GY_DBG[0] = "a%.2f" % _aspect
-            return None
-        _pxa = _gy_quad_area(_outer)
-        # _dens 只用于日志，不再作为筛选闸门。
-        _ss = _quad_sides(_outer)
-        _dens = min(_ss) / max(_ss) if max(_ss) > 0 else 1.0
-        _ins, _outs, _ = paper_contrast(img, _bx, _by, _bw, _bh)
-        return (_pxa, _bx, _by, _bw, _bh, _long, _aspect, _dens,
-                        _ins, _outs, tuple(_outer), _ci[0], _ci[1])
-    except Exception as e:
-        _GY_ERR[0] += 1
-        if _GY_ERR[0] == 1:
-            log("[CV2] 融合图检测异常(%s)" % e)
-        return None
-    finally:
-        _PROF[4] += time.ticks_diff(time.ticks_ms(), _t)
-        _PROF[5] += 1
-
-def log_scene(img):
-    """采样画面亮度分布，用于判断无靶是曝光、视野还是判据问题。"""
-    _vals = []
-    for gy in range(12):
-        y = int(IMG_H * (gy + 0.5) / 12)
-        for gx in range(10):
-            x = int(IMG_W * (gx + 0.5) / 10)
+def _otsu_from_samples(img):
+    """自实现大津法（设备直方图 API 不可用时的备胎）：
+    40x30 网格采样 -> 32 桶直方图 -> 找双峰分界 -> 折回 0~100。
+    QGimbal 的"确定性二值化"就靠这个保证：每 10 帧一定有一个"算出来的"阈值，
+    不依赖任何单一 API。返回 -1 表示样本不足。"""
+    hist = [0] * 32
+    n = 0
+    for gy in range(30):
+        y = int(IMG_H * (gy + 0.5) / 30)
+        for gx in range(40):
+            x = int(IMG_W * (gx + 0.5) / 40)
             v = px_luma(img, x, y)
             if v >= 0:
-                _vals.append(v)
-    if _vals:
-        _vals.sort()
-        k = len(_vals)
-        s = 0
-        for v in _vals:
-            s += v
-        lo = _vals[0]
-        hi = _vals[k - 1]
-        p25 = _vals[k * 25 // 100]
-        p50 = _vals[k * 50 // 100]
-        p75 = _vals[k * 75 // 100]
-        log("[SCENE] 画面亮度 均=%.0f 小=%d 大=%d P25=%d P50=%d P75=%d (0~255) "
-            "（当前阈值 th=%d：反向二值化里白的=比它暗，胶带落在 P25 那档、"
-            "木柜在 P50 那档）  靶=无靶时看这行"
-            % (s / float(k), lo, hi, p25, p50, p75,
-               (_GY_TH_NOW[0] if _GY_TH_NOW[0] > 0 else GY_TH)))
+                hist[v >> 3] += 1
+                n += 1
+    if n < 200:
+        return -1.0
+    total = 0.0
+    for i in range(32):
+        total += hist[i] * i
+    sum_b = 0.0
+    wb = 0
+    best = -1.0
+    th_lo = 0
+    th_hi = 0
+    for i in range(32):
+        wb += hist[i]
+        if wb == 0:
+            continue
+        wf = n - wb
+        if wf == 0:
+            break
+        sum_b += hist[i] * i
+        mb = sum_b / wb
+        mf = (total - sum_b) / wf
+        var = wb * wf * (mb - mf) * (mb - mf)
+        if var > best * 1.002:
+            best = var
+            th_lo = i
+            th_hi = i
+        elif var >= best * 0.998:
+            th_hi = i
+    th = (th_lo + th_hi) * 0.5
+    return (th + 0.5) * 8.0 * 100.0 / 255.0
 
-def paper_contrast(img, x, y, w, h):
-    """返回内部均值、外侧均值和外侧暗点比例。"""
+
+def log_scene(img):
+    """每 5 秒打一行"画面亮度"（6x8 网格自己采样），用来判断为什么没锁到靶：
+      · 均/大 都很小（均<60 且 大<90）-> 画面太暗 / 镜头被挡 / 对着暗墙
+      · 有大亮块（大>=200）但没靶     -> 靶纸不在视野里，或太远太小
+      · 均 100+ 且有大亮块            -> 视野正常，那是靶纸判据/阈值的问题
+    以前没有这行时，"候选0"（一个亮块都没有）只能靠猜。"""
+    lo = 255
+    hi = 0
+    s = 0
+    k = 0
+    for gy in range(6):
+        y = int(IMG_H * (gy + 0.5) / 6)
+        for gx in range(8):
+            x = int(IMG_W * (gx + 0.5) / 8)
+            v = px_luma(img, x, y)
+            if v < 0:
+                continue
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+            s += v
+            k += 1
+    if k:
+        _src = _scene_cache[2]
+        _tag = "(Otsu)" if _src == 1.0 else \
+               ("(自算Otsu)" if _src == 2.0 else
+                ("(固定)" if _src == 4.0 else "(回退)"))
+        log("[SCENE] 画面亮度 均=%.0f 小=%d 大=%d (0~255) 阈值=%d%s  靶=无靶时看这行"
+            % (s / float(k), lo, hi, int(_scene_cache[1]), _tag))
+
+
+def paper_contrast(img, x, y, w, h, use_arr=False):
+    """内亮外暗校验：返回 (内部平均亮度, 外侧平均亮度, 外侧合格比例)。
+
+    外侧取 12 个点（四边各 3 个），要求其中至少 PAPER_DARK_FRAC_MIN 的比例
+    明显比内部暗 —— 背景柜子那种“只有一边有暗边”的亮块因此过不了。
+    """
     u = ((x + w * 0.30, y + h * 0.50), (x + w * 0.70, y + h * 0.50),
          (x + w * 0.50, y + h * 0.30), (x + w * 0.50, y + h * 0.70),
          (x + w * 0.50, y + h * 0.50))
@@ -1241,13 +389,17 @@ def paper_contrast(img, x, y, w, h):
     so = 0
     ni = 0
     no = 0
+    if use_arr:
+        get_luma = px_luma_arr
+    else:
+        get_luma = px_luma
     for p in u:
-        v = px_luma(img, p[0], p[1])
+        v = get_luma(img, p[0], p[1])
         if v >= 0:
             si += v
             ni += 1
     for p in o:
-        v = px_luma(img, p[0], p[1])
+        v = get_luma(img, p[0], p[1])
         if v >= 0:
             so += v
             no += 1
@@ -1256,13 +408,422 @@ def paper_contrast(img, x, y, w, h):
     ins = si / float(ni)
     ok = 0
     for p in o:
-        v = px_luma(img, p[0], p[1])
+        v = get_luma(img, p[0], p[1])
         if v >= 0 and v < (ins - PAPER_DARK_MARGIN):
             ok += 1
     return ins, so / float(no), ok / float(no)
 
+
+def paper_frame_sides(img, x, y, w, h, ins):
+    """近处黑胶带框校验：四边各 3 点，至少 2 点比纸面暗才算该边有框。
+
+    反光可能破坏一边，所以允许 3/4 边；破坏两边以上就拒绝。
+    """
+    lim = ins - PAPER_DARK_MARGIN
+    sides = 0
+    for sx in (x - PROBE_OFF_PX, x + w + PROBE_OFF_PX):
+        k = 0
+        for fy in (0.25, 0.50, 0.75):
+            v = px_luma(img, sx, y + h * fy)
+            if v >= 0 and v < lim:
+                k += 1
+        if k >= 2:
+            sides += 1
+    for sy in (y - PROBE_OFF_PX, y + h + PROBE_OFF_PX):
+        k = 0
+        for fx in (0.25, 0.50, 0.75):
+            v = px_luma(img, x + w * fx, sy)
+            if v >= 0 and v < lim:
+                k += 1
+        if k >= 2:
+            sides += 1
+    return sides
+
+
+def norm_bbox(bx, by, bw, bh, roi):
+    """兼容 find_blobs 返回“相对 ROI”或“全图”两种坐标。"""
+    if roi[0] or roi[1]:
+        if (bx + bw / 2.0) < roi[0] or (by + bh / 2.0) < roi[1]:
+            return bx + roi[0], by + roi[1]
+    return bx, by
+
+
+def merge_fragments(blobs, roi):
+    """把"被印刷圈/阴影切碎的靶纸"重新拼成一块，**但绝不吸收背景大块**。
+
+    为什么不用 find_blobs(merge=True)：那个 merge 是按**外接框**做的 ——
+    两块的外接框一靠近（margin 之内）就并成一块。于是只要背景里有个大亮块
+    （白墙/亮桌面），它的外接框罩住靶纸，靶纸就被吞进去，最后只剩一个
+    "26 万像素 框800 ✗框长"的大块：**真靶纸永远不作为候选出现**。
+    这里的规则：只拼“嵌套”的碎片 —— 印刷圈把纸切成同心环时，
+    内圈的外接框在外圈里面，这种情况必须拼；相邻但不嵌套的亮块
+    （反光、背景）一律不拼。
+      · 嵌套但尺寸差很多时，只有“外环密度低 + 内盘同心 + 内盘不是噪点”
+        才拼：这是近处印刷圈产生的中心白盘，必须并回外环；而背景大块
+        罩住靶纸时外块是实心的（密度高），不会被这条规则吞掉；
+      · 两块各自的长度 <= PAPER_MAX_LONG*1.3（"整幅背景大块"在这一步就被挡住）；
+      · 并起来之后：长边 <= PAPER_MAX_LONG、长宽比 <= PAPER_ASPECT_MAX、
+        面积 <= PAPER_MAX_AREA_RATIO × 画面（拼完还得像一张靶纸）。
+    输入/输出都是 [(x, y, w, h, px), ...]（已归一化到全图坐标），
+    输出按面积从大到小排。
+    """
+    items = []
+    for b in blobs:
+        x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
+        x, y = norm_bbox(x, y, w, h, roi)
+        items.append([x, y, w, h, px])
+    lim = PAPER_MAX_LONG * 1.3
+    amax = PAPER_MAX_AREA_RATIO * IMG_W * IMG_H
+    again = True
+    while again:
+        again = False
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a = items[i]
+                c = items[j]
+                la = a[2] if a[2] > a[3] else a[3]
+                lc = c[2] if c[2] > c[3] else c[3]
+                if (la > lim) or (lc > lim):
+                    continue
+                nested = ((a[0] >= c[0]) and (a[1] >= c[1]) and
+                          (a[0] + a[2] <= c[0] + c[2]) and
+                          (a[1] + a[3] <= c[1] + c[3])) or \
+                         ((c[0] >= a[0]) and (c[1] >= a[1]) and
+                          (c[0] + c[2] <= a[0] + a[2]) and
+                          (c[1] + c[3] <= a[1] + a[3]))
+                if not nested:
+                    continue
+                if nested and ((la < lc * 0.75) or (lc < la * 0.75)):
+                    if la >= lc:
+                        outer, inner, ol = a, c, la
+                    else:
+                        outer, inner, ol = c, a, lc
+                    oa = outer[2] * outer[3]
+                    ia = inner[2] * inner[3]
+                    ocx = outer[0] + outer[2] * 0.5
+                    ocy = outer[1] + outer[3] * 0.5
+                    icx = inner[0] + inner[2] * 0.5
+                    icy = inner[1] + inner[3] * 0.5
+                    od = outer[4] / float(oa) if oa > 0 else 0.0
+                    if (od > MERGE_RING_DENSITY_MAX) or \
+                            (abs(icx - ocx) > MERGE_CENTER_K * ol) or \
+                            (abs(icy - ocy) > MERGE_CENTER_K * ol) or \
+                            (ia < MERGE_INNER_AREA_MIN * oa):
+                        continue
+                ux = min(a[0], c[0])
+                uy = min(a[1], c[1])
+                uw = max(a[0] + a[2], c[0] + c[2]) - ux
+                uh = max(a[1] + a[3], c[1] + c[3]) - uy
+                ulong = uw if uw > uh else uh
+                ushort = uw if uw < uh else uh
+                if (ulong > PAPER_MAX_LONG) or \
+                        (ulong / max(1.0, ushort) > PAPER_ASPECT_MAX) or \
+                        (uw * uh > amax):
+                    continue
+                items[i] = [ux, uy, uw, uh, a[4] + c[4]]
+                del items[j]
+                again = True
+                break
+            if again:
+                break
+    items.sort(key=lambda it: -it[4])
+    return items
+
+
+def _scan_th(ref):
+    """按纸面自身亮度定的扫描门槛（纸面有阴影时也能摸到真边）。"""
+    t = ref * SCAN_TH_K
+    if t < SCAN_TH_LO:
+        t = SCAN_TH_LO
+    elif t > SCAN_TH_HI:
+        t = SCAN_TH_HI
+    return t
+
+
+def _requad(img, seed):
+    """快速复测：拿上次的四边形当种子只重扫四条边（省一次 find_blobs 的固定开销）。
+
+    seed/main 的测量元组: (px,x,y,w,h,long,aspect,den,ins,outs,corners,cx,cy)
+    返回同样格式的 (best, 亮块数=0, 诊断串)。
+    """
+    px = seed[0]
+    c = seed[10]
+    if c is None:
+        return None, 0, ""
+    xs = (c[0][0], c[1][0], c[2][0], c[3][0])
+    ys = (c[0][1], c[1][1], c[2][1], c[3][1])
+    bx = min(xs)
+    by = min(ys)
+    w = max(xs) - bx
+    h = max(ys) - by
+    if w < 8 or h < 8:
+        return None, 0, ""
+    ins, outs, frac = paper_contrast(img, bx, by, w, h)
+    if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
+            (frac < PAPER_DARK_FRAC_MIN):
+        return None, 0, "[复测:亮度] "
+    q = quad_from_blob(img, bx, by, w, h, _scan_th(ins))
+    if q is None:
+        return None, 0, "[复测:拟合] "
+    corners, ctr, long_side, short_side, qa = q
+    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+        return None, 0, "[复测:面积] "
+    if seed[5] >= QUAD_NEAR_LONG:
+        box_long = w if w > h else h
+        if (long_side < QUAD_NEAR_SIDE_K * box_long) or \
+                (qa < QUAD_NEAR_FILL_K * w * h) or \
+                _quad_inside_bad(corners, bx, by, w, h, QUAD_NEAR_EDGE_K):
+            return None, 0, "[复测:内圈] "
+    aspect = long_side / max(1.0, short_side)
+    if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG) or \
+            (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
+        return None, 0, "[复测:尺寸] "
+    return (px, bx, by, w, h, long_side, aspect, px / max(1.0, qa),
+            ins, outs, corners, ctr[0], ctr[1]), 0, ""
+
+
+def _probe(img, x, y, dx, dy, th):
+    """沿射线前后各 1px 取样，多数（>=2/3）亮才算“纸”。
+
+    印刷圆圈的细线在“圆的正左/正右”几乎与横向射线垂直，只做垂直方向
+    取最大跨不过去（扫描会停在第一圈圆环，四边形缩到圆环范围）；
+    沿射线取多数则与细线角度无关。
+    复测里每帧要上千次 _probe，3 个采样是速度和抗印刷圈之间的折中。
+    """
+    if dx:
+        offs = ((x - 1, y), (x, y), (x + 1, y))
+    else:
+        offs = ((x, y - 1), (x, y), (x, y + 1))
+    k = 0
+    for p in offs:
+        v = px_luma(img, p[0], p[1])
+        if v >= th:
+            k += 1
+    return k >= 2
+
+
+def _edge(img, xc, yc, dx, dy, limit, th):
+    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“纸”像素的距离；找不到给 -1。"""
+    if not _probe(img, xc, yc, dx, dy, th):
+        return -1
+    lo = 0
+    hi = limit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _probe(img, xc + dx * mid, yc + dy * mid, dx, dy, th):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _lsq(pts):
+    """最小二乘拟合 v = a*u + b（点数<2 返回 None）。"""
+    n = len(pts)
+    if n < 2:
+        return None
+    su = sv = suu = suv = 0.0
+    for u, v in pts:
+        su += u
+        sv += v
+        suu += u * u
+        suv += u * v
+    den = n * suu - su * su
+    if abs(den) < 1e-6:
+        return None
+    a = (n * suv - su * sv) / den
+    return a, (sv - a * su) / float(n)
+
+
+def _lsq_robust(pts):
+    """Theil-Sen：点对斜率取中位数。斜视时部分扫描点会打到相邻边，
+    普通最小二乘会被带偏几十像素，中位数法最多容忍一半坏点。"""
+    n = len(pts)
+    if n < 2:
+        return None
+    if n == 2:
+        (u1, v1), (u2, v2) = pts[0], pts[1]
+        if abs(u2 - u1) < 1e-6:
+            return None
+        a = (v2 - v1) / (u2 - u1)
+        return a, v1 - a * u1
+    sl = []
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            du = pts[j][0] - pts[i][0]
+            if (du > 1.5) or (du < -1.5):
+                sl.append((pts[j][1] - pts[i][1]) / du)
+    if len(sl) < 2:
+        return _lsq(pts)
+    sl.sort()
+    m = len(sl)
+    a = sl[m // 2] if (m % 2) else 0.5 * (sl[m // 2 - 1] + sl[m // 2])
+    bs = []
+    for u, v in pts:
+        bs.append(v - a * u)
+    bs.sort()
+    nb = len(bs)
+    b = bs[nb // 2] if (nb % 2) else 0.5 * (bs[nb // 2 - 1] + bs[nb // 2])
+    return a, b
+
+
+def _cross(e1, e2):
+    """竖边 x = a*y+b 与横边 y = a*x+b 的交点。"""
+    al, bl = e1
+    at, bt = e2
+    den = 1.0 - al * at
+    if abs(den) < 1e-3:
+        return None
+    x = (al * bt + bl) / den
+    return (x, at * x + bt)
+
+
+def _quad_angle_bad(corners, cos_lim=0.574):
+    """QGimbal-Vision 同款判据：矩形四个内角都应接近 90°（±35° -> |cos|≤0.574）。
+    返回 True = 不合格（弃用四边形、退回外接框）。斜视透视下角度会偏离直角，
+    容差放到 ±35°；超过这个限度的一定不是我们的靶纸（是乱接边的糊块）。"""
+    for i in range(4):
+        p0 = corners[i]
+        p1 = corners[(i + 1) % 4]
+        p2 = corners[(i + 2) % 4]
+        v1x = p0[0] - p1[0]
+        v1y = p0[1] - p1[1]
+        v2x = p2[0] - p1[0]
+        v2y = p2[1] - p1[1]
+        n1 = (v1x * v1x + v1y * v1y) ** 0.5
+        n2 = (v2x * v2x + v2y * v2y) ** 0.5
+        if (n1 < 1e-3) or (n2 < 1e-3):
+            return True
+        c = (v1x * v2x + v1y * v2y) / (n1 * n2)
+        if c > 1.0:
+            c = 1.0
+        elif c < -1.0:
+            c = -1.0
+        if (c > cos_lim) or (c < -cos_lim):
+            return True
+    return False
+
+
+def _quad_inside_bad(corners, x, y, w, h, k):
+    """近处四边形必须贴着亮块外框。
+
+    如果四个角都缩在框内一大截，说明边扫描停在印刷圈上，不是靶纸外沿。
+    返回 True = 不合格（弃用四边形，退回这个亮块的框中心）。
+    """
+    for p in corners:
+        dx = min(abs(p[0] - x), abs(p[0] - (x + w)))
+        dy = min(abs(p[1] - y), abs(p[1] - (y + h)))
+        if (dx > w * k) and (dy > h * k):
+            return True
+    return False
+
+
+def quad_from_blob(img, bx, by, bw, bh, th, pad=None):
+    """把亮块拟合成四边形（斜视=梯形）。
+    返回 (corners, center, long_side, short_side, quad_area) 或 None；
+    center = 两条对角线交点 = 透视意义下的靶心。"""
+    if pad is None:
+        pad = QUAD_LIM_PAD
+    icx = int(bx + bw / 2.0)
+    icy = int(by + bh / 2.0)
+    lim_l = icx - int(bx) + pad
+    lim_r = int(bx + bw) - icx + pad
+    lim_u = icy - int(by) + pad
+    lim_d = int(by + bh) - icy + pad
+    left = []
+    right = []
+    top = []
+    bot = []
+    for k in range(1, QUAD_SCAN_N + 1):
+        yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
+        dl = _edge(img, icx, yy, -1, 0, lim_l, th)
+        dr = _edge(img, icx, yy, 1, 0, lim_r, th)
+        if dl >= 0:
+            left.append((yy, icx - dl))
+        if dr >= 0:
+            right.append((yy, icx + dr))
+        xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
+        du = _edge(img, xx, icy, 0, -1, lim_u, th)
+        dd = _edge(img, xx, icy, 0, 1, lim_d, th)
+        if du >= 0:
+            top.append((xx, icy - du))
+        if dd >= 0:
+            bot.append((xx, icy + dd))
+    if (len(left) < 3) or (len(right) < 3) or \
+            (len(top) < 3) or (len(bot) < 3):
+        return None
+    e_l = _lsq_robust(left)
+    e_r = _lsq_robust(right)
+    e_t = _lsq_robust(top)
+    e_b = _lsq_robust(bot)
+    if (e_l is None) or (e_r is None) or (e_t is None) or (e_b is None):
+        return None
+    tl = _cross(e_l, e_t)
+    tr = _cross(e_r, e_t)
+    br = _cross(e_r, e_b)
+    bl = _cross(e_l, e_b)
+    if (tl is None) or (tr is None) or (br is None) or (bl is None):
+        return None
+    c = [tl, tr, br, bl]
+    bad = []
+    for i in range(4):
+        p = c[i]
+        if (p[0] < bx - 5) or (p[0] > bx + bw + 5) or \
+                (p[1] < by - 5) or (p[1] > by + bh + 5):
+            bad.append(i)
+    if len(bad) == 1:
+        i = bad[0]
+        a = c[(i - 1) % 4]
+        b = c[(i + 1) % 4]
+        d = c[(i + 2) % 4]
+        c[i] = (a[0] + b[0] - d[0], a[1] + b[1] - d[1])
+    elif len(bad) > 1:
+        return None
+    for p in c:
+        if (p[0] < 1) or (p[0] > IMG_W - 2) or \
+                (p[1] < 1) or (p[1] > IMG_H - 2):
+            return None
+    c = (c[0], c[1], c[2], c[3])
+    qa = 0.0
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        qa += x1 * y2 - x2 * y1
+    qa = abs(qa) * 0.5
+    if qa < 1.0:
+        return None
+    d = []
+    for i in range(4):
+        x1, y1 = c[i]
+        x2, y2 = c[(i + 1) % 4]
+        d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+    dl1 = (d[0] + d[2]) / 2.0
+    dl2 = (d[1] + d[3]) / 2.0
+    if dl1 >= dl2:
+        long_side, short_side = dl1, dl2
+    else:
+        long_side, short_side = dl2, dl1
+    d1x, d1y = br[0] - tl[0], br[1] - tl[1]
+    d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
+    den = d1x * d2y - d1y * d2x
+    if abs(den) < 1e-6:
+        ctr = ((tl[0] + br[0]) / 2.0, (tl[1] + br[1]) / 2.0)
+    else:
+        t = ((tr[0] - tl[0]) * d2y - (tr[1] - tl[1]) * d2x) / den
+        ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
+    if (ctr[0] < 0) or (ctr[0] >= IMG_W) or \
+            (ctr[1] < 0) or (ctr[1] >= IMG_H):
+        return None
+    return (c, ctr, long_side, max(1.0, short_side), qa)
+
+
 class PaperDetector(object):
-    """靶纸检测、时间一致性过滤和平滑。"""
+    """A4 靶纸检测（C 加速 find_blobs）+ 三道闸门 + 连续确认 + 平滑。
+
+    返回 dict: center/box/area/aspect/density/long_side/contrast/n/state
+    state: 锁定 / 确认x/3 / 搜索
+    详细判据与依据见 tools/vision_check.py 顶部注释。
+    """
 
     def __init__(self):
         self.u = IMG_W / 2.0
@@ -1273,105 +834,127 @@ class PaperDetector(object):
         self.lost = 0
         self.meas = None
         self.corners = None
+        self.pend = None
         self.frame = 0
         self.last_n = 0
         self.last_dbg = ""
+        self.cands = []
+        self.did_full = False
         self.state = "搜索"
         self.err = 0
         self.err_msg = ""
-        self.last_res = None
-        # 平滑中心每帧位移。
-        self.mot_px = 0.0
-        # 原始候选位移，被拒帧也更新，避免快速运动时护栏锁死。
-        self.raw_u = None
-        self.raw_v = None
-        self.cand_mot = 0.0
-        self.rej_n = 0             # 连续拒收帧数
-        self.last_long = 0.0       # 上一帧采纳的外框长边
-        self.pend_long = 0.0
-        self.pend_n = 0
+        self.last_long = 0.0
+
+    def roi(self):
+        L = max(self.w, self.h)
+        if L < 200.0:
+            k = (200.0 - L) / 140.0
+            if k > 1.0:
+                k = 1.0
+            elif k < 0.0:
+                k = 0.0
+            pad = TRACK_PAD + (TRACK_PAD_FAR - TRACK_PAD) * k
+        else:
+            pad = TRACK_PAD
+        r = int(L * TRACK_K) + int(pad)
+        x = int(self.u - r)
+        y = int(self.v - r)
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        w = 2 * r
+        h = 2 * r
+        if x + w > IMG_W:
+            w = IMG_W - x
+        if y + h > IMG_H:
+            h = IMG_H - y
+        return (x, y, w, h)
 
     def fresh(self):
-        return self.have and (self.lost == 0)
+        return self.have and (self.lost < HOLD_FRAMES)
+
+    def _size_ok(self, long_side, density=0.0, contrast=0.0):
+        if not self.have:
+            return True
+        old = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
+        lo = SIZE_GATE_LO
+        hi = SIZE_GATE_HI
+        if self.lost > 0:
+            k = 1.0 - 0.02 * self.lost
+            if k < 0.6:
+                k = 0.6
+            lo = SIZE_GATE_LO * k
+            hi = SIZE_GATE_HI / k
+        if (lo * old) <= long_side <= (hi * old):
+            return True
+        return (density >= SIZE_RESCUE_DENSITY) and \
+               (contrast >= SIZE_RESCUE_CONTRAST) and \
+               (0.35 * old <= long_side <= SIZE_RESCUE_MAX * old)
+
+    def _confirm(self, cand):
+        """全图候选的连续确认。返回 True = 确认为目标。"""
+        if cand is None:
+            if self.pend is not None:
+                self.pend[4] += 1
+                if self.pend[4] > PENDING_MISS:
+                    self.pend = None
+            return False
+        cu, cv, lo = cand[11], cand[12], cand[5]
+        if self.have and (self.lost < 30):
+            old = max(self.w, self.h)
+            if (lo < 0.30 * old) or (lo > 3.0 * old):
+                self.pend = None
+                return False
+        if self.pend is None:
+            self.pend = [cu, cv, lo, 1, 0]
+            if CONFIRM_N <= 1:
+                self.pend = None
+                return True
+            return False
+        if (abs(cu - self.pend[0]) <= CONFIRM_DXY) and \
+                (abs(cv - self.pend[1]) <= CONFIRM_DXY) and \
+                (abs(lo - self.pend[2]) <= CONFIRM_DSIZE * self.pend[2]):
+            n = self.pend[3] + 1
+            self.pend[0] += (cu - self.pend[0]) / float(n)
+            self.pend[1] += (cv - self.pend[1]) / float(n)
+            self.pend[2] += (lo - self.pend[2]) / float(n)
+            self.pend[3] = n
+            self.pend[4] = 0
+            if n >= CONFIRM_N:
+                self.pend = None
+                return True
+        else:
+            self.pend = [cu, cv, lo, 1, 0]
+        return False
 
     def _accept(self, cand):
-        """过滤中心跳变和尺度突变；连续拒收后允许重新锁定。"""
-        w, h = cand[3], cand[4]
+        x, y, w, h = cand[1], cand[2], cand[3], cand[4]
         c = cand[10]
-        cu, cv = cand[11], cand[12]      # 四边形对角线交点 = 透视中心
-        if self.raw_u is not None:
-            _d = abs(cu - self.raw_u)
-            _d2 = abs(cv - self.raw_v)
-            if _d2 > _d:
-                _d = _d2
-            self.cand_mot = (0.6 * self.cand_mot + 0.4 * _d) \
-                if self.cand_mot > 0 else _d
-        self.raw_u, self.raw_v = cu, cv
+        cu, cv = cand[11], cand[12]
+        old_l = self.last_long if self.last_long > 1.0 \
+            else max(self.w, self.h)
         if self.have and (self.lost < LOST_FULL):
-            _mv = self.mot_px if self.mot_px > self.cand_mot else self.cand_mot
-            if _mv > 120.0:
-                _mv = 120.0
-            _jl = JUMP_REJECT_BASE + int(2.0 * _mv)
-            if self.rej_n >= 2:
-                _jl *= 2
-            if self.rej_n >= 5:
-                _jl *= 4
-            _bad = None
-            if abs(cu - self.u) > _jl:
-                _bad = "跳"
-            elif abs(cv - self.v) > _jl:
-                _bad = "跳"
-            else:
-                old_l = self.last_long if self.last_long > 1.0 \
-                    else max(self.w, self.h)
-                if old_l > 1.0:
-                    _dl = abs(cand[5] - old_l) / old_l
-                    # 静止时尺度容差 8%，快速运动时放宽到 20%。
-                    _scale_tol = 0.20 if _mv > 10.0 else 0.08
-                    if _dl > _scale_tol:
-                        # 连续 3 帧接近新尺度才确认换框。
-                        if (self.pend_long > 1.0) and \
-                                (abs(cand[5] - self.pend_long) <=
-                                 0.05 * self.pend_long):
-                            self.pend_n += 1
-                        else:
-                            self.pend_long = cand[5]
-                            self.pend_n = 1
-                        if self.pend_n >= 3:
-                            self.pend_long = 0.0
-                            self.pend_n = 0
-                            old_l = cand[5]      # 确认切换 -> 放行尺寸闸门
-                        else:
-                            _bad = "换"
-                    else:
-                        self.pend_long = 0.0
-                        self.pend_n = 0
-                    _lo_l = 0.65 if _mv > 10.0 else 0.85
-                    _hi_l = 1.45 if _mv > 10.0 else 1.18
-                    if (_bad is None) and \
-                            ((cand[5] < _lo_l * old_l) or
-                             (cand[5] > _hi_l * old_l)):
-                        _bad = "尺"
-            if _bad is not None:
-                self.rej_n += 1
-                _ACC_DBG[0] = "%s%d" % (_bad, self.rej_n)
-                if self.rej_n < ACCEPT_RELOCK_N:
+            _jump = max(JUMP_REJECT_PX * 0.55, old_l * 0.45) + 20.0
+            _jump += self.lost * 8.0
+            if abs(cu - self.u) > _jump:
+                return False
+            if abs(cv - self.v) > _jump:
+                return False
+            if old_l > 1.0:
+                if (cand[5] < 0.40 * old_l) or (cand[5] > 2.50 * old_l):
                     return False
-                # 连续拒收后清掉旧参考，重新锁定。
-                self.rej_n = 0
-                self.have = False
-                self.lost = LOST_FULL
-            else:
-                self.rej_n = 0
-                _ACC_DBG[0] = ""
         if (not self.have) or (self.lost >= LOST_FULL):
-            # 首次锁定或丢失后重新锁定，直接吸附到当前测量。
             self.u, self.v, self.w, self.h = cu, cv, w, h
             self.have = True
             self.corners = c
         else:
-            # 远处目标较小，使用更强的平滑。
-            k = SMOOTH_FAR if (0.0 < cand[5] < FAR_LONG_PX) else SMOOTH
+            if 0.0 < cand[5] < FAR_LONG_PX:
+                k = SMOOTH_FAR
+            elif cand[5] >= QUAD_NEAR_LONG:
+                k = SMOOTH_NEAR
+            else:
+                k = SMOOTH
             if abs(cu - self.u) > DEADBAND_PX:
                 self.u += k * (cu - self.u)
             if abs(cv - self.v) > DEADBAND_PX:
@@ -1380,7 +963,6 @@ class PaperDetector(object):
                 self.w += k * (w - self.w)
             if abs(h - self.h) > 2 * DEADBAND_PX:
                 self.h += k * (h - self.h)
-            # 四角同样做时间平滑。
             if c is not None:
                 if self.corners is None:
                     self.corners = c
@@ -1392,74 +974,895 @@ class PaperDetector(object):
                         sc.append((ax + k * (c[i][0] - ax),
                                    ay + k * (c[i][1] - ay)))
                     self.corners = tuple(sc)
+            else:
+                self.corners = None
         self.meas = cand
         self.lost = 0
         self.state = "锁定"
         self.last_long = cand[5]
         return True
 
-    def detect(self, img, mask_out=None):
-        """返回 dict（center/box/...）或 None（这一帧没有可用测量）。"""
+    def detect(self, img):
         self.frame += 1
-        # 非检测帧沿用上一帧结果。
-        if self.have and (self.last_res is not None) and \
-                ((self.frame % CV2_EVERY) != 0):
-            self.last_n = 0
-            return self.last_res
+        th_ad = scene_th(img, self.frame)
+        if (PAPER_TH_NEAR_FIXED > 0) and self.have and \
+                (self.lost < LOST_FULL) and \
+                (self.last_long >= QUAD_NEAR_LONG):
+            th_ad = PAPER_TH_NEAR_FIXED
+            _scene_cache[1] = float(th_ad)
+            _scene_cache[2] = 4.0
+        if (self.frame % 8) == 0:
+            th_alt = th_ad + 8
+            if th_alt > 84:
+                th_alt = 84
+        else:
+            th_alt = th_ad - 6
+            if th_alt < 38:
+                th_alt = 38
         cand = None
-        # 软件曝光在灰度化之前完成。
-        gimg = _frame_gray(img)
-        if gimg is None:
-            gimg = img
-        _use_th = GY_TH_FAR if (self.have and
-                                0.0 < self.last_long < FAR_LONG_PX) else GY_TH
+        n = 0
+        dbg = ""
+        self.did_full = False
         try:
-            # hint 用于同尺度候选优先，不改变检测区域。
-            cand = _cv2_find(gimg, (self.last_long, self.u, self.v)
-                             if self.have else None, _use_th, mask_out)
-            if (cand is None) and (_use_th != GY_TH_FAR):
-                cand = _cv2_find(gimg, (self.last_long, self.u, self.v)
-                                 if self.have else None, GY_TH_FAR, mask_out)
-                if cand is not None:
-                    _GY_DBG[0] = "低"
+            if self.have and self.lost < LOST_FULL:
+                if ((self.frame % SEED_EVERY) == 0) or (self.meas is None):
+                    cand, n, dbg = self._find(img, self.roi(), th_ad)
+                else:
+                    cand, n, dbg = self._find(img, self.roi(), th_ad,
+                                              self.meas)
+                    if cand is None:
+                        cand, n, dbg = self._find(img, self.roi(), th_ad)
+                if (cand is not None) and \
+                        (not self._size_ok(cand[5], cand[7],
+                                           cand[8] - cand[9])):
+                    dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
+                    cand = None
+                if (self.frame % RE_CHECK_EVERY) == 0:
+                    cb, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                            th_ad, prefer=False)
+                    self.did_full = True
+                    n += n2
+                    if cb is not None:
+                        old_s = 0.0
+                        if self.meas is not None:
+                            old_s = self.meas[0] * (0.5 + min(max(
+                                self.meas[8] - self.meas[9], 0), 80) / 80.0)
+                        new_s = cb[0] * (0.5 + min(max(
+                            cb[8] - cb[9], 0), 80) / 80.0)
+                        cur_l = self.last_long if self.last_long > 1.0 \
+                            else max(self.w, self.h)
+                        cbn = (abs(cb[11] - SPOT_UV[0]) +
+                               abs(cb[12] - SPOT_UV[1])) <= SPOT_PREF_PX
+                        cun = (abs(self.u - SPOT_UV[0]) +
+                               abs(self.v - SPOT_UV[1])) <= SPOT_PREF_PX
+                        old_con = 0.0
+                        if self.meas is not None:
+                            old_con = max(self.meas[8] - self.meas[9], 0.0)
+                        new_con = max(cb[8] - cb[9], 0.0)
+                        if ((cbn and not cun) or (new_s > 1.6 * old_s) or
+                                (new_con >= 60 and new_con >= 1.5 * old_con)) \
+                                and \
+                                (abs(cb[11] - self.u) +
+                                 abs(cb[12] - self.v) > 40) and \
+                                (0.35 * cur_l <= cb[5] <= 3.0 * cur_l):
+                            self.u, self.v = cb[11], cb[12]
+                            self.w, self.h = cb[3], cb[4]
+                            self.corners = cb[10]
+                            self.meas = cb
+                            self.last_long = cb[5]
+                            self.lost = 0
+                            self.state = "锁定"
+                            self.last_n = n
+                            self.last_dbg = ("[全图复查换目标 %.0f->%.0f] "
+                                             % (old_s, new_s)) + d2
+                            return {"center": (self.u, self.v),
+                                    "box": (cb[1], cb[2], cb[3], cb[4]),
+                                    "area": cb[0], "aspect": cb[6],
+                                    "density": cb[7], "long_side": cb[5],
+                                    "contrast": cb[8] - cb[9], "n": n,
+                                    "state": self.state,
+                                    "corners": self.corners}
+            else:
+                self.did_full = True
+                c2, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H), th_ad)
+                if c2 is None and ((self.frame % 4) == 0):
+                    c3, n3, d3 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                            th_alt)
+                    c2, n2, d2 = c3, n2 + n3, d2 + d3
+                n += n2
+                dbg = d2
+                if self._confirm(c2):
+                    cand = c2
         except Exception as e:
             self.err += 1
             if self.err_msg != str(e):
                 self.err_msg = str(e)
-                # 异常写入日志文件。
-                log("[ERROR] 靶纸检测异常: %s" % e)
-            cand = None
+                print("靶纸检测异常: %s" % e)
+            return None
+        self.last_n = n
+        self.last_dbg = dbg
         if cand is not None:
             if not self._accept(cand):
                 cand = None
-        self.last_n = 1 if (cand is not None) else 0
         if cand is None:
             self.lost += 1
-            if self.lost >= LOST_FULL:
-                # 丢失后清掉旧尺度和旧中心，允许重新吸附。
-                self.have = False
-                self.last_long = 0.0
-                self.meas = None
-            self.state = "锁定" if (self.have and self.lost < LOST_FULL) \
-                else "搜索"
-            # 同时记录检测拒收和输出护栏拒收原因。
-            self.last_dbg = "[丢 %d 帧 %s%s]" % (
-                self.lost, _GY_DBG[0],
-                (" 护栏拒:%s" % _ACC_DBG[0]) if _ACC_DBG[0] else "")
+            if self.pend is not None:
+                self.state = "确认%d/%d" % (self.pend[3], CONFIRM_N)
+            elif (not self.have) or (self.lost >= LOST_FULL):
+                self.state = "搜索"
+            else:
+                self.state = "搜索"
+        if cand is None:
             return None
-        _du = self.u - self.meas[11]
-        _dv = self.v - self.meas[12]
-        _dd = _du * _du + _dv * _dv
-        self.mot_px = _dd ** 0.5 if _dd > 0.0 else 0.0
-        self.last_dbg = "[靶 ✓ %s 长边%.0f 形%.2f 对比%.0f]" % (
-            _GY_DBG[0], cand[5], cand[7], cand[8] - cand[9])
-        self.last_res = {"center": (self.u, self.v),
-                         "box": (cand[1], cand[2], cand[3], cand[4]),
-                         "area": cand[0], "aspect": cand[6],
-                         "density": cand[7], "long_side": cand[5],
-                         "contrast": cand[8] - cand[9], "n": self.last_n,
-                         "state": self.state, "corners": self.corners}
-        return self.last_res
+        px, x, y, w, h, long_side, aspect, density, ins, outs = self.meas[:10]
+        return {"center": (self.u, self.v), "box": (x, y, w, h),
+                "area": px, "aspect": aspect, "density": density,
+                "long_side": long_side, "contrast": ins - outs, "n": n,
+                "state": self.state, "corners": self.corners}
+
+    def _find(self, img, roi, th, seed=None, prefer=None):
+        """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。
+
+        seed=上次测量元组时走快速复测（只重扫四边形，不找亮块）。"""
+        if seed is not None:
+            return _requad(img, seed)
+        if prefer is None:
+            prefer = self.have and (self.lost == 0)
+        best = None
+        n = 0
+        dbg = ""
+        self.cands = []
+        blobs = img.find_blobs(
+            [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
+              -PAPER_B_MAX, PAPER_B_MAX)],
+            roi=roi, merge=False,
+            area_threshold=PAPER_MIN_AREA,
+            pixels_threshold=PAPER_MIN_AREA)
+        if not blobs:
+            return None, 0, ""
+        blobs = merge_fragments(blobs, roi)
+        if not blobs:
+            return None, 0, ""
+        for b in blobs:
+            n += 1
+            x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
+            x, y = norm_bbox(x, y, w, h, roi)
+            if w < 8 or h < 8:
+                continue
+            box_long = w if w > h else h
+            ins, outs, frac = paper_contrast(img, x, y, w, h)
+            why = ""
+            corners = None
+            qa = 0.0
+            near_sides = 4
+            ctr = (x + w / 2.0, y + h / 2.0)
+            if box_long < PAPER_MIN_LONG * 0.8 or \
+                    box_long > PAPER_MAX_LONG * 1.3:
+                why = "框长"
+                long_side = box_long
+                short_side = w if w < h else h
+                density = px / float(w * h)
+            else:
+                q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
+                if q is not None:
+                    corners, ctr, long_side, short_side, qa = q
+                    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+                        corners = None
+                    elif (box_long >= QUAD_NEAR_LONG) and \
+                            ((long_side < QUAD_NEAR_SIDE_K * box_long) or
+                             (qa < QUAD_NEAR_FILL_K * w * h) or
+                             _quad_inside_bad(corners, x, y, w, h,
+                                              QUAD_NEAR_EDGE_K)):
+                        corners = None
+                    elif long_side < 0.70 * box_long:
+                        corners = None
+                    elif _quad_angle_bad(
+                            corners,
+                            QUAD_NEAR_COS_LIM
+                            if box_long >= QUAD_NEAR_LONG else 0.574):
+                        corners = None
+                    else:
+                        lim = QUAD_LIM_PAD + 8
+                        for p in corners:
+                            if (p[0] < x - lim) or (p[0] > x + w + lim) or \
+                                    (p[1] < y - lim) or (p[1] > y + h + lim):
+                                corners = None
+                                break
+                if corners is None:
+                    long_side = box_long
+                    short_side = w if w < h else h
+                    density = px / float(w * h)
+                    dens_min = PAPER_DENSITY_MIN
+                    if (ins - outs) >= PAPER_CONTRAST_STRONG:
+                        dens_min = PAPER_DENSITY_MIN_STRONG
+                    if (box_long >= QUAD_NEAR_LONG) and \
+                            (dens_min < PAPER_DENSITY_NEAR_MIN):
+                        dens_min = PAPER_DENSITY_NEAR_MIN
+                    ctr = (x + w / 2.0, y + h / 2.0)
+                    if box_long >= QUAD_NEAR_LONG:
+                        near_sides = paper_frame_sides(
+                            img, x, y, w, h, ins)
+                else:
+                    if box_long >= QUAD_NEAR_LONG:
+                        qx = qx2 = corners[0][0]
+                        qy = qy2 = corners[0][1]
+                        for p in corners:
+                            if p[0] < qx:
+                                qx = p[0]
+                            elif p[0] > qx2:
+                                qx2 = p[0]
+                            if p[1] < qy:
+                                qy = p[1]
+                            elif p[1] > qy2:
+                                qy2 = p[1]
+                        qins, qouts, qfrac = paper_contrast(
+                            img, qx, qy, qx2 - qx, qy2 - qy)
+                        if qins >= 0:
+                            ins, outs, frac = qins, qouts, qfrac
+                        near_sides = paper_frame_sides(
+                            img, qx, qy, qx2 - qx, qy2 - qy, ins)
+                    density = px / max(1.0, qa)
+                    dens_min = PAPER_DENSITY_QUAD_MIN
+                    if (box_long >= QUAD_NEAR_LONG) and \
+                            (dens_min < PAPER_DENSITY_NEAR_MIN):
+                        dens_min = PAPER_DENSITY_NEAR_MIN
+                aspect = long_side / max(1.0, short_side)
+                if px < PAPER_MIN_AREA:
+                    why = "面积"
+                elif px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
+                    why = "太大"
+                elif long_side < PAPER_MIN_LONG or \
+                        long_side > PAPER_MAX_LONG:
+                    why = "长边"
+                elif aspect < PAPER_ASPECT_MIN or \
+                        aspect > PAPER_ASPECT_MAX:
+                    why = "比例"
+                elif (density < dens_min) or \
+                        (density > (QUAD_NEAR_DENSITY_HI
+                                    if (corners is not None and
+                                        box_long >= QUAD_NEAR_LONG)
+                                    else 1.08)):
+                    why = "密度"
+                elif (box_long >= QUAD_NEAR_LONG) and (near_sides < 3):
+                    why = "黑框"
+                elif ((x <= 1) or (y <= 1) or
+                      ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1)) and \
+                        (corners is None) and (box_long < 90):
+                    why = "贴边"
+                elif ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
+                    why = "对比"
+                elif frac < PAPER_DARK_FRAC_MIN:
+                    why = "暗边"
+            if n <= 6:
+                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
+                    px, box_long, ins, outs, frac * 100.0, density,
+                    ("四" if corners is not None else "框"),
+                    (" ✗" + why) if why else " ✓")
+            if len(self.cands) < 8:
+                self.cands.append((x, y, w, h, 0 if why else 1))
+            if why:
+                continue
+            score = px * (0.5 + min(ins - outs, 80) / 80.0)
+            score *= 0.5 + 0.5 * (density if density < 1.0 else 1.0)
+            if prefer and self.have and self.last_long > 1.0:
+                d = abs(ctr[0] - self.u) + abs(ctr[1] - self.v)
+                ds = abs(long_side - self.last_long) / self.last_long
+                score *= 1.0 / (1.0 + d / 80.0 + ds * 2.0)
+            dc = abs(ctr[0] - SPOT_UV[0]) + abs(ctr[1] - SPOT_UV[1])
+            key = (1 if dc <= SPOT_PREF_PX else 0, score)
+            if best is None or key > best[0]:
+                best = (key, (px, x, y, w, h, long_side, aspect, density,
+                              ins, outs, corners, ctr[0], ctr[1]))
+        if best is None:
+            return None, n, dbg
+        bx, by, bw, bh = best[1][1], best[1][2], best[1][3], best[1][4]
+        keep = []
+        for cb in self.cands:
+            ccx = cb[0] + cb[2] * 0.5
+            ccy = cb[1] + cb[3] * 0.5
+            is_best = (cb[0] == bx and cb[1] == by and
+                       cb[2] == bw and cb[3] == bh)
+            if (not is_best) and (bx <= ccx <= bx + bw) and \
+                    (by <= ccy <= by + bh):
+                continue
+            keep.append((cb[0], cb[1], cb[2], cb[3],
+                         1 if is_best else 0))
+        self.cands = keep
+        return best[1], n, dbg
+
+
+class ClosePaperDetector(PaperDetector):
+    """全帧二值闭运算检测器。
+
+    二值化/闭运算负责生成白纸 mask；白块在 mask 上扫描四边，
+    原始 RGB888 图像只做内亮外暗和黑框校验。
+    """
+
+    def __init__(self):
+        PaperDetector.__init__(self)
+        self.close_hit = False
+        self.close_dbg = ""
+        self.err_printed = False
+        self.close_ms = 0
+        self.quad_ms = 0
+        self.close_view = None
+        self.close_data = None
+        self.close_roi = None
+        self.close_miss_n = 0
+        self.rgb_buf = None
+        self.rgb_shape = None
+        self.conv_logged = False
+        self.cand_why = ""
+        self.close_scale = 1
+        self.mask_logged = False
+        self.scan_dbg = ""
+        self.debug_quad = None
+        self.debug_score = 0.0
+
+    def _close_roi(self):
+        bw = bh = 0
+        if self.meas is not None:
+            bw = int(self.meas[3])
+            bh = int(self.meas[4])
+        if (bw < 20) or (bh < 20):
+            bw = bh = int(self.last_long)
+        rw = int(bw * CLOSE_ROI_K) + CLOSE_ROI_PAD
+        rh = int(bh * CLOSE_ROI_K) + CLOSE_ROI_PAD
+        x0 = int(self.u - rw)
+        y0 = int(self.v - rh)
+        if x0 < 0:
+            x0 = 0
+        if y0 < 0:
+            y0 = 0
+        x1 = int(self.u + rw)
+        y1 = int(self.v + rh)
+        if x1 > IMG_W:
+            x1 = IMG_W
+        if y1 > IMG_H:
+            y1 = IMG_H
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    @staticmethod
+    def _order4(q):
+        """把四个角按左上 -> 右上 -> 右下 -> 左下排好。"""
+        cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) * 0.25
+        cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) * 0.25
+        s = sorted(q, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+        i0 = min(range(4), key=lambda i: s[i][0] + s[i][1])
+        return tuple(s[i0:] + s[:i0])
+
+    @staticmethod
+    def _mask_white(view, x, y):
+        """灰度闭运算图取点：只走单通道 get_pixel，不用 RGB 的 _PIXBUF。"""
+        try:
+            p = view.get_pixel(int(x), int(y))
+        except Exception:
+            return False
+        if p is None:
+            return False
+        try:
+            v = int(p)
+            return (v >= 128) or (v == 1)
+        except Exception:
+            pass
+        try:
+            v = int(p.item())
+            return (v >= 128) or (v == 1)
+        except Exception:
+            pass
+        try:
+            if len(p) == 1:
+                v = int(p[0])
+            else:
+                v = (int(p[0]) * 77 + int(p[1]) * 150 +
+                     int(p[2]) * 29) >> 8
+            return (v >= 128) or (v == 1)
+        except Exception:
+            return False
+
+    def _quad_metrics(self, q, strict=True):
+        """返回 (四角, 对角线交点, 长边, 短边, 四边形面积)。"""
+        c = self._order4(q)
+        if strict:
+            for p in c:
+                if (p[0] < 1) or (p[0] > IMG_W - 2) or \
+                        (p[1] < 1) or (p[1] > IMG_H - 2):
+                    self.scan_dbg = "metrics:角点越界 %r" % (c,)
+                    return None
+        qa = 0.0
+        for i in range(4):
+            x1, y1 = c[i]
+            x2, y2 = c[(i + 1) % 4]
+            qa += x1 * y2 - x2 * y1
+        qa = abs(qa) * 0.5
+        if strict and (qa < 1.0):
+            self.scan_dbg = "metrics:面积"
+            return None
+        d = []
+        for i in range(4):
+            x1, y1 = c[i]
+            x2, y2 = c[(i + 1) % 4]
+            d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+        dl1 = (d[0] + d[2]) * 0.5
+        dl2 = (d[1] + d[3]) * 0.5
+        if dl1 >= dl2:
+            long_side, short_side = dl1, dl2
+        else:
+            long_side, short_side = dl2, dl1
+        tl, tr, br, bl = c
+        d1x, d1y = br[0] - tl[0], br[1] - tl[1]
+        d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
+        den = d1x * d2y - d1y * d2x
+        if abs(den) < 1e-6:
+            ctr = ((tl[0] + br[0]) * 0.5, (tl[1] + br[1]) * 0.5)
+        else:
+            t = ((tr[0] - tl[0]) * d2y -
+                 (tr[1] - tl[1]) * d2x) / den
+            ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
+        return c, ctr, long_side, max(1.0, short_side), qa
+
+    def _make_cand(self, img, bx, by, bw, bh, corners, ctr,
+                   long_side, short_side, qa, ins=None, outs=None, frac=None,
+                   sides_min=3):
+        """把一套四角过完整的近处闸门，变成 _find 的候选元组。"""
+        box_long = bw if bw > bh else bh
+        aspect = long_side / max(1.0, short_side)
+        if box_long >= QUAD_NEAR_LONG:
+            if (long_side < QUAD_NEAR_SIDE_K * box_long) or \
+                    (qa < QUAD_NEAR_FILL_K * bw * bh) or \
+                    _quad_inside_bad(corners, bx, by, bw, bh,
+                                     QUAD_NEAR_EDGE_K):
+                self.cand_why = "近边"
+                return None
+            cos_lim = CLOSE_FRAME_COS if FULL_FRAME_CLOSE \
+                else QUAD_NEAR_COS_LIM
+        else:
+            cos_lim = CLOSE_FRAME_COS if FULL_FRAME_CLOSE else 0.574
+        if _quad_angle_bad(corners, cos_lim):
+            self.cand_why = "角"
+            return None
+        if (long_side < PAPER_MIN_LONG) or \
+                (long_side > PAPER_MAX_LONG) or \
+                (aspect < PAPER_ASPECT_MIN) or \
+                (aspect > PAPER_ASPECT_MAX):
+            self.cand_why = "尺寸"
+            return None
+        if ins is None:
+            ins, outs, frac = paper_contrast(img, bx, by, bw, bh)
+        if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
+                (frac < PAPER_DARK_FRAC_MIN):
+            self.cand_why = "对比"
+            return None
+        sides = paper_frame_sides(img, bx, by, bw, bh, ins)
+        if sides < sides_min:
+            self.cand_why = "黑%d" % sides
+            return None
+        self.cand_why = ""
+        return (int(qa), bx, by, bw, bh, long_side, aspect,
+                1.0, ins, outs, corners, ctr[0], ctr[1])
+
+    def _scan_quad(self, view, bx, by, bw, bh, ox, oy):
+        """在闭运算白块 bbox 内扫四条外边，再拟合四边形。
+
+        bx/by/bw/bh 是闭运算 ROI 内的局部 bbox；ox/oy 是 ROI 在全图的偏移。
+        从左/右/上/下边界向里扫最外白像素，所以中心那个小黑点不会
+        像原来的“从中心出发”扫描那样把边扫描带偏。
+        """
+        self.scan_dbg = ""
+        self.debug_quad = None
+        left = []
+        right = []
+        top = []
+        bot = []
+        for k in range(1, QUAD_SCAN_N + 1):
+            yy = by + int(bh * k / float(QUAD_SCAN_N + 1))
+            xl = -1
+            xr = -1
+            for x in range(bx, bx + bw):
+                if self._mask_white(view, x, yy):
+                    xl = x
+                    break
+            for x in range(bx + bw - 1, bx - 1, -1):
+                if self._mask_white(view, x, yy):
+                    xr = x
+                    break
+            if (xl >= 0) and (xr > xl):
+                left.append((yy + oy, xl + ox))
+                right.append((yy + oy, xr + ox))
+            xx = bx + int(bw * k / float(QUAD_SCAN_N + 1))
+            yt = -1
+            yb = -1
+            for y in range(by, by + bh):
+                if self._mask_white(view, xx, y):
+                    yt = y
+                    break
+            for y in range(by + bh - 1, by - 1, -1):
+                if self._mask_white(view, xx, y):
+                    yb = y
+                    break
+            if (yt >= 0) and (yb > yt):
+                top.append((xx + ox, yt + oy))
+                bot.append((xx + ox, yb + oy))
+        if (len(left) < 3) or (len(right) < 3) or \
+                (len(top) < 3) or (len(bot) < 3):
+            self.scan_dbg = ("L%dR%dT%dB%d bbox=%d,%d,%dx%d"
+                             % (len(left), len(right), len(top), len(bot),
+                                bx, by, bw, bh))
+            return None
+        e_l = _lsq_robust(left)
+        e_r = _lsq_robust(right)
+        e_t = _lsq_robust(top)
+        e_b = _lsq_robust(bot)
+        if (e_l is None) or (e_r is None) or \
+                (e_t is None) or (e_b is None):
+            self.scan_dbg = "line"
+            return None
+        tl = _cross(e_l, e_t)
+        tr = _cross(e_r, e_t)
+        br = _cross(e_r, e_b)
+        bl = _cross(e_l, e_b)
+        if (tl is None) or (tr is None) or (br is None) or (bl is None):
+            self.scan_dbg = "cross"
+            return None
+        self.debug_quad = (tl, tr, br, bl)
+        m = self._quad_metrics((tl, tr, br, bl), strict=False)
+        if (m is None) and (not self.scan_dbg):
+            self.scan_dbg = "metrics"
+        return m
+
+    def _full_candidate(self, img):
+        """二值 mask 上按 10.13 的 _find 逻辑检测靶纸。"""
+        self.close_view = None
+        self.close_data = None
+        self.close_roi = None
+        self.close_ms = 0
+        self.quad_ms = 0
+        arr = None
+        try:
+            t0 = time.ticks_ms()
+            binary_np = None
+            try:
+                arr = img.to_numpy_ref()
+                if GRAY_DIRECT:
+                    binary_np = _cv_lite.grayscale_threshold_binary(
+                        [IMG_H, IMG_W], arr, CLOSE_BIN_TH, 255)
+                else:
+                    binary_np = _cv_lite.rgb888_threshold_binary(
+                        [IMG_H, IMG_W], arr, CLOSE_BIN_TH, 255)
+                view = image.Image(
+                    IMG_W, IMG_H, image.GRAYSCALE,
+                    alloc=image.ALLOC_REF, data=binary_np)
+            except Exception:
+                arr = None
+                try:
+                    view = img.to_grayscale(copy=True)
+                except Exception:
+                    view = img.to_grayscale()
+                view.binary([(CLOSE_BIN_TH, 255)])
+                try:
+                    view = view.to_grayscale()
+                except Exception:
+                    pass
+            view.close(CLOSE_MORPH_SIZE)
+            self.close_ms = time.ticks_diff(time.ticks_ms(), t0)
+            if (arr is not None) and (not self.mask_logged):
+                self.mask_logged = True
+                if GRAY_DIRECT:
+                    _v0 = px_luma(img, IMG_W // 2, IMG_H // 2)
+                    print("[CLOSE] 灰度直出 中心=%d" % _v0)
+                else:
+                    _v0 = px_luma_arr(arr, IMG_W // 2, IMG_H // 2)
+                    print("[CLOSE] ndarray取亮度 mode=%d 中心=%d"
+                          % (_ARR_MODE, _v0))
+            self.close_view = view
+            self.close_data = binary_np
+            self.close_roi = (0, 0, IMG_W, IMG_H)
+            self.close_scale = 1
+            t0 = time.ticks_ms()
+            blobs = view.find_blobs(
+                [(1, 255)], merge=False,
+                area_threshold=PAPER_MIN_AREA,
+                pixels_threshold=PAPER_MIN_AREA)
+        except Exception as e:
+            if not self.err_printed:
+                self.err_printed = True
+                print("全帧闭运算异常(%s)" % einfo(e))
+            return None, 0, ""
+        if not blobs:
+            self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
+            return None, 0, "[闭运算:无白块] "
+        self.cands = []
+        self.debug_quad = None
+        self.debug_score = 0.0
+        best = None
+        n = 0
+        dbg = ""
+        for b in blobs:
+            n += 1
+            x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
+            if w < 8 or h < 8:
+                continue
+            box_long = w if w > h else h
+            use_arr = (not GRAY_DIRECT) and (arr is not None)
+            ins, outs, frac = paper_contrast(
+                arr if use_arr else img, x, y, w, h, use_arr)
+            if (ins < 0) and use_arr:
+                ins, outs, frac = paper_contrast(img, x, y, w, h, False)
+            why = ""
+            corners = None
+            qa = 0.0
+            ctr = (x + w / 2.0, y + h / 2.0)
+            if self.have and (self.lost < 5):
+                _max_d = max(45.0, self.last_long * 0.55) + self.lost * 10.0
+                if abs(ctr[0] - self.u) + abs(ctr[1] - self.v) > _max_d:
+                    continue
+            if box_long < PAPER_MIN_LONG * 0.8 or \
+                    box_long > PAPER_MAX_LONG * 1.3:
+                why = "框长"
+                long_side = box_long
+                short_side = w if w < h else h
+                density = px / float(w * h)
+            else:
+                # 只扫本白块 bbox，不跨到旁边的亮块
+                q = quad_from_blob(view, x, y, w, h, 1, 0)
+                if q is not None:
+                    corners, ctr, long_side, short_side, qa = q
+                    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
+                        corners = None
+                    elif long_side < 0.70 * box_long:
+                        corners = None
+                    elif _quad_angle_bad(corners):
+                        corners = None
+                    else:
+                        lim = 8
+                        for p in corners:
+                            if (p[0] < x - lim) or (p[0] > x + w + lim) or \
+                                    (p[1] < y - lim) or (p[1] > y + h + lim):
+                                corners = None
+                                break
+                if corners is None:
+                    long_side = box_long
+                    short_side = w if w < h else h
+                    density = px / float(w * h)
+                    dens_min = PAPER_DENSITY_MIN
+                    if (ins - outs) >= PAPER_CONTRAST_STRONG:
+                        dens_min = PAPER_DENSITY_MIN_STRONG
+                    ctr = (x + w / 2.0, y + h / 2.0)
+                else:
+                    density = px / max(1.0, qa)
+                    dens_min = PAPER_DENSITY_QUAD_MIN
+                aspect = long_side / max(1.0, short_side)
+                if px < PAPER_MIN_AREA:
+                    why = "面积"
+                elif px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
+                    why = "太大"
+                elif long_side < PAPER_MIN_LONG or \
+                        long_side > PAPER_MAX_LONG:
+                    why = "长边"
+                elif aspect < PAPER_ASPECT_MIN or \
+                        aspect > PAPER_ASPECT_MAX:
+                    why = "比例"
+                elif (density < dens_min) or (density > 1.08):
+                    why = "密度"
+                elif ((x <= 1) or (y <= 1) or
+                      ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1)) and \
+                        (corners is None) and (box_long < 90):
+                    why = "贴边"
+                elif ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
+                    why = "对比"
+                elif frac < PAPER_DARK_FRAC_MIN:
+                    why = "暗边"
+            if n <= 6:
+                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
+                    px, box_long, ins, outs, frac * 100.0, density,
+                    ("四" if corners is not None else "框"),
+                    (" ✗" + why) if why else " ✓")
+            if len(self.cands) < 8:
+                self.cands.append((x, y, w, h, 0 if why else 1))
+            _dc = abs(ctr[0] - SPOT_UV[0]) + abs(ctr[1] - SPOT_UV[1])
+            dbg_score = px / (1.0 + _dc / 40.0)
+            if dbg_score > self.debug_score:
+                self.debug_score = dbg_score
+                if corners is not None:
+                    self.debug_quad = corners
+                else:
+                    self.debug_quad = ((x, y), (x + w, y),
+                                       (x + w, y + h), (x, y + h))
+            if why:
+                continue
+            score = px * (0.5 + min(ins - outs, 80) / 80.0)
+            score *= 0.5 + 0.5 * (density if density < 1.0 else 1.0)
+            if self.have and (self.lost < LOST_FULL) and \
+                    (self.last_long > 1.0):
+                _d = abs(ctr[0] - self.u) + abs(ctr[1] - self.v)
+                _ds = abs(long_side - self.last_long) / self.last_long
+                score *= 1.0 / (1.0 + _d / 80.0 + _ds * 2.0)
+            if self.have and (self.lost < LOST_FULL):
+                key = (0, score)
+            else:
+                key = (1 if _dc <= SPOT_PREF_PX else 0, score)
+            if best is None or key > best[0]:
+                best = (key, (px, x, y, w, h, long_side, aspect, density,
+                              ins, outs, corners, ctr[0], ctr[1]))
+        self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
+        if best is None:
+            return None, n, dbg
+        return best[1], n, dbg
+
+
+    def _near_candidate(self, img, roi):
+        """ROI 闭运算 -> 最大白块 -> 原来的四边扫描，返回候选元组。"""
+        x0, y0, rw, rh = roi
+        self.close_view = None
+        self.close_data = None
+        self.close_roi = None
+        self.close_ms = 0
+        self.quad_ms = 0
+        src = None
+        rgb = None
+        arr = None
+        closed = None
+        try:
+            t0 = time.ticks_ms()
+            src = img.crop(roi)
+            try:
+                rgb = src.to_rgb888()
+                arr = rgb.to_numpy_ref()
+                if not self.conv_logged:
+                    self.conv_logged = True
+                    print("[CLOSE] RGB888转换: to_rgb888")
+            except Exception:
+                if (self.rgb_buf is None) or (self.rgb_shape != (rw, rh)):
+                    self.rgb_buf = image.Image(rw, rh, image.RGB888)
+                    self.rgb_shape = (rw, rh)
+                src.copy_to(self.rgb_buf)
+                arr = self.rgb_buf.to_numpy_ref()
+                if not self.conv_logged:
+                    self.conv_logged = True
+                    print("[CLOSE] RGB888转换: copy_to 兜底")
+            closed = _cv_lite.rgb888_close(
+                [rh, rw], arr, CLOSE_ROI_KERNEL,
+                CLOSE_ROI_ITERS, CLOSE_ROI_TH)
+            self.close_ms = time.ticks_diff(time.ticks_ms(), t0)
+            self.close_view = image.Image(
+                rw, rh, image.GRAYSCALE,
+                alloc=image.ALLOC_REF, data=closed)
+            self.close_data = closed
+            self.close_roi = roi
+            t0 = time.ticks_ms()
+            blobs = self.close_view.find_blobs(
+                [(128, 255)], merge=False,
+                area_threshold=PAPER_MIN_AREA,
+                pixels_threshold=PAPER_MIN_AREA)
+            self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
+        except Exception as e:
+            if not self.err_printed:
+                self.err_printed = True
+                print("近处闭运算异常(%s) -> 本帧回退原检测"
+                      % einfo(e))
+            return None, 0, ""
+        if not blobs:
+            return None, 0, "[闭运算:无白块] "
+        big = []
+        lim = int(rw * rh * 0.05)
+        if lim < PAPER_MIN_AREA:
+            lim = PAPER_MIN_AREA
+        for b in blobs:
+            if int(b[4]) >= lim:
+                big.append(b)
+        if len(big) > 1:
+            return None, 0, "[闭运算:多块] "
+        blobs = big
+        if not blobs:
+            return None, 0, "[闭运算:无白块] "
+        best = None
+        n = 0
+        for b in blobs:
+            bx = int(b[0])
+            by = int(b[1])
+            bw = int(b[2])
+            bh = int(b[3])
+            if (bw < 8) or (bh < 8):
+                continue
+            q = self._scan_quad(self.close_view, bx, by, bw, bh, x0, y0)
+            if q is None:
+                continue
+            corners, ctr, long_side, short_side, qa = q
+            cand = self._make_cand(
+                img, x0 + bx, y0 + by, bw, bh, corners, ctr,
+                long_side, short_side, qa)
+            if cand is None:
+                continue
+            n += 1
+            score = qa * (0.5 + min(cand[8] - cand[9], 80) / 80.0)
+            if best is None or score > best[0]:
+                best = (score, cand)
+        if best is None:
+            return None, n, "[闭运算:四边] "
+        return best[1], n, "[闭运算+四边] "
+
+    def detect(self, img):
+        if FULL_FRAME_CLOSE:
+            self.frame += 1
+            cand, n, dbg = self._full_candidate(img)
+            self.close_dbg = dbg
+            self.last_n = n
+            self.last_dbg = dbg
+            self.did_full = True
+            if cand is None:
+                self.close_hit = False
+                self.lost += 1
+                self.state = "搜索"
+                self.close_miss_n += 1
+                if (self.close_miss_n % 20) == 1:
+                    print("[CLOSE] 全帧未命中 n=%d %s"
+                          % (n, dbg))
+                return None
+            self.close_miss_n = 0
+            if not self._size_ok(cand[5], cand[7], cand[8] - cand[9]):
+                self.last_dbg = "[全帧闭运算:尺寸闸门] "
+                self.lost += 1
+                self.state = "搜索"
+                return None
+            self.cands = [(cand[1], cand[2], cand[3], cand[4], 1)]
+            if self._accept(cand):
+                self.close_hit = True
+                return {"center": (self.u, self.v),
+                        "box": (cand[1], cand[2], cand[3], cand[4]),
+                        "area": cand[0], "aspect": cand[6],
+                        "density": cand[7], "long_side": cand[5],
+                        "contrast": cand[8] - cand[9], "n": n,
+                        "state": self.state,
+                        "corners": self.corners}
+            self.lost += 1
+            self.state = "搜索"
+            return None
+        near = USE_CLOSE_ROI and self.have and (self.lost == 0) and \
+            (self.last_long >= CLOSE_ROI_MIN_LONG)
+        if not near:
+            self.close_dbg = ""
+            self.close_view = None
+            self.close_data = None
+            self.close_roi = None
+            self.close_miss_n = 0
+        if near:
+            roi = self._close_roi()
+            cand, n, dbg = self._near_candidate(img, roi)
+            self.close_dbg = dbg
+            if cand is not None:
+                self.close_miss_n = 0
+                self.frame += 1
+                self.last_n = n
+                self.last_dbg = dbg
+                self.did_full = False
+                if not self._size_ok(cand[5], cand[7], cand[8] - cand[9]):
+                    self.last_dbg = "[近处闭运算:尺寸闸门] "
+                    self.lost += 1
+                    self.state = "搜索"
+                    return None
+                self.cands = [(cand[1], cand[2], cand[3], cand[4], 1)]
+                if self._accept(cand):
+                    self.close_hit = True
+                    return {"center": (self.u, self.v),
+                            "box": (cand[1], cand[2], cand[3], cand[4]),
+                            "area": cand[0], "aspect": cand[6],
+                            "density": cand[7], "long_side": cand[5],
+                            "contrast": cand[8] - cand[9], "n": n,
+                            "state": self.state,
+                            "corners": self.corners}
+                self.lost += 1
+                self.state = "搜索"
+                return None
+            self.close_miss_n += 1
+            if (self.close_miss_n % 20) == 1:
+                print("[CLOSE] 未命中 n=%d roi=%s %s"
+                      % (n, roi, dbg))
+            self.lost += 1
+            self.state = "搜索"
+            return None
+        self.close_hit = False
+        return PaperDetector.detect(self, img)
+
 
 class SpotDetector(object):
     def __init__(self):
@@ -1500,36 +1903,27 @@ class SpotDetector(object):
         self.u += du
         self.v += dv
 
-    # 激光光斑色块检测。
     def _detect_blobs(self, img):
         x0, y0, w, h = self.roi()
-        best_core = None
-        best_halo = None
-        for ti in range(len(SPOT_THRESHOLDS)):
-            for b in img.find_blobs([SPOT_THRESHOLDS[ti]], roi=(x0, y0, w, h),
-                                    merge=True,
-                                    pixels_threshold=SPOT_MIN_AREA,
-                                    area_threshold=SPOT_MIN_AREA):
-                area = b[4]
-                if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                    continue
-                bw = b[2]
-                bh = b[3]
-                if bw < 1 or bh < 1:
-                    continue
-                if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                    continue
-                # 把 ROI 坐标转换回全图坐标。
-                bx, by = b[0] + x0, b[1] + y0
-                cx = bx + bw / 2.0
-                cy = by + bh / 2.0
-                if ti == 0:
-                    if best_core is None or area > best_core[0]:
-                        best_core = (area, cx, cy, (bx, by, bw, bh))
-                else:
-                    if best_halo is None or area > best_halo[0]:
-                        best_halo = (area, cx, cy, (bx, by, bw, bh))
-        best = best_core if best_core is not None else best_halo
+        best = None
+        for b in img.find_blobs(SPOT_THRESHOLDS, roi=(x0, y0, w, h),
+                                merge=True,
+                                pixels_threshold=SPOT_MIN_AREA,
+                                area_threshold=SPOT_MIN_AREA):
+            area = b[4]
+            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
+                continue
+            bw = b[2]
+            bh = b[3]
+            if bw < 1 or bh < 1:
+                continue
+            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
+                continue
+            bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
+            cx = bx + bw / 2.0
+            cy = by + bh / 2.0
+            if best is None or area > best[0]:
+                best = (area, cx, cy, (bx, by, bw, bh))
         if best is None:
             return None
         area, cx, cy, rect = best
@@ -1537,10 +1931,10 @@ class SpotDetector(object):
         return {"uv": (cx, cy), "area": area, "rect": rect}
 
 
-
-
 def apply_flip(sensor):
-    """按固件支持的形式设置上下/左右翻转。"""
+    """上下/左右翻转尽量多试几种写法：不同固件的 set_vflip 签名/是否分通道不同，
+    现场实测 set_vflip(True) 不生效。如果最后还是倒的，就把摄像头模块整体转 180°
+    装（装完记得把 CAM_VFLIP 改回 False，否则又会被翻回去）。"""
     for kw in ({}, {"chn": 0}, {"chn": 1}):
         try:
             sensor.set_vflip(CAM_VFLIP, **kw)
@@ -1552,232 +1946,50 @@ def apply_flip(sensor):
             pass
 
 
-# ============================ 画面亮度诊断 ============================
 def log(msg):
     print(msg)
 
 
 def einfo(e):
-    """返回带异常类型的错误文本。"""
+    """异常信息带类型 —— 这版固件上 Python 异常的字符串经常只有一个数字
+    （现场被 `叠加层异常(0)` / `二值预览失败(0)` 坑过好几轮，其实就是
+    KeyError(0)）。带上类型，下次一眼就能看出是什么错。"""
     return "%s: %s" % (type(e).__name__, e)
-
-def apply_exposure(sensor):
-    """先让 AE 稳定，再冻结硬件曝光并标定软件曝光增益。"""
-    if not EXPO_FIX:
-        return "关（EXPO_FIX=False）" + _apply_sw_scale()
-
-    def _snap_mean():
-        try:
-            _im = sensor.snapshot(chn=0)
-            _v = _grid_mean(_im)
-            del _im
-            return _v
-        except Exception:
-            return -1.0
-
-    # 1) 等待 AE 适应。
-    time.sleep_ms(EXPO_SETTLE_MS)
-    _m1 = _snap_mean()
-    # 2) 清除 ae_enable 并立即下发。
-    _how = ""
-    _why = ""
-    try:
-        sensor._dev_attr.pipe_ctrl.bits.ae_enable = 0
-        _how = "ae_enable=0"
-    except Exception as e:
-        _how = ""
-        _why = e
-    if _how:
-        try:
-            import mpp
-            mpp.kd_mpi_vicap_set_dev_attr(sensor._dev_id, sensor._dev_attr)
-            _how = _how + " + set_dev_attr()"
-            _froze = True
-        except Exception as e:
-            _how = _how + "（下发失败:%s）" % e
-            _froze = False
-    else:
-        _how = "拿不到 dev attr(%s)" % _why
-        _froze = False
-    # 3) 明显变暗时恢复 AE。
-    time.sleep_ms(400)
-    _m2 = _snap_mean()
-    _tail = ""
-    # 只有冻结成功时才继续调模拟增益。
-    _ae_off = _froze
-    if (_m1 > 0) and (_m2 > 0) and (_m2 < _m1 * EXPO_DARK_RATIO):
-        try:
-            sensor._dev_attr.pipe_ctrl.bits.ae_enable = 1
-            import mpp
-            mpp.kd_mpi_vicap_set_dev_attr(sensor._dev_id, sensor._dev_attr)
-            _tail = "；冻完变暗(%.0f->%.0f) 已把 AE 开回来" % (_m1, _m2)
-            _ae_off = False
-        except Exception as e:
-            _tail = "；冻完变暗(%.0f->%.0f) 且回滚失败(%s)" % (_m1, _m2, e)
-    # 4) 按启动亮度计算一次软件曝光增益，并验证输出亮度。
-    global EXPO_SW_GAIN
-    _m = _m2
-    _sw_ok = False
-    if (EXPO_TARGET_MEAN > 0) and (_m > 0):
-        _g_new = EXPO_SW_GAIN
-        if EXPO_AUTO_GAIN:
-            _g_new = EXPO_TARGET_MEAN / _m
-            if _g_new < EXPO_SW_MIN:
-                _g_new = EXPO_SW_MIN
-            elif _g_new > EXPO_SW_MAX:
-                _g_new = EXPO_SW_MAX
-        try:
-            import cv_lite
-            import image as _image
-            _im = sensor.snapshot(chn=0)
-            _rgb = _im.to_numpy_ref()
-            _out = cv_lite.rgb888_adjust_exposure_fast(
-                [IMG_H, IMG_W], _rgb, float(_g_new))
-            if _out is not None:
-                _eim = _image.Image(IMG_W, IMG_H, _image.RGB888,
-                                    alloc=_image.ALLOC_REF, data=_out)
-                _m3 = _grid_mean(_eim)
-                try:
-                    del _eim
-                    del _out
-                except Exception:
-                    pass
-                _sw_ok = True
-                _tail += ("；软件曝光 gain=%.2f 亮度 %.0f->%.0f%s"
-                          % (_g_new, _m, _m3,
-                             " ✓" if abs(_m3 - _m) >= 2.0 else "（变化<%d）"
-                             % 2))
-                _m = _m3
-                EXPO_SW_GAIN = float(_g_new)
-            try:
-                del _im
-            except Exception:
-                pass
-        except Exception as e:
-            _tail += "；软件曝光失败(%s: %s)" % (type(e).__name__, e)
-        if not _sw_ok:
-            EXPO_SW_GAIN = 1.0
-            _tail += "；软件曝光不可用，退回 gain=1.0（原始帧）"
-
-    # 5) 可选模拟增益；0 表示保持冻结时的值。
-    if _ae_off and (EXPO_HW_GAIN > 0):
-        try:
-            from media.sensor import k_sensor_gain
-            _g1 = sensor.again()
-            _g0 = float(_g1.gain[0]) if _g1 is not None else -1.0
-            _gh = k_sensor_gain()
-            _gh.gain[0] = EXPO_HW_GAIN
-            sensor.again(_gh)
-            time.sleep_ms(300)
-            _g2 = sensor.again()
-            _g_rd = float(_g2.gain[0]) if _g2 is not None else -1.0
-            _m4 = _snap_mean()
-            _tail += "；模拟增益 %.2f->%d(读回%.2f) 亮度 %.0f" % (
-                _g0, EXPO_HW_GAIN, _g_rd, _m4)
-            if _m4 > 0:
-                _m = _m4
-        except Exception as e:
-            _tail += "；模拟增益写入失败(%s: %s)" % (type(e).__name__, e)
-    if (_m > 0) and (EXPO_TARGET_MEAN > 0):
-        _tail += "；最终 均=%.0f（目标%.0f，软件曝光 gain=%.2f）" % (
-            _m, EXPO_TARGET_MEAN, EXPO_SW_GAIN)
-    _tail += _apply_sw_scale()
-    return "冻曝光: %s；亮度 %.0f -> %.0f%s" % (_how, _m1, _m2, _tail)
-
-def _grid_mean(img):
-    """用 10×10 网格估算画面平均亮度。"""
-    _arr = None
-    try:
-        _arr = img.to_numpy_ref()
-    except Exception:
-        _arr = None
-    s = 0.0
-    k = 0
-    for gy in range(10):
-        y = int(IMG_H * (gy + 0.5) / 10)
-        for gx in range(10):
-            x = int(IMG_W * (gx + 0.5) / 10)
-            v = None
-            if _arr is not None:
-                try:
-                    p = _arr[y, x]
-                    try:
-                        n = len(p)
-                    except TypeError:
-                        v = p
-                    else:
-                        if n >= 3:
-                            # 先转 int，避免 uint8 相加溢出。
-                            v = (int(p[0]) + int(p[1]) + int(p[2])) / 3.0
-                        elif n == 1:
-                            v = int(p[0])
-                except Exception:
-                    v = None
-            if v is None:
-                try:
-                    p = img.get_pixel(x, y)
-                except Exception:
-                    continue
-                if p is None:
-                    continue
-                try:
-                    v = ((p[0] + p[1] + p[2]) / 3.0) \
-                        if isinstance(p, (tuple, list)) else p
-                except Exception:
-                    continue
-            s += v
-            k += 1
-    return (s / k) if k else -1.0
-
-def _apply_sw_scale():
-    """软件曝光改变亮度时，同步缩放绝对亮度判据。
-
-    GY_TH 是软件曝光归一化后的固定阈值，不再乘 gain。
-    """
-    global PAPER_INNER_MAX, PAPER_CONTRAST_MIN
-    global PAPER_DARK_MARGIN, GY_CANNY1, GY_CANNY2
-    if _SW_SCALED[0]:
-        return ""
-    _SW_SCALED[0] = True
-    _s = float(EXPO_SW_GAIN)
-    if abs(_s - 1.0) < 1e-3:
-        return "（软件曝光 gain=1.0，阈值不缩放）"
-    _o = (PAPER_INNER_MAX, PAPER_CONTRAST_MIN,
-          PAPER_DARK_MARGIN, GY_CANNY1, GY_CANNY2)
-    PAPER_INNER_MAX = max(2, int(round(PAPER_INNER_MAX * _s)))
-    PAPER_CONTRAST_MIN = max(1, int(round(PAPER_CONTRAST_MIN * _s)))
-    PAPER_DARK_MARGIN = max(1, int(round(PAPER_DARK_MARGIN * _s)))
-    GY_CANNY1 = max(1, int(round(GY_CANNY1 * _s)))
-    GY_CANNY2 = max(2, int(round(GY_CANNY2 * _s)))
-    return ("；曝光判据随 gain ×%.2f：饱和档 %d->%d "
-            "对比 %d->%d 暗边 %d->%d Canny %d/%d->%d/%d；"
-            "GY_TH 固定=%d（不乘 gain）"
-            % (_s, _o[0], PAPER_INNER_MAX,
-               _o[1], PAPER_CONTRAST_MIN, _o[2], PAPER_DARK_MARGIN,
-               _o[3], _o[4], GY_CANNY1, GY_CANNY2, GY_TH))
 
 
 def main():
+    global GRAY_DIRECT
     from media.sensor import Sensor, CAM_CHN_ID_0
     from media.display import Display
     from media.media import MediaManager
     import gc
-    global GY_TH                   # GY_TH 轮换（GY_TH_SWEEP）要在运行时改它
 
     sensor = Sensor(id=2, width=1280, height=960, fps=90)
     sensor.reset()
     time.sleep_ms(100)
     apply_flip(sensor)
-    # ISP 输出请求尺寸。
     sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    # 软件曝光要求相机输出 RGB888，检测前再转灰度。
-    sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
+    if FULL_FRAME_CLOSE and GRAY_DIRECT:
+        _fmt = Sensor.GRAYSCALE
+    elif FULL_FRAME_CLOSE:
+        _fmt = Sensor.RGB888
+    else:
+        _fmt = Sensor.RGB565
+    try:
+        sensor.set_pixformat(_fmt, chn=CAM_CHN_ID_0)
+    except Exception as e:
+        if not GRAY_DIRECT:
+            raise
+        print("灰度直出不可用(%s) -> 回退RGB888" % einfo(e))
+        GRAY_DIRECT = False
+        sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
     apply_flip(sensor)
     if EXPO_FIX:
-        # run() 前保持 AE，运行后再冻结。
-        log("曝光: 先让自动曝光(AE)自适应 %dms，run 后再冻住（见 apply_exposure）"
-            % EXPO_SETTLE_MS)
-    # 板载显示固定 640x480，处理图缩放后绘制。
+        try:
+            sensor.set_auto_exposure(False, exposure_us=EXPO_US)
+            print("曝光: 固定 exposure_us=%d（自动曝光已关）" % EXPO_US)
+        except Exception as e:
+            print("固定曝光不支持(%s)，继续自动曝光" % einfo(e))
     try:
         Display.init(Display.ST7701, width=DISPLAY_W, height=DISPLAY_H,
                      to_ide=True, quality=DISPLAY_QUALITY)
@@ -1789,11 +2001,12 @@ def main():
         print("显示: VIRT %dx%d -> IDE 帧缓冲区" % (DISPLAY_W, DISPLAY_H))
     MediaManager.init()
     sensor.run()
-    # run() 后冻结 AE 并标定软件曝光。
-    print("曝光: %s" % apply_exposure(sensor))
+    if not GRAY_DIRECT:
+        try:
+            px_probe_fast(sensor.snapshot(chn=CAM_CHN_ID_0))
+        except Exception:
+            pass
 
-    # ---------- 预览缩放（把处理图像摆到 640x480 画布上）----------
-    # 不放大（放大只会糊）；比画布小时居中摆放。
     import image
     _canvas = image.Image(DISPLAY_W, DISPLAY_H, image.RGB565)
     _sx = DISPLAY_W / float(IMG_W)
@@ -1802,15 +2015,19 @@ def main():
         _sx = _sy = 1.0
     _ox = int((DISPLAY_W - IMG_W * _sx) * 0.5)
     _oy = int((DISPLAY_H - IMG_H * _sy) * 0.5)
-    _preview_scaled = True        # draw_image 的缩放万一不支持 -> 退回推原图
-    _bin_mode = ""                # 二值预览走哪条路（下面探测；"" = 用不了）
-    _cv_shape = False             # 画布上能不能画图形（下面探测）
-    _cv_text = False              # 画布上能不能写字
-    _ov_bad = []                  # 哪些绘制调用这版固件不支持（每个只报一次）
+    _preview_scaled = True
+    _bin_mode = ""
+    _bin_rgb = None
+    _close_prev_bad = False
+    _prev_err_printed = False
+    _cv_shape = False
+    _cv_text = False
+    _ov_bad = []
 
     def _ov(name, fn, *a, **kw):
         """调一次绘制。某个 API 在这版固件上不支持时，只把它自己跳过 +
-        打一行日志，避免单个 API 失败影响整层叠加。"""
+        打一行日志 —— 不能因为一个调用把整层叠加（框/靶心/激光）全带崩。
+        2026-10-11 现场：`叠加层异常(0)` 就是这么来的（一个调用失败，全层没了）。"""
         if name in _ov_bad:
             return
         try:
@@ -1819,17 +2036,41 @@ def main():
             _ov_bad.append(name)
             print("叠加层 '%s' 不支持(%s) -> 以后跳过它" % (name, e))
 
-    def _overlay(target, det, spot_uv, s, ox, oy, ink, txt):
-        """绘制候选框、四边形、靶心、激光和状态文字。"""
+    def _overlay(target, det, spot_uv, s, ox, oy, mono, txt):
+        """叠加层：候选框 / 四边形 / 靶心 / 激光 / 文字。
+
+        target = 画布（此时 s=_sx, ox=_ox：原图坐标要缩放到画布）或
+                 img  （此时 s=1, ox=0：原图坐标直接用）。
+        mono=True 表示 target 是**二值图**（只有黑白），所有标记都用 0=黑 ——
+        在二值图上画彩色是没意义的，而且黑色正好在白纸上最显眼。
+        spot_uv 收两种写法：{"uv": (u, v)} 字典或 (u, v) 元组。
+        （⚠ 2026-10-11 踩过：传进来是字典、这里按元组 index 取 —— 会抛
+          KeyError(0)，日志里只显示 "(0)"，查了好几轮。两种都收，省得再犯。）
+        """
         if spot_uv is not None and (type(spot_uv) is dict):
             spot_uv = spot_uv["uv"]
-        if ink is not None:
-            _v = int(ink)
-            c_ok = c_cross = c_spot = _v
+        if mono:
+            c_ok = c_no = 0
+            c_cross = c_spot = 0
         else:
             c_ok = (0, 255, 0)
+            c_no = (255, 128, 0)
             c_cross = (255, 0, 0)
             c_spot = (255, 255, 0)
+        for (bx, by, bw, bh, ok) in det.cands:
+            _ov("rect", target.draw_rectangle,
+                int(bx * s + ox), int(by * s + oy),
+                int(bw * s), int(bh * s),
+                color=c_ok if ok else c_no, thickness=1)
+        dq = getattr(det, "debug_quad", None)
+        if (dq is not None) and (not det.fresh()):
+            for i in range(4):
+                a = dq[i]
+                b = dq[(i + 1) % 4]
+                _ov("debugline", target.draw_line,
+                    int(a[0] * s + ox), int(a[1] * s + oy),
+                    int(b[0] * s + ox), int(b[1] * s + oy),
+                    color=c_ok if not mono else 0, thickness=2)
         if det.fresh():
             c4 = det.corners
             if c4 is not None:
@@ -1853,45 +2094,10 @@ def main():
             _ov("circle", target.draw_circle,
                 int(spot_uv[0] * s + ox), int(spot_uv[1] * s + oy), 6,
                 color=c_spot, thickness=2)
-        if txt and (ink is None):
+        if txt and (not mono):
             _ov("text", target.draw_string_advanced,
                 4, 4, 16, txt, color=(255, 255, 0))
 
-    def _gray_comp(im):
-        """中心像素的分量数：灰度=1~2 个，彩色=3 个。查不了返回 -1。"""
-        try:
-            p = im.get_pixel(im.width() // 2, im.height() // 2)
-            if p is None:
-                return -1
-            return len(p) if isinstance(p, tuple) else 1
-        except Exception:
-            return -1
-
-    def _to_gray(img):
-        """转换为灰度图，并返回 (图像, 使用的方式)。"""
-        g = None
-        try:
-            g = img.to_grayscale()
-        except Exception as e:
-            print("to_grayscale 异常(%s)" % einfo(e))
-            g = None
-        if g is not None:
-            n = _gray_comp(g)
-            if n != 3:                 # 1~2 = 灰度；-1 = 查不了也先信它
-                return g, "rv"
-        elif _gray_comp(img) in (1, 2):     # 返回 None 且原地确实转灰了
-            return img, "inplace"
-        try:
-            gb = image.Image(img.width(), img.height(), image.GRAYSCALE)
-            img.copy_to(gb)
-            if _gray_comp(gb) != 3:
-                return gb, "copy"
-        except Exception as e:
-            print("灰度备用路(copy_to)也不行(%s)" % einfo(e))
-        return None, ""
-
-    # ---------- 相机会话与显示初始化 ----------
-    # 纯取图测速用于区分采集上限和处理耗时。
     _t0 = time.ticks_ms()
     _n = 0
     _probe_img = None
@@ -1909,56 +2115,45 @@ def main():
           "实际输出 %dx%d，请求 %dx%d）"
           % (_n, _ms, _n * 1000.0 / _ms, _w, _h, IMG_W, IMG_H))
 
-    # ---------- 预览路径探测 ----------
-    _pv_what = "灰度预览" if GRAY_PREVIEW else "二值化预览"
-    if BIN_PREVIEW or GRAY_PREVIEW:
+    if BIN_PREVIEW:
         try:
             _pi = sensor.snapshot(chn=CAM_CHN_ID_0)
-            if GRAY_PREVIEW:
-                # 灰度预览不执行二值化。
-                _gt, _gm = _to_gray(_pi)
-                print("灰度探测: 转换路径=%s (rv=用返回值/inplace=原地/copy=预分配)"
-                      % (_gm or "失败"))
-                if _gt is not None:
-                    _pi = _gt
-            # 二值预览直接使用检测链的融合图。
+            _pth = scene_th(_pi, 0)
+            _pi.binary([(_pth, 100, -PAPER_A_MAX, PAPER_A_MAX,
+                         -PAPER_B_MAX, PAPER_B_MAX)])
             try:
-                # 优先直接缩放，避免每帧分配。
                 _canvas.draw_image(_pi, _ox, _oy,
                                    x_scale=_sx, y_scale=_sy)
                 _bin_mode = "bin"
             except Exception as e:
-                print("预览B(直画缩放)不行: %s" % e)
+                print("二值预览B(二值直画)不行: %s" % e)
             if not _bin_mode:
                 try:
-                    # 其次使用预分配 RGB565 缓冲。
                     _bin_rgb = image.Image(IMG_W, IMG_H, image.RGB565)
                     _pi.copy_to(_bin_rgb)
                     _canvas.draw_image(_bin_rgb, _ox, _oy,
                                        x_scale=_sx, y_scale=_sy)
                     _bin_mode = "copy"
                 except Exception as e:
-                    print("预览C(预分配+copy_to)不行: %s" % e)
+                    print("二值预览C(预分配+copy_to)不行: %s" % e)
                     try:
                         del _bin_rgb
                     except Exception:
                         pass
             if not _bin_mode:
                 try:
-                    # 最后尝试每帧转 RGB565。
                     _prgb = _pi.to_rgb565()
                     _canvas.draw_image(_prgb, _ox, _oy,
                                        x_scale=_sx, y_scale=_sy)
                     _bin_mode = "rgb"
                     del _prgb
                 except Exception as e:
-                    print("预览A(转RGB565)不行: %s" % e)
+                    print("二值预览A(转RGB565)不行: %s" % e)
             if _bin_mode:
                 Display.show_image(_canvas)
             del _pi
         except Exception as e:
-            print("预览变换(灰度化/binary)本身不行: %s" % e)
-        # 逐项探测画布是否支持图形和文字。
+            print("二值化(binary)本身不行: %s" % e)
         try:
             _canvas.draw_rectangle(0, 0, 8, 8, color=(255, 0, 0), thickness=1)
             _cv_shape = True
@@ -1978,28 +2173,24 @@ def main():
         except Exception as e:
             print("画布写字不行(%s)，就不显示 th= 那行字了" % einfo(e))
         if _bin_mode == "bin":
-            print("%s: 做法B（图直接缩放，零分配）" % _pv_what)
+            print("二值化预览: 做法B（二值图直接缩放，零分配）")
         elif _bin_mode == "copy":
-            print("%s: 做法C（预分配 RGB565 + copy_to）" % _pv_what)
+            print("二值化预览: 做法C（预分配 RGB565 + copy_to）")
         elif _bin_mode == "rgb":
-            print("%s: 做法A（每帧转 RGB565）" % _pv_what)
+            print("二值化预览: 做法A（每帧二值图转 RGB565）")
         else:
-            print("%s: 用不了 -> 本次跑彩色预览" % _pv_what)
+            print("二值化预览: 用不了 -> 本次跑彩色预览")
         print("预览叠加: 画布图形=%s 画布文字=%s"
               % ("可以" if _cv_shape else "不行(改画二值图上)",
                  "可以" if _cv_text else "不行"))
 
-    target_det = PaperDetector()
+    target_det = ClosePaperDetector()
     spot_det = SpotDetector()
 
     last_spot = None
-    cal_u = []            # 标定用：光斑 u 采样（中位数抗误检）
+    cal_u = []
     cal_v = []
     t_print = time.ticks_ms()
-    t_mask = time.ticks_ms()   # [MASK] 读数节拍（见 _dark_frac）
-    _gy_sw = -1           # 当前阈值扫描档位
-    _sw_n = 0             # 本档已打印的 FPS 行数（统计用）
-    _sw_lock = 0          # 本档"靶=锁定"的行数
     n_frame = 0
     n_frame_prev = 0
     n_tgt = 0
@@ -2010,58 +2201,34 @@ def main():
     sum_show = 0
     sum_n = 0
 
-    # 阈值扫描会修改模块级 GY_TH。
-    global GY_TH
-
     print("=" * 68)
-    print("vision_check: 纯视觉（不发串口）; 视觉处理 = k230_aim/main.py 原文")
+    print("vision_check: 纯视觉（不发串口）; 远处=main.py 原检测，"
+          "近处=闭运算实验")
     print("  分辨率 %dx%d (S=%.2f, K=%.2fpx/°)  靶心=四边形对角线交点"
           % (IMG_W, IMG_H, S_SCALE, VIS_K))
-    def _ksize(n):
-        return "关" if n <= 0 else ("%dx%d" % (2 * n + 1, 2 * n + 1))
-
-    def _dark_frac(im, th):
-        """估算画面中比阈值暗的像素比例。"""
-        n = 0
-        dk = 0
-        for _gy in range(16):
-            y = int(IMG_H * (_gy + 0.5) / 16)
-            for _gx in range(20):
-                x = int(IMG_W * (_gx + 0.5) / 20)
-                v = px_luma(im, x, y)
-                if v >= 0:
-                    n += 1
-                    if v < th:
-                        dk += 1
-        if n <= 0:
-            return -1.0
-        return dk * 100.0 / n
-
-    print("  检测=融合图每%d帧一次 -> 白色连通域 -> 凸包/RDP 四边"
-          " + 内孔；外框=外沿/内框重心=靶心" % CV2_EVERY)
-    if GY_CLOSE_SIZE <= 0:
-        _cl = "闭运算关"
-    elif GY_CLOSE_SIZE <= 2:
-        _cl = "闭运算%d×%d(全分辨率直接做)" % (2 * GY_CLOSE_SIZE + 1,
-                                              2 * GY_CLOSE_SIZE + 1)
+    print("  阈值=Otsu(兜底:均值+8 夹[%d,72]) 长边%d~%dpx 密度(四边)%.2f "
+          "对比>=%d 暗边>=%.0f%%"
+          % (PAPER_TH, PAPER_MIN_LONG, PAPER_MAX_LONG,
+             PAPER_DENSITY_QUAD_MIN, PAPER_CONTRAST_MIN,
+             PAPER_DARK_FRAC_MIN * 100))
+    print("  跟踪窗=长边x%.1f+%dpx 尺寸闸门[%.2f,%.2f]x 确认%d次 光斑每%d帧搜一次"
+          % (TRACK_K, TRACK_PAD, SIZE_GATE_LO, SIZE_GATE_HI, CONFIRM_N,
+             SPOT_EVERY))
+    if FULL_FRAME_CLOSE:
+        if GRAY_DIRECT:
+            print("  全帧: GRAYSCALE直出 -> cv_lite灰度二值化130"
+                  " -> image.close(1)[3x3] -> 白块 -> 原四边扫描")
+        else:
+            print("  全帧: RGB888 -> cv_lite二值化130(GRAYSCALE 0/255)"
+                  " -> image.close(1)[3x3]"
+                  " -> 白块 -> 原四边扫描"
+                  "（沿用原来的黑框/对比度/尺寸闸门）")
+    elif USE_CLOSE_ROI:
+        print("  近处: cv_lite闭运算ROI -> 白块 -> 原四边扫描（不做碎片合并）"
+              + ("；命中时预览=闭运算ROI"
+                 if CLOSE_FULL_PREVIEW else ""))
     else:
-        _cl = "闭运算%d×%d(金字塔等效)" % (2 * (GY_CLOSE_SIZE // 2) + 1,
-                                          2 * (GY_CLOSE_SIZE // 2) + 1)
-    print("  预览=反向二值化(暗=白 th=%d) + %s ∪ "
-          "Canny(%d,%d) -> 外框绿、靶心红"
-          % (GY_TH, _cl, GY_CANNY1, GY_CANNY2))
-    print("  曝光=%s  光斑每%d帧搜一次"
-          % ("冻结 AE + 软件曝光标定(目标亮度%.0f，gain 启动时算一次)"
-             % EXPO_TARGET_MEAN
-             if EXPO_FIX else "自动", SPOT_EVERY))
-    print("  过滤=%s"
-          % ("对比>=%d/暗边>=%.0f%%/[仅饱和灯检查内部结构] -> "
-             "长边%d~%dpx 比例[%.2f,%.2f] 四边几何(cos<=%.2f/最短边%d)"
-             % (PAPER_CONTRAST_MIN, PAPER_DARK_FRAC_MIN * 100,
-                PAPER_MIN_LONG, PAPER_MAX_LONG,
-                PAPER_ASPECT_MIN, PAPER_ASPECT_MAX,
-                QUAD_ANGLE_COS_MAX, PAPER_MIN_SIDE)))
-    print("  丢检保持：绿框最多再留 3 帧（%s）" % "显示用，不影响上报")
+        print("  近处: cv_lite 不可用 -> 全部走原检测")
     print("=" * 68)
 
     try:
@@ -2069,33 +2236,19 @@ def main():
             os.exitpoint()
             now = time.ticks_ms()
 
-            # ---------- 可选阈值扫描 ----------
-            if GY_TH_SWEEP and GY_TH_SWEEP_LIST:
-                _sw2 = ((time.ticks_ms() // (GY_TH_SWEEP_SEC * 1000)) %
-                        len(GY_TH_SWEEP_LIST))
-                if _sw2 != _gy_sw:
-                    _gy_sw = _sw2
-                    GY_TH = GY_TH_SWEEP_LIST[_sw2]
-                    print(">>> 阈值扫描: GY_TH=%d（看预览：只有胶带是白的"
-                          "那一档最好）" % GY_TH)
-
-            # ---------- 取图 ----------
             t0 = time.ticks_ms()
             img = sensor.snapshot(chn=CAM_CHN_ID_0)
             t_grab = time.ticks_diff(time.ticks_ms(), t0)
             n_frame += 1
 
-            # ---------- 靶纸（与 main.py 同一套 PaperDetector）----------
             t0 = time.ticks_ms()
-            res = target_det.detect(img, _GY_MASK_CACHE)
+            res = target_det.detect(img)
             t_tgt = time.ticks_diff(time.ticks_ms(), t0)
             if res is not None:
                 n_tgt += 1
 
-            # ---------- 光斑（每 SPOT_EVERY 帧搜一次，其它帧复用）----------
             t0 = time.ticks_ms()
             if CALIB_LASER:
-                # 标定模式逐帧检测光斑。
                 last_spot = spot_det.detect(img)
                 spot = last_spot
                 if last_spot is not None and len(cal_u) < 400:
@@ -2107,29 +2260,16 @@ def main():
                 spot = last_spot
             t_spot = time.ticks_diff(time.ticks_ms(), t0)
             if USE_FIXED_LASER and (not CALIB_LASER):
-                # 使用固定激光坐标。
                 spot = {"uv": LASER_UV}
             if spot is not None:
                 n_spot += 1
                 SPOT_UV[0], SPOT_UV[1] = spot["uv"]
 
-            # 丢靶时打一行画面亮度：判断"没看到靶"还是"判据没过"
             if target_det.lost == 8 or (target_det.lost > 30 and
                                         target_det.lost % 90 == 0):
                 log_scene(img)
 
-            # ---------- 反向二值图暗像素比例 ----------
-            if time.ticks_diff(now, t_mask) >= 2000:
-                t_mask = now
-                _th_now = _GY_TH_NOW[0] if _GY_TH_NOW[0] > 0 else GY_TH
-                _df = _dark_frac(img, _th_now)
-                if _df >= 0:
-                    print("[MASK] th=%d 暗于此的像素=%.1f%% (只有胶带约 3~10%%；"
-                          ">15%% 说明木柜也切进来了)" % (_th_now, _df))
-
-            # ---------- 绘制叠加层 ----------
-            if (not _bin_mode) and target_det.have and \
-                    (target_det.lost <= DRAW_HOLD):
+            if (not _bin_mode) and target_det.fresh():
                 c = target_det.corners
                 if c is not None:
                     for i in range(4):
@@ -2150,97 +2290,135 @@ def main():
                 img.draw_cross(int(spot["uv"][0]), int(spot["uv"][1]),
                                color=(255, 255, 0), size=6, thickness=1)
 
-            # 按 PREVIEW_EVERY 推送预览。
             t0 = time.ticks_ms()
-            if (n_frame % PREVIEW_EVERY) == 0:
+            if (n_frame % SHOW_EVERY) == 0:
                 _ok = False
-                _pending = False
-                if _bin_mode:
-                    # 灰度预览或融合图预览；各步骤独立捕获异常。
-                    if GRAY_PREVIEW:
+                _direct = False
+                if (CLOSE_FULL_PREVIEW and (not _close_prev_bad) and
+                        (target_det.close_view is not None) and
+                        (target_det.close_hit or CLOSE_PREVIEW_ANY)):
+                    try:
+                        _cr = target_det.close_roi
+                        _cw, _ch = _cr[2], _cr[3]
+                        _css = DISPLAY_W / float(_cw)
+                        _css2 = DISPLAY_H / float(_ch)
+                        if _css2 < _css:
+                            _css = _css2
+                        _cox = (DISPLAY_W - int(_cw * _css)) // 2
+                        _coy = (DISPLAY_H - int(_ch * _css)) // 2
                         try:
-                            # 与检测链使用同一灰度化流程。
-                            _g2 = _frame_gray(img)
-                            if _g2 is None:
-                                _bin_mode = ""
-                                print("灰度化不可用 -> 改彩色预览")
-                            else:
-                                img = _g2
-                        except Exception as e:
-                            _bin_mode = ""
-                            print("灰度化失败(%s) -> 改彩色预览" % einfo(e))
-                    else:
-                        # 显示检测链生成的融合图。
+                            _canvas.clear()
+                        except Exception:
+                            _canvas.draw_rectangle(
+                                0, 0, DISPLAY_W, DISPLAY_H,
+                                color=(0, 0, 0), fill=True)
+                        _canvas.draw_image(
+                            target_det.close_view, _cox, _coy,
+                            x_scale=_css * target_det.close_scale,
+                            y_scale=_css * target_det.close_scale)
+                        _sp = None
+                        if spot is not None:
+                            _su, _sv = spot["uv"]
+                            if (_cr[0] - 10 <= _su <= _cr[0] + _cw + 10) and \
+                                    (_cr[1] - 10 <= _sv <= _cr[1] + _ch + 10):
+                                _sp = (_su, _sv)
+                        _overlay(
+                            _canvas, target_det, _sp, _css,
+                            _cox - _cr[0] * _css,
+                            _coy - _cr[1] * _css,
+                            False,
+                            (("全帧闭运算" if target_det.close_hit else
+                              "闭运算未命中") + " %dx%d" % (_cw, _ch))
+                            if _cv_text else None)
+                        _ok = True
+                    except Exception as e:
                         try:
-                            _mg = None
-                            _mg = _GY_MASK_CACHE[0]
-                            if _mg is None:
-                                # 融合图暂未生成时跳过本帧绘制。
-                                _pending = True
-                            else:
-                                img = _mg
-                        except Exception as e:
-                            _bin_mode = ""
-                            print("检测图预览失败(%s) -> 改彩色预览" % einfo(e))
-                if _pending:
-                    pass                    # 等待下一帧融合图。
-                elif _bin_mode:
+                            Display.show_image(target_det.close_view)
+                            _ok = True
+                            _direct = True
+                        except Exception:
+                            _close_prev_bad = True
+                            print("闭运算ROI预览失败(%s) -> 回到全帧预览"
+                                  % einfo(e))
+                if (not _ok) and _bin_mode:
+                    _th_bin = int(_scene_cache[1])
+                    if _th_bin <= 0:
+                        _th_bin = PAPER_TH
+                    try:
+                        img.binary([(_th_bin, 100,
+                                     -PAPER_A_MAX, PAPER_A_MAX,
+                                     -PAPER_B_MAX, PAPER_B_MAX)])
+                    except Exception as e:
+                        _bin_mode = ""
+                        print("二值化 binary() 失败(%s) -> 改彩色预览" % einfo(e))
+                if (not _ok) and _bin_mode:
                     try:
                         if _bin_mode == "bin":
                             _canvas.draw_image(img, _ox, _oy,
                                                x_scale=_sx, y_scale=_sy)
                         elif _bin_mode == "copy":
+                            if _bin_rgb is None:
+                                _bin_rgb = image.Image(
+                                    IMG_W, IMG_H, image.RGB565)
                             img.copy_to(_bin_rgb)
                             _canvas.draw_image(_bin_rgb, _ox, _oy,
                                                x_scale=_sx, y_scale=_sy)
-                        else:                       # "rgb"
+                        else:
                             _rgb = img.to_rgb565()
                             _canvas.draw_image(_rgb, _ox, _oy,
                                                x_scale=_sx, y_scale=_sy)
                             del _rgb
-                        _txt = ("th=%d(固定) %s 长边%.0f"
-                                % ((_GY_TH_NOW[0] if _GY_TH_NOW[0] > 0
-                                    else GY_TH), target_det.state,
-                                   target_det.last_long))
+                        _s4 = _scene_cache[2]
+                        _tag4 = "(固定)" if _s4 == 4.0 else \
+                                ("(Otsu)" if _s4 == 1.0 else
+                                 ("(自算Otsu)" if _s4 == 2.0 else "(回退)"))
+                        _txt = ("th=%d%s %s 候选%d"
+                                % (int(_scene_cache[1]), _tag4,
+                                   target_det.state, target_det.last_n))
                         _sp = None
                         if spot is not None:
                             _sp = spot["uv"]
                         if not _cv_shape:
-                            # 画布不支持图形时，在融合图副本上绘制。
-                            _ink = 255 if _GY_MASK_OK[0] else 0
-                            try:
-                                img = img.copy()
-                            except Exception:
-                                pass
                             _overlay(img, target_det, _sp,
-                                     1.0, 0, 0, _ink, None)
+                                     1.0, 0, 0, True, None)
                         if _cv_shape:
                             _overlay(_canvas, target_det, _sp,
-                                     _sx, _ox, _oy, None,
+                                     _sx, _ox, _oy, False,
                                      _txt if _cv_text else None)
                         _ok = True
                     except Exception as e:
-                        _bin_mode = ""
-                        print("二值图缩放/叠加失败(%s) -> 改彩色预览" % einfo(e))
+                        if _bin_mode == "bin":
+                            _bin_mode = "copy"
+                            print("二值直画失败(%s) -> 改用预分配copy_to"
+                                  % einfo(e))
+                        else:
+                            _bin_mode = ""
+                            print("二值图缩放/叠加失败(%s) -> 改彩色预览"
+                                  % einfo(e))
                 if _ok:
-                    try:
-                        Display.show_image(_canvas)
-                    except Exception as e:
-                        print("推画面失败(%s)" % einfo(e))
-                else:
-                    # 彩色预览：优先缩放，失败时直接推送原图。
-                    if _preview_scaled:
+                    if not _direct:
                         try:
-                            _canvas.draw_image(img, _ox, _oy,
-                                               x_scale=_sx, y_scale=_sy)
                             Display.show_image(_canvas)
                         except Exception as e:
-                            _preview_scaled = False
-                            print("缩放预览不支持(%s) -> 直接推原图"
-                                  "（画面会被裁掉一部分）" % e)
+                            print("推画面失败(%s)" % einfo(e))
+                else:
+                    if ALLOW_COLOR_FALLBACK:
+                        if _preview_scaled:
+                            try:
+                                _canvas.draw_image(img, _ox, _oy,
+                                                   x_scale=_sx, y_scale=_sy)
+                                Display.show_image(_canvas)
+                            except Exception as e:
+                                _preview_scaled = False
+                                print("缩放预览不支持(%s) -> 直接推原图"
+                                      "（画面会被裁掉一部分）" % e)
+                                Display.show_image(img)
+                        else:
                             Display.show_image(img)
-                    else:
-                        Display.show_image(img)
+                    elif not _prev_err_printed:
+                        _prev_err_printed = True
+                        print("预览绘制失败 -> 保持上一帧"
+                              "（要彩色预览把 ALLOW_COLOR_FALLBACK=True）")
             t_show = time.ticks_diff(time.ticks_ms(), t0)
             del img
 
@@ -2250,7 +2428,6 @@ def main():
             sum_show += t_show
             sum_n += 1
 
-            # ---------- 打印 ----------
             if time.ticks_diff(now, t_print) >= PRINT_MS:
                 fps = ((n_frame - n_frame_prev) * 1000.0 /
                        max(1, time.ticks_diff(now, t_print)))
@@ -2259,16 +2436,26 @@ def main():
                 line = "FPS=%.1f " % fps
                 if res is not None:
                     m = target_det.meas
-                    line += ("靶=锁定 距离≈%.2fm 靶心=(%.0f,%.0f) "
-                             "长边=%.0fpx 比%.2f 形%.2f 对比=%.0f"
-                             % (FX_PX * PAPER_LONG_M / max(1.0, m[5]),
+                    _cs = ""
+                    if target_det.close_hit:
+                        _cs = (" [全帧闭运算 闭%.0fms 四边%.0fms]"
+                               % (target_det.close_ms, target_det.quad_ms))
+                    elif target_det.last_long >= CLOSE_ROI_MIN_LONG:
+                        _cs = " [闭运算未命中]"
+                    line += ("靶=锁定%s 距离≈%.2fm 靶心=(%.0f,%.0f) "
+                             "长边=%.0fpx 比%.2f 密%.2f 对比=%.0f"
+                             % (_cs,
+                                FX_PX * PAPER_LONG_M / max(1.0, m[5]),
                                 target_det.u, target_det.v,
                                 m[5], m[6], m[7], m[8] - m[9]))
                 else:
-                    line += "靶=%s 候选%d th=%d %s" % (
-                        target_det.state, target_det.last_n,
-                        (_GY_TH_NOW[0] if _GY_TH_NOW[0] > 0 else GY_TH),
+                    line += "靶=%s%s 候选%d th=%d %s" % (
+                        target_det.state,
+                        ("(全图)" if target_det.did_full else "(跟踪窗)"),
+                        target_det.last_n, int(_scene_cache[1]),
                         target_det.last_dbg)
+                    line += (" | 闭%.0f 扫%.0fms"
+                             % (target_det.close_ms, target_det.quad_ms))
                 if spot is not None:
                     if res is not None:
                         eu = target_det.u - spot["uv"][0]
@@ -2283,7 +2470,6 @@ def main():
                 else:
                     line += " | 光斑: 未检出"
                 if CALIB_LASER:
-                    # 用中位数抑制单帧误检。
                     if cal_u:
                         su = sorted(cal_u)
                         sv = sorted(cal_v)
@@ -2301,10 +2487,6 @@ def main():
                         sum_spot / float(sum_n), sum_show / float(sum_n))
                 line += " | 靶%d/%d 斑%d" % (n_tgt, n_frame, n_spot)
                 print(line)
-                # 分段耗时。
-                print("[PERF] 目标%.0fms/帧 | %s"
-                      % (sum_tgt / float(max(1, sum_n)), prof_line()))
-                prof_reset()
                 sum_grab = 0
                 sum_tgt = 0
                 sum_spot = 0
@@ -2314,15 +2496,7 @@ def main():
             if (n_frame % GC_EVERY) == 0:
                 gc.collect()
     except KeyboardInterrupt:
-        print("已停止")
-    except Exception as e:
-        # 输出完整 traceback，便于在 IDE 中定位。
-        print("[CRASH] %s: %s" % (type(e).__name__, e))
-        try:
-            import sys as _sys
-            _sys.print_exception(e)
-        except Exception:
-            pass
+        print("用户停止")
     finally:
         try:
             sensor.stop()
@@ -2338,4 +2512,5 @@ def main():
         print("已退出")
 
 
-main()
+if __name__ == "__main__":
+    main()

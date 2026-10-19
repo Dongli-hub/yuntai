@@ -277,10 +277,11 @@ class FakeBlob(object):
     外接框中心在透视下会偏 10px 量级）。
     """
 
-    def __init__(self, x, y, w, h, area, cx=None, cy=None):
+    def __init__(self, x, y, w, h, area, cx=None, cy=None, pts=None):
         self._v = (x, y, w, h, area, x + w // 2, y + h // 2)
         self._cx = float(x + w / 2.0) if cx is None else float(cx)
         self._cy = float(y + h / 2.0) if cy is None else float(cy)
+        self._pts = pts
 
     def __getitem__(self, i):
         return self._v[i]
@@ -296,6 +297,18 @@ class FakeBlob(object):
 
     def cyf(self):
         return self._cy
+
+    def min_corners(self):
+        """对应 blob.min_corners()：最小外接矩形的四个角点。"""
+        if self._pts is None or len(self._pts) < 5:
+            x, y, w, h = self._v[0], self._v[1], self._v[2], self._v[3]
+            return ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
+        rect = cv2.minAreaRect(self._pts.astype(np.float32))
+        box = cv2.boxPoints(rect)
+        c = box.mean(axis=0)
+        order = np.argsort(np.arctan2(box[:, 1] - c[1], box[:, 0] - c[0]))
+        box = box[order]
+        return tuple((float(p[0]), float(p[1])) for p in box)
 
 
 class FakeFrame(object):
@@ -352,7 +365,8 @@ class FakeFrame(object):
         return out
 
     def find_blobs(self, thresholds, roi=None, merge=True, margin=4,
-                   pixels_threshold=3, area_threshold=3):
+                   pixels_threshold=3, area_threshold=3,
+                   x_stride=2, y_stride=1):
         """仿真版 find_blobs：在合成场景上做真实 LAB 阈值分割。
         2026-10-11：原来这里是个只认光斑的占位桩，导致仿真里"靶纸检测"
         永远命中 0；现在按 CanMV 语义实现（阈值 -> ROI -> margin 合并 ->
@@ -390,11 +404,13 @@ class FakeFrame(object):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if area < max(int(pixels_threshold), int(area_threshold)):
                 continue
+            ys, xs = np.where(_labels == i)
             out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
                                 int(stats[i, cv2.CC_STAT_TOP]),
                                 int(stats[i, cv2.CC_STAT_WIDTH]),
                                 int(stats[i, cv2.CC_STAT_HEIGHT]), area,
-                                float(_cents[i][0]), float(_cents[i][1])))
+                                float(_cents[i][0]), float(_cents[i][1]),
+                                np.column_stack([xs, ys])))
         return out
 
     def get_histogram(self, *a, **kw):
@@ -464,11 +480,21 @@ class FakeGrayFrame(object):
         self.np = cv2.erode(self.np, kern)
         return self
 
-    def copy(self):
-        """对应 CanMV img.copy()：返回一份独立副本（不改原图）。"""
+    def copy(self, roi=None, **kw):
+        """对应 CanMV img.copy([roi])：返回一份独立副本（不改原图）。"""
         n = FakeGrayFrame.__new__(FakeGrayFrame)
-        n.np = self.np.copy()
+        if roi is None:
+            n.np = self.np.copy()
+        else:
+            x, y, w, h = [int(v) for v in roi]
+            n.np = np.ascontiguousarray(self.np[y:y + h, x:x + w]).copy()
         return n
+
+    def dilate(self, size, **kw):
+        """对应 CanMV img.dilate(size)：核 (2*size+1)²。"""
+        k = 2 * int(size) + 1
+        self.np = cv2.dilate(self.np, np.ones((k, k), np.uint8))
+        return self
 
     def draw_image(self, src, x, y, x_scale=1.0, y_scale=1.0, **kw):
         """对应 CanMV img.draw_image(小图, x, y, x_scale=, y_scale=)：贴回原图。
@@ -521,7 +547,8 @@ class FakeGrayFrame(object):
         return int(self.np[int(y), int(x)])
 
     def find_blobs(self, thresholds, roi=None, merge=True, margin=4,
-                   pixels_threshold=3, area_threshold=3):
+                   pixels_threshold=3, area_threshold=3,
+                   x_stride=2, y_stride=1):
         lo = thresholds[0][0]
         hi = thresholds[0][1]
         mask = np.zeros(self.np.shape, np.uint8)
@@ -543,11 +570,13 @@ class FakeGrayFrame(object):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if area < max(int(pixels_threshold), int(area_threshold)):
                 continue
+            ys, xs = np.where(_labels == i)
             out.append(FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
                                 int(stats[i, cv2.CC_STAT_TOP]),
                                 int(stats[i, cv2.CC_STAT_WIDTH]),
                                 int(stats[i, cv2.CC_STAT_HEIGHT]), area,
-                                float(_cents[i][0]), float(_cents[i][1])))
+                                float(_cents[i][0]), float(_cents[i][1]),
+                                np.column_stack([xs, ys])))
         return out
 
 
@@ -623,7 +652,7 @@ class FakeImage(object):
         pass
 
     def to_grayscale(self):
-        """对应 image.Image(...).to_grayscale()（软件曝光后的 RGB -> 灰度）。"""
+        """对应 image.Image(...).to_grayscale()（RGB -> 灰度）。"""
         f = FakeGrayFrame.__new__(FakeGrayFrame)
         if self.np is None:
             f.np = np.zeros((self.h, self.w), np.uint8)
@@ -632,6 +661,20 @@ class FakeImage(object):
         else:
             f.np = self.np
         return f
+
+    def dilate(self, size, **kw):
+        """对应 image.Image(ALLOC_REF).dilate(size)：就地改 cv_lite 返回的 ndarray。"""
+        k = 2 * int(size) + 1
+        self.np = cv2.dilate(self.np, np.ones((k, k), np.uint8))
+        return self
+
+    def to_numpy_ref(self):
+        return self.np
+
+    def find_blobs(self, *a, **kw):
+        f = FakeGrayFrame.__new__(FakeGrayFrame)
+        f.np = self.np
+        return f.find_blobs(*a, **kw)
 
     def get_pixel(self, x, y):
         p = self.np[int(y), int(x)]
@@ -661,9 +704,9 @@ def install_fake_modules():
         if k >= 3:
             g = cv2.GaussianBlur(g, (k, k), 0)
         e = cv2.Canny(g, int(c1), int(c2))
-        # ⚠ RETR_LIST（不是 RETR_EXTERNAL）：靶子是"黑胶带圈套着白纸"，
-        #   圈的外沿和内沿是两条轮廓，国一那套要靠**内外双轮廓**配对取内框。
-        cnts, _ = cv2.findContours(e, cv2.RETR_LIST,
+        # 与 v2.9.0 的 C 实现一致：RETR_EXTERNAL。新链只取最外层框，
+        # 靶心由框内亮纸块质心给出，不再依赖内轮廓配对。
+        cnts, _ = cv2.findContours(e, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
         H = int(shape[0])
         W = int(shape[1])
@@ -740,14 +783,6 @@ def install_fake_modules():
         return np.dstack([e, e, e]) if g.ndim == 3 else e
 
     cvl.grayscale_find_edges = _fake_find_edges
-
-    def _fake_adjust_exposure(shape, np_img, gain):
-        """对应 cv_lite.rgb888_adjust_exposure_fast（厂家软件曝光，像素乘系数）。"""
-        g = np.asarray(np_img).astype(np.float32) * float(gain)
-        return np.clip(g, 0, 255).astype(np.uint8)
-
-    cvl.rgb888_adjust_exposure_fast = _fake_adjust_exposure
-    cvl.rgb888_adjust_exposure = _fake_adjust_exposure
     sys.modules["cv_lite"] = cvl
 
     class Pin(object):

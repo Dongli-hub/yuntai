@@ -33,7 +33,7 @@ PROTO = os.path.join(ROOT, "Core", "Inc", "gimbal_proto.h")
 #   main   = 整机主循环（状态机/串口/画图），vision_check 只留视觉骨架
 #   log    = main 要写 SD 卡，vision_check 只 print
 #   apply_flip = 相机翻转的兼容写法，两边各自维护
-IGNORE = {"main", "log", "apply_flip"}
+IGNORE = {"main", "log", "apply_flip", "ClosePaperDetector"}
 
 
 def parse(path):

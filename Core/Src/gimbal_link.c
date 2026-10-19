@@ -310,6 +310,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.px_vs      = gp_get_u16(&s_parser.payload[6]);
             s_cmd.flags      = s_parser.payload[8];
             s_cmd.quality    = s_parser.payload[9];
+            s_cmd.vision_seq = s_parser.seq;
             if (s_parser.len >= GP_AIM_PAYLOAD_LEN_K)
             {
                 s_cmd.vis_k_x100 = (uint16_t)gp_get_i16(&s_parser.payload[10]);

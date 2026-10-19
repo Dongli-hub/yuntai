@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""pc_vision_test.py —— 靶纸检测的离线回归（老路删掉之后唯一那条链）
+"""pc_vision_test.py —— 当前 C 层轮廓链的离线回归
 
     python k230_aim/tools/pc_vision_test.py
 
@@ -51,7 +51,7 @@ def main():
         else:
             if res is None:
                 good = False
-                print("%s: FAIL（没锁上）dbg=%s" % (name, g["_GY_DBG"][0]))
+                print("%s: FAIL（没锁上）dbg=%s" % (name, g["_VIS_DBG"][0]))
             else:
                 dx = abs(det.u - cx)
                 dy = abs(det.v - cy)
@@ -110,20 +110,19 @@ def main():
     run("D 无靶(亮底白块)", plain, "none")
 
     # E 带 hint 的寻常路径：给一个"上一帧框"的 hint（锁定后的每一帧都这样），
-    #   结果必须一样准。
-    #   ⚠ 2026-10-16：ROI 裁剪已按用户要求**关掉**（CROP_K=0，见 main.py 说明），
-    #   所以这里**不再断言"喂像素明显变少"**，只查结果是否正确。
+    #   结果必须一样准；同时断言中心 ROI 确实让喂入像素明显变少。
     f = frame_from(np.ascontiguousarray(canvas), g)
     g["_PROF"][1] = 0.0
     g["_PROF"][3] = 0
-    r = g["_cv2_find"](f, (122.0, 105.0, 84.0))
-    fed = g["_PROF"][1] / max(1, g["_PROF"][3])
+    g["_PROF"][5] = 0
+    r = g["_cv2_find"](g["_frame_gray"](f), (122.0, 105.0, 84.0))
+    fed = g["_PROF"][1] / max(1, g["_PROF"][5])
     if r is None:
         print("E 带hint路径: FAIL（没找到）")
         ok = False
     else:
         d = max(abs(r[11] - 105.0), abs(r[12] - 84.0))
-        good = (d <= 6.0)
+        good = (d <= 6.0) and (fed < W * H * 0.5)
         print("E 带hint路径: %s 误差=%.1fpx 喂像素=%.0f万 (全图 %.0f万)"
               % ("OK" if good else "FAIL", d, fed / 10000.0,
                  W * H / 10000.0))
@@ -136,12 +135,12 @@ def main():
     _ox = (W - small.shape[1]) // 2
     _oy = (H - small.shape[0]) // 2
     far[_oy:_oy + small.shape[0], _ox:_ox + small.shape[1]] = small
-    g["_GY_DBG"][0] = ""
+    g["_VIS_DBG"][0] = ""
     rm = g["_cv2_find"](frame_from(np.ascontiguousarray(far), g),
                         (348.0, 320.0, 240.0))
     if rm is None:
         print("M 近远切换RETRY: FAIL（备用核没救回）dbg=%s"
-              % g["_GY_DBG"][0])
+              % g["_VIS_DBG"][0])
         ok = False
     else:
         _tx = _ox + 300.0 * 0.35
@@ -150,11 +149,10 @@ def main():
         good = (dm <= 6.0)
         print("M 近远切换RETRY: %s 靶心=(%.0f,%.0f) 长边=%.0f dbg=%s"
               % ("OK" if good else "FAIL", rm[11], rm[12], rm[5],
-                 g["_GY_DBG"][0]))
+                 g["_VIS_DBG"][0]))
         ok = ok and good
 
-    # G 厚胶带外框：纸很小时胶带很厚，新的掩码轮廓拟合必须仍给**胶带外沿**
-    #   （不是纸边/内沿），靶心由内沿四边形得到。
+    # G 厚胶带：绿框固定跟**纸面内框**，不随胶带外沿/纸边切换。
     garr = np.full((H, W, 3), 120, np.uint8)
     cv2.rectangle(garr, (200, 130), (440, 350), (25, 25, 30), -1)     # 20px 胶带
     cv2.rectangle(garr, (220, 150), (420, 330), (235, 235, 235), -1)  # 小纸
@@ -164,36 +162,36 @@ def main():
         cv2.circle(garr, (320, 240), _rr, (70, 70, 70), 3)
     cv2.circle(garr, (320, 240), 2, (70, 70, 70), -1)
     fg = frame_from(np.ascontiguousarray(garr), g)
-    g["_GY_DBG"][0] = ""
+    g["_VIS_DBG"][0] = ""
     det2 = g["PaperDetector"]()
     res2 = det2.detect(fg)
     if res2 is None:
-        print("G 厚胶带外框: FAIL（没锁上）dbg=%s" % g["_GY_DBG"][0])
+        print("G 厚胶带内框: FAIL（没锁上）dbg=%s" % g["_VIS_DBG"][0])
         ok = False
     else:
         c4 = res2["corners"]
         xs2 = [p[0] for p in c4]
         ys2 = [p[1] for p in c4]
-        # 外框是胶带外沿 200..440/130..350，不是纸边 220..420/150..330。
+        # 纸面是 220..420/150..330；绿框应稳定贴这条内框。
         good = (abs(res2["center"][0] - 320.0) <= 8.0) and \
             (abs(res2["center"][1] - 240.0) <= 8.0) and \
-            (min(xs2) < 210) and (max(xs2) > 430)
-        print("G 厚胶带外框: %s 靶心=(%.0f,%.0f) 框 x %.0f~%.0f y %.0f~%.0f "
+            (min(xs2) > 215) and (max(xs2) < 425)
+        print("G 厚胶带内框: %s 靶心=(%.0f,%.0f) 框 x %.0f~%.0f y %.0f~%.0f "
               "dbg=%s" % ("OK" if good else "FAIL", res2["center"][0],
                           res2["center"][1], min(xs2), max(xs2),
-                          min(ys2), max(ys2), g["_GY_DBG"][0]))
+                          min(ys2), max(ys2), g["_VIS_DBG"][0]))
         ok = ok and good
 
     # H 印刷靶（框 + 同心环）—— 2026-10-16 用户的当前场景：
     #   框是**印在纸上**的（对比度比黑胶带低），纸中间还有 4 圈印刷同心环
-    #   （反向二值化后是白圈，都在框里面）。要求：必须锁上、靶心误差 ≤6px，
+    #   （亮纸阈值下纸面是亮的，同心环是暗的）。要求：必须锁上、靶心误差 ≤6px，
     #   而且**同心环不能把内外配对抢走**（抢走的话靶心会跟着环跑）。
     S.SCENE.printed = True
     try:
         h_img = S.SCENE.render()
-        g["_GY_DBG"][0] = ""
+        g["_VIS_DBG"][0] = ""
         run("H 印刷靶(框+环)", h_img, "hit", cx=300.0, cy=240.0)
-        print("      H dbg=%s" % g["_GY_DBG"][0])
+        print("      H dbg=%s" % g["_VIS_DBG"][0])
     finally:
         S.SCENE.printed = False
 

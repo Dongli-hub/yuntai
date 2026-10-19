@@ -43,7 +43,7 @@ SCALES = (0.85, 0.92, 1.00, 1.08)
 
 
 class GrayFrame(object):
-    """模拟 CanMV 灰度 image：get_pixel 返回单值、copy() 出副本、binary 就地改。"""
+    """模拟 CanMV 灰度 image：copy(roi)、dilate、find_blobs、get_pixel。"""
 
     def __init__(self, arr):
         self.np = arr
@@ -51,8 +51,16 @@ class GrayFrame(object):
     def to_numpy_ref(self):
         return self.np
 
-    def copy(self):
-        return GrayFrame(self.np.copy())
+    def copy(self, roi=None, **kw):
+        if roi is None:
+            return GrayFrame(self.np.copy())
+        x, y, w, h = [int(v) for v in roi]
+        return GrayFrame(np.ascontiguousarray(self.np[y:y + h, x:x + w]).copy())
+
+    def dilate(self, size, **kw):
+        k = 2 * int(size) + 1
+        self.np = cv2.dilate(self.np, np.ones((k, k), np.uint8))
+        return self
 
     def to_grayscale(self):
         return self
@@ -60,25 +68,9 @@ class GrayFrame(object):
     def get_pixel(self, x, y):
         return int(self.np[int(y), int(x)])
 
-    def binary(self, thresholds, **kw):
-        lo = thresholds[0][0]
-        hi = thresholds[0][1]
-        m = (self.np >= lo) & (self.np <= hi)
-        self.np = np.where(m, 255, 0).astype(np.uint8)
-        return self
-
-    def close(self, size, **kw):
-        k = 2 * int(size) + 1
-        self.np = cv2.morphologyEx(self.np, cv2.MORPH_CLOSE,
-                                   np.ones((k, k), np.uint8))
-        return self
-
-    def b_or(self, other):
-        self.np = cv2.bitwise_or(self.np, other.np)
-        return self
-
     def find_blobs(self, thresholds, roi=None, merge=True, margin=4,
-                   pixels_threshold=3, area_threshold=3):
+                   pixels_threshold=3, area_threshold=3,
+                   x_stride=2, y_stride=1):
         """对应 CanMV 灰度图 find_blobs（纸块兜底要用）：返回 FakeBlob（含质心）。"""
         lo = thresholds[0][0]
         hi = thresholds[0][1]
@@ -101,22 +93,14 @@ class GrayFrame(object):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if area < max(int(pixels_threshold), int(area_threshold)):
                 continue
+            ys, xs = np.where(_labels == i)
             out.append(S.FakeBlob(int(stats[i, cv2.CC_STAT_LEFT]),
                                   int(stats[i, cv2.CC_STAT_TOP]),
                                   int(stats[i, cv2.CC_STAT_WIDTH]),
                                   int(stats[i, cv2.CC_STAT_HEIGHT]), area,
-                                  float(cents[i][0]), float(cents[i][1])))
+                                  float(cents[i][0]), float(cents[i][1]),
+                                  np.column_stack([xs, ys])))
         return out
-
-    def draw_line(self, *a, **kw):
-        pass
-
-    def draw_cross(self, *a, **kw):
-        pass
-
-    def draw_rectangle(self, *a, **kw):
-        pass
-
 
 def load_prog():
     """把 main.py 原文 exec 进来（去掉末尾的 main() 调用）—— 和 pc_vision_test 同款。"""
@@ -188,13 +172,12 @@ def main():
                 dy = abs(res["center"][1] - ty)
                 good = (dx <= tol) and (dy <= tol)
                 print("   亮度x%.2f: %s 靶心=(%.1f,%.1f) 长边=%.0f "
-                      "误差=(%.1f,%.1f) 第%d帧锁上 图=%s"
+                      "误差=(%.1f,%.1f) 第%d帧锁上 dbg=%s"
                       % (sc, "OK" if good else "FAIL", res["center"][0],
                          res["center"][1], res["long_side"], dx, dy, tries,
-                         g["_GY_SRC_DBG"][0]))
-                # 锁定后的第二帧会带 hint。134r 修的那个 bug 就在这里：
-                # 旧代码拿"本帧内框长边"去和"上一帧外框长边"比，外框/内框
-                # 两套尺度会互相抢。同一张图连续两帧必须还锁在同一个外框上。
+                         g["_VIS_DBG"][0]))
+                # 锁定后的第二帧会带 hint：同一张图连续两帧必须还锁在
+                # 同一个外框上，长边和中心都不能跳。
                 res2 = det.detect(GrayFrame(np.ascontiguousarray(gray.copy())))
                 if res2 is None:
                     print("     锁定复测: FAIL（同一张图第二帧丢了）")
