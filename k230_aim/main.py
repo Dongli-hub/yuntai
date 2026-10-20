@@ -57,7 +57,7 @@ IMG_H = PROC_H
 S_SCALE = PROC_W / 640.0    # 像素常数缩放系数（640 档 = 1.0，800 档 = 1.25）
 VIS_K = 7.8 * S_SCALE       # px/°（现场标定 7.8 @640x480，随分辨率同比缩放）
 USE_CLOSE_DETECTOR = False  # True=新灰度闭运算检测器；False=10.13 已验证检测器
-GRAY_DIRECT = USE_CLOSE_DETECTOR
+GRAY_DIRECT = True
 CLOSE_BIN_TH = 130          # 二值化阈值
 CLOSE_MORPH_SIZE = 1        # close(1) = 3x3
 FULL_FRAME_CLOSE = True
@@ -92,7 +92,7 @@ PAPER_DENSITY_QUAD_MIN = 0.65
 PAPER_DENSITY_NEAR_MIN = 0.72  # 近处纸面应明显更实心（大背景块密度约 0.6~0.7）
 PAPER_CONTRAST_MIN = 30    # 内亮度 - 外亮度（0~255 量程）
 PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
-PAPER_DARK_FRAC_MIN = 0.55  # 外侧 12 点里至少这么多比例更暗
+PAPER_DARK_FRAC_MIN = 0.80  # 外侧 12 点里至少 10 点比纸暗
 QUAD_SCAN_N = 3            # 每边取几行/几列做扫描
 QUAD_PERP_PX = 1           # 扫描时垂直方向各看几像素
 QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
@@ -182,9 +182,9 @@ SPOT_ADAPT_LIMIT = 6.0     # 单次最多修正多少像素
 SPOT_PREF_PX = int(round(70 * S_SCALE))
 SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]   # 最近一次找到的激光点，主循环每帧更新
 USE_FIXED_LASER = True
-LASER_UV = (int(round(312 * S_SCALE)), int(round(252 * S_SCALE)))
+LASER_UV = (int(round(323 * S_SCALE)), int(round(246 * S_SCALE)))
 
-AUTO_CALIB_LASER = True
+AUTO_CALIB_LASER = False
 CALIB_FRAMES = 60          # 标定取多少帧（≈1.5~2s）
 CALIB_MIN_N = 12           # 至少检出多少帧才算数
 CALIB_SHIFT_MAX = 30.0     # 中位数离标称值最大偏移（px）
@@ -757,6 +757,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
     so = 0
     ni = 0
     no = 0
+    outer_vals = []
     if use_arr:
         get_luma = px_luma_arr
     else:
@@ -768,6 +769,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
             ni += 1
     for p in o:
         v = get_luma(img, p[0], p[1])
+        outer_vals.append(v)
         if v >= 0:
             so += v
             no += 1
@@ -775,8 +777,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
         return -1, -1, 0.0
     ins = si / float(ni)
     ok = 0
-    for p in o:
-        v = get_luma(img, p[0], p[1])
+    for v in outer_vals:
         if v >= 0 and v < (ins - PAPER_DARK_MARGIN):
             ok += 1
     return ins, so / float(no), ok / float(no)
@@ -1208,40 +1209,42 @@ class PaperDetector(object):
         self.lost = 0
         self.meas = None
         self.corners = None
-        self.pend = None       # [cu, cv, long, cnt, miss]
+        self.pend = None
         self.frame = 0
         self.last_n = 0
         self.last_dbg = ""
-        # 上一帧所有候选的外接框（给 vision_check 的二值化预览画框用）：
-        # (x, y, w, h, 1=过闸门 / 0=被拒)。最多记 8 个，别把内存撑起来。
         self.cands = []
         self.did_full = False
         self.state = "搜索"
         self.err = 0
         self.err_msg = ""
-        # 上一帧"被采纳"的四边形长边：尺寸闸门必须拿同一个量比较
-        # （以前拿的是外接框 max(w,h)，和 quad 长边不是一个量 -> 退远时误杀，见 _size_ok）
         self.last_long = 0.0
+        self.vel_u = 0.0
+        self.vel_v = 0.0
+        self.prev_cu = None
+        self.prev_cv = None
 
-    def roi(self):
-        # 窗口半径 = 长边×TRACK_K + 外扩量。
-        # ⚠ 2026-10-10 现场日志：1.47m 丢靶那一帧是"候选0"——窗口里一个亮块
-        #   都没有。远处靶纸小、窗口半径只有 0.5×88+35 = 79px，手一推/一窜，
-        #   画面里的目标就能跳出去。所以远处（L<200px）把外扩量线性加大到
-        #   TRACK_PAD_FAR；近处（纸大）窗口本来就够大，保持 35 省时间。
-        L = max(self.w, self.h)
-        if L < 200.0:
-            k = (200.0 - L) / 140.0
-            if k > 1.0:
-                k = 1.0
-            elif k < 0.0:
-                k = 0.0
-            pad = TRACK_PAD + (TRACK_PAD_FAR - TRACK_PAD) * k
-        else:
-            pad = TRACK_PAD
-        r = int(L * TRACK_K) + int(pad)
-        x = int(self.u - r)
-        y = int(self.v - r)
+    def roi(self, expand=1.0):
+        L = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
+        pu = self.u + self.vel_u * 0.70
+        pv = self.v + self.vel_v * 0.70
+        if pu < 0:
+            pu = 0
+        elif pu >= IMG_W:
+            pu = IMG_W - 1
+        if pv < 0:
+            pv = 0
+        elif pv >= IMG_H:
+            pv = IMG_H - 1
+        _v = abs(self.vel_u)
+        if abs(self.vel_v) > _v:
+            _v = abs(self.vel_v)
+        r = int(L * 0.60 + 18 + min(36.0, _v * 2.0))
+        if self.lost > 0:
+            r += min(TRACK_PAD_FAR, self.lost * 8)
+        r = int(r * expand)
+        x = int(pu - r)
+        y = int(pv - r)
         if x < 0:
             x = 0
         if y < 0:
@@ -1257,27 +1260,23 @@ class PaperDetector(object):
     def fresh(self):
         return self.have and (self.lost < HOLD_FRAMES)
 
-    def _size_ok(self, long_side):
+    def _size_ok(self, long_side, density=0.0, contrast=0.0):
         if not self.have:
             return True
-        # ⚠ 2026-10-10 逻辑修正：以前拿 max(w,h)（**外接框**长边）来比，
-        #   而 long_side 是**四边形**长边 —— 两个量在斜视/退远时差很多：
-        #   日志实例：外接框还停在 180px，四边形长边已缩到 100px，
-        #   结果 100 < 0.65×180 被当成"换目标"丢掉 -> 直接丢靶。
-        #   改成和"上一帧被采纳的四边形长边"比（同一种量）。
         old = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
         lo = SIZE_GATE_LO
         hi = SIZE_GATE_HI
         if self.lost > 0:
-            # 丢靶滑行期间闸门放宽（2026-10-10）：车在动/正在退远时靶纸尺寸变化快，
-            # 跟踪对象又是"上一帧被采纳的尺寸"，卡太紧会把真靶纸判成"换目标"。
-            # 每多丢一帧多放 2%，最多放到 0.6 倍系数。
             k = 1.0 - 0.02 * self.lost
             if k < 0.6:
                 k = 0.6
             lo = SIZE_GATE_LO * k
             hi = SIZE_GATE_HI / k
-        return (lo * old) <= long_side <= (hi * old)
+        if (lo * old) <= long_side <= (hi * old):
+            return True
+        return (density >= SIZE_RESCUE_DENSITY) and \
+               (contrast >= SIZE_RESCUE_CONTRAST) and \
+               (0.35 * old <= long_side <= SIZE_RESCUE_MAX * old)
 
     def _confirm(self, cand):
         """全图候选的连续确认。返回 True = 确认为目标。"""
@@ -1288,12 +1287,6 @@ class PaperDetector(object):
                     self.pend = None
             return False
         cu, cv, lo = cand[11], cand[12], cand[5]
-        # 重新锁定也要过尺寸合理性：纸不可能在半秒里变成 1/4 大
-        # （现场日志里锁到背景 71px 亮块就是这个口子漏的）。
-        # ⚠ 2026-10-11 深夜：窗口 100 帧(4~5s) 太长、0.40 倍太紧 —— 现场
-        #   "先锁近处大靶再退远"时远处纸只有 ~100px，0.40*322=129 > 100 被卡，
-        #   要等满 5 秒才放开，表现就是"远处怎么都对不上"。改成丢靶 30 帧
-        #   (≈1s) / 0.30~3.0 倍；防误锁还有 对比/暗边/密度/激光点优先 四道关。
         if self.have and (self.lost < 30):
             old = max(self.w, self.h)
             if (lo < 0.30 * old) or (lo > 3.0 * old):
@@ -1302,9 +1295,6 @@ class PaperDetector(object):
         if self.pend is None:
             self.pend = [cu, cv, lo, 1, 0]
             if CONFIRM_N <= 1:
-                # "一帧即锁"（用户 2026-10-11）：AGC 把纸面压暗时，纸面只在个别
-                # 帧能单独成块（日志 [7929px 内126 外47 ✓] 那种闪光帧），要等
-                # 第二帧一致永远等不到 -> 直接确认。
                 self.pend = None
                 return True
             return False
@@ -1327,30 +1317,35 @@ class PaperDetector(object):
     def _accept(self, cand):
         x, y, w, h = cand[1], cand[2], cand[3], cand[4]
         c = cand[10]
-        cu, cv = cand[11], cand[12]      # 四边形对角线交点 = 透视中心
-        # ---- 防"测到的目标乱跳"（见 JUMP_REJECT_PX 说明）----
-        # 已经锁着的时候，单帧中心突然跑 60px 以上、尺寸还同时大变 —— 那不是
-        # 目标在动（30fps 下相当于 1800px/s），是误检。直接丢，当这次没测到。
-        if self.have and (self.lost == 0):
-            if abs(cu - self.u) > JUMP_REJECT_PX:
+        cu, cv = cand[11], cand[12]
+        old_l = self.last_long if self.last_long > 1.0 \
+            else max(self.w, self.h)
+        if self.have and (self.lost < LOST_FULL):
+            _jump = max(JUMP_REJECT_PX * 0.55, old_l * 0.45) + 20.0
+            _jump += self.lost * 8.0
+            if abs(cu - self.u) > _jump:
                 return False
-            if abs(cv - self.v) > JUMP_REJECT_PX:
+            if abs(cv - self.v) > _jump:
                 return False
-            # 尺寸也一样：一帧之内长边变 45% 以上 = 换目标了（整张纸 <-> 碎片/
-            # 激光光斑），必须丢掉。真实目标一帧的尺寸变化只有几个百分点。
-            old_l = self.last_long if self.last_long > 1.0 \
-                else max(self.w, self.h)
             if old_l > 1.0:
-                if (cand[5] < 0.55 * old_l) or (cand[5] > 1.80 * old_l):
+                if (cand[5] < 0.40 * old_l) or (cand[5] > 2.50 * old_l):
                     return False
         if (not self.have) or (self.lost >= LOST_FULL):
-            # 首次锁定 / 丢靶很久后的重新锁定：旧的平滑中心早没意义了，直接吸附
             self.u, self.v, self.w, self.h = cu, cv, w, h
             self.have = True
             self.corners = c
+            self.prev_cu, self.prev_cv = cu, cv
         else:
-            # 靶纸小（远）时平滑做强一点：远处中心估计本来就抖
-            k = SMOOTH_FAR if (0.0 < cand[5] < FAR_LONG_PX) else SMOOTH
+            if (self.lost == 0) and (self.prev_cu is not None):
+                self.vel_u = 0.5 * self.vel_u + 0.5 * (cu - self.prev_cu)
+                self.vel_v = 0.5 * self.vel_v + 0.5 * (cv - self.prev_cv)
+            self.prev_cu, self.prev_cv = cu, cv
+            if 0.0 < cand[5] < FAR_LONG_PX:
+                k = SMOOTH_FAR
+            elif cand[5] >= QUAD_NEAR_LONG:
+                k = SMOOTH_NEAR
+            else:
+                k = SMOOTH
             if abs(cu - self.u) > DEADBAND_PX:
                 self.u += k * (cu - self.u)
             if abs(cv - self.v) > DEADBAND_PX:
@@ -1359,8 +1354,6 @@ class PaperDetector(object):
                 self.w += k * (w - self.w)
             if abs(h - self.h) > 2 * DEADBAND_PX:
                 self.h += k * (h - self.h)
-            # 四边形四角也做时间平滑：现场"比"逐帧在 1.26<->1.44 来回跳，
-            # 画出来就抖；平滑后绿框稳定（靶心用 u,v，本来就平滑）
             if c is not None:
                 if self.corners is None:
                     self.corners = c
@@ -1372,21 +1365,23 @@ class PaperDetector(object):
                         sc.append((ax + k * (c[i][0] - ax),
                                    ay + k * (c[i][1] - ay)))
                     self.corners = tuple(sc)
+            else:
+                self.corners = None
         self.meas = cand
         self.lost = 0
         self.state = "锁定"
-        self.last_long = cand[5]      # 记住这次采纳的四边形长边（给尺寸闸门用）
+        self.last_long = cand[5]
         return True
 
     def detect(self, img):
         self.frame += 1
-        # 自适应亮度阈值（亮场景抬高、暗场景降低），再算一个兜底档
         th_ad = scene_th(img, self.frame)
-        # 兜底档：每 3 帧补一次全图，单双拍方向不同 ——
-        #   偶数拍 +8（更严）：背景把纸面糊住时抓"更亮的芯"；
-        #   奇数拍 -6（更松）：AGC 把纸面压暗、主阈值把纸切没时抓回来。
-        # （2026-10-11 现场：远处丢靶后再转回画面，纸面只有个别帧能过闸门，
-        #   两个方向各补一半机会。两个方向都有过实测依据。）
+        if (PAPER_TH_NEAR_FIXED > 0) and self.have and \
+                (self.lost < LOST_FULL) and \
+                (self.last_long >= QUAD_NEAR_LONG):
+            th_ad = PAPER_TH_NEAR_FIXED
+            _scene_cache[1] = float(th_ad)
+            _scene_cache[2] = 4.0
         if (self.frame % 8) == 0:
             th_alt = th_ad + 8
             if th_alt > 84:
@@ -1399,27 +1394,29 @@ class PaperDetector(object):
         n = 0
         dbg = ""
         self.did_full = False
+        _stable = (self.lost == 0)
+        _seed_every = 24 if _stable else SEED_EVERY
+        _recheck_every = 60 if _stable else RE_CHECK_EVERY
         try:
             if self.have and self.lost < LOST_FULL:
-                if ((self.frame % SEED_EVERY) == 0) or (self.meas is None):
+                if ((self.frame % _seed_every) == 0) or (self.meas is None):
                     cand, n, dbg = self._find(img, self.roi(), th_ad)
                 else:
-                    # 隔帧只做四边形复测（省 ~13ms），靶心仍每帧更新；
-                    # 复测失败立刻补一次完整搜索。
                     cand, n, dbg = self._find(img, self.roi(), th_ad,
                                               self.meas)
                     if cand is None:
                         cand, n, dbg = self._find(img, self.roi(), th_ad)
-                if (cand is not None) and (not self._size_ok(cand[5])):
+                    if cand is None:
+                        _roi2 = self.roi(1.6)
+                        cand, n, dbg = self._find(img, _roi2, th_ad)
+                if (cand is not None) and \
+                        (not self._size_ok(cand[5], cand[7],
+                                           cand[8] - cand[9])):
                     dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
                     cand = None
-                # ---- 全图复查（2026-10-11 深夜新增）----
-                # 现场问题：锁到旁边的白色物体后，窗口搜索只在那附近打转，靶纸
-                # 就在画面中央也不再看一眼。每 RE_CHECK_EVERY 帧做一次全图复查：
-                # 全图里若有"评分 ≥1.6 倍 + 尺寸合理 + 位置差>40px"的合法候选，
-                # 直接切过去（截图4 的误锁：真纸 38310 分 vs 白物 2228 分）。
-                if (self.frame % RE_CHECK_EVERY) == 0:
-                    cb, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H), th_ad)
+                if (self.frame % _recheck_every) == 0:
+                    cb, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
+                                            th_ad, prefer=False)
                     self.did_full = True
                     n += n2
                     if cb is not None:
@@ -1439,19 +1436,12 @@ class PaperDetector(object):
                         if self.meas is not None:
                             old_con = max(self.meas[8] - self.meas[9], 0.0)
                         new_con = max(cb[8] - cb[9], 0.0)
-                        # 换目标判据（任一成立）：
-                        #   ① 激光点在它身上、不在当前目标身上；
-                        #   ② 评分高 1.6 倍；
-                        #   ③ 对比度高一大截（真纸"白纸+黑边"对比 90~110，误锁的
-                        #      大暗块只有 20~50；这条专治"锁到大块后评分换不动"）。
                         if ((cbn and not cun) or (new_s > 1.6 * old_s) or
                                 (new_con >= 60 and new_con >= 1.5 * old_con)) \
                                 and \
                                 (abs(cb[11] - self.u) +
                                  abs(cb[12] - self.v) > 40) and \
                                 (0.35 * cur_l <= cb[5] <= 3.0 * cur_l):
-                            # 直接吸附换目标（不走 _accept 的防跳闸门——
-                            # 这是"纠正锁错对象"，不是"目标乱跳"）
                             self.u, self.v = cb[11], cb[12]
                             self.w, self.h = cb[3], cb[4]
                             self.corners = cb[10]
@@ -1469,25 +1459,10 @@ class PaperDetector(object):
                                     "contrast": cb[8] - cb[9], "n": n,
                                     "state": self.state,
                                     "corners": self.corners}
-                # ⚠ 2026-10-10：这里原来还有一条"窗口失败 -> 中间区域/全图再搜一次"。
-                #   用户明确要求：比赛里丢靶就算失败，main.py 不做"找靶"。
-                #   把它删掉有两个好处：
-                #   ① 省掉每帧最多两次全图 find_blobs（远处"目标耗时 100ms"就是它）；
-                #   ② 不会再出现"拿着错误差满图乱找 -> 偏置被推飞"的剧烈晃动。
-                #   短暂漏检（<LOST_FULL 帧）仍由上面的窗口搜索兜住。
             else:
-                # 开机第一次找靶 / 丢靶超过 LOST_FULL 帧后的重新找靶：
-                # **每帧全图搜**（2026-10-11 用户意见）。
-                # ⚠ 2026-10-11 修 bug：原来这里写的是 elif not self.have ——
-                #   锁定过又丢靶超过 25 帧之后，两个分支都不进，检测器就永远
-                #   "候选0"什么都不看了（现场日志：靶=搜索(跟踪窗) 候选0 几百帧，
-                #   云台对着靶纸也不动）。用户说的"不做找靶"指的是别乱扫，
-                #   靶回到画面里时必须能重新抓住。
                 self.did_full = True
                 c2, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H), th_ad)
                 if c2 is None and ((self.frame % 4) == 0):
-                    # 兜底阈值档每 4 帧补一次（全图一遍 ~35ms，1/4 频率省时间；
-                    # 单双拍方向由 frame%8 决定，见上面 th_alt 的注释）
                     c3, n3, d3 = self._find(img, (0, 0, IMG_W, IMG_H),
                                             th_alt)
                     c2, n2, d2 = c3, n2 + n3, d2 + d3
@@ -1505,11 +1480,11 @@ class PaperDetector(object):
         self.last_dbg = dbg
         if cand is not None:
             if not self._accept(cand):
-                # 判为"误检"（中心跳太远）：这一帧按"没测到"处理，
-                # 但平滑中心保持不变（滑行），避免被错误目标把云台推走。
                 cand = None
         if cand is None:
             self.lost += 1
+            self.vel_u *= 0.5
+            self.vel_v *= 0.5
             if self.pend is not None:
                 self.state = "确认%d/%d" % (self.pend[3], CONFIRM_N)
             elif (not self.have) or (self.lost >= LOST_FULL):
@@ -1524,28 +1499,26 @@ class PaperDetector(object):
                 "long_side": long_side, "contrast": ins - outs, "n": n,
                 "state": self.state, "corners": self.corners}
 
-    def _find(self, img, roi, th, seed=None):
+    def _find(self, img, roi, th, seed=None, prefer=None):
         """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。
 
         seed=上次测量元组时走快速复测（只重扫四边形，不找亮块）。"""
         if seed is not None:
             return _requad(img, seed)
+        if prefer is None:
+            prefer = self.have and (self.lost == 0)
         best = None
         n = 0
         dbg = ""
-        self.cands = []            # 本帧所有候选（预览画框用，见 __init__）
+        self.cands = []
+        if GRAY_DIRECT:
+            _gth = int(max(0, min(255, th * 255 / 100.0)))
+            _thresholds = [(_gth, 255)]
+        else:
+            _thresholds = [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
+                            -PAPER_B_MAX, PAPER_B_MAX)]
         blobs = img.find_blobs(
-            [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
-              -PAPER_B_MAX, PAPER_B_MAX)],
-            # margin：2026-10-10 2 -> 4。远距离时纸面被印刷圈/阴影切成碎片，
-            # 间隙只有 1~3px，margin=2 合不起来（日志里全是"框73/81px 的碎片"）；
-            # 而黑胶带在 1.3m 还有 ~7px 宽、2m 也有 ~4px，margin=4 不会把纸
-            # 和背景粘在一起（当初 6 才会）。这是"整块/碎片来回跳"的正解。
-            # ⚠ 2026-10-11 深夜定案：上面这套"margin 合并"整个作废 ——
-            #   find_blobs 的 merge 是按**外接框**合并的，背景大块的外接框罩住
-            #   靶纸就会把靶纸吞掉（现场日志：只剩 "18 万像素 框640 ✗框长"，
-            #   真靶纸永远不作为候选出现）。改成 merge=False + merge_fragments()
-            #   自己按"像不像靶纸"拼碎片，规则写在 merge_fragments 里。
+            _thresholds,
             roi=roi, merge=False,
             area_threshold=PAPER_MIN_AREA,
             pixels_threshold=PAPER_MIN_AREA)
@@ -1561,10 +1534,13 @@ class PaperDetector(object):
             if w < 8 or h < 8:
                 continue
             box_long = w if w > h else h
-            ins, outs, frac = paper_contrast(img, x, y, w, h)
             why = ""
             corners = None
             qa = 0.0
+            ins = 0
+            outs = 0
+            frac = 0.0
+            near_sides = 4
             ctr = (x + w / 2.0, y + h / 2.0)
             if box_long < PAPER_MIN_LONG * 0.8 or \
                     box_long > PAPER_MAX_LONG * 1.3:
@@ -1572,28 +1548,32 @@ class PaperDetector(object):
                 long_side = box_long
                 short_side = w if w < h else h
                 density = px / float(w * h)
+            elif box_long > (PAPER_ASPECT_MAX * 1.3) * min(w, h):
+                why = "比例"
+                long_side = box_long
+                short_side = w if w < h else h
+                density = px / float(w * h)
             else:
+                ins, outs, frac = paper_contrast(img, x, y, w, h)
                 q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
                 if q is not None:
                     corners, ctr, long_side, short_side, qa = q
                     if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
-                        corners = None        # 拟合和亮块对不上，弃用
-                    elif long_side < 0.70 * box_long:
-                        # 2026-10-11：四边形明显小于外接框 = 边缘扫描在阴影/印刷圈
-                        # 处提前收住（2.7m 实测 框52 而四边形 44），退回外接框。
-                        # ⚠ 0.90 -> 0.70（30 号日志）：**靶纸在画面里被转开/掠射时，
-                        #   外接框天生比纸大**（斜 30° 时 框297 而四边形长边 245，
-                        #   比值 0.82）—— 0.90 会把这种"好四边形"也弃掉，退回外接框
-                        #   再被密度门槛卡死。0.70 只拦真正塌缩的拟合。
                         corners = None
-                    elif _quad_angle_bad(corners):
-                        # QGimbal-Vision 同款"四角接近 90°"判据：斜得离谱/乱接边
-                        # 的四边形直接弃用（退回外接框，仍受其它闸门约束）。
+                    elif (box_long >= QUAD_NEAR_LONG) and \
+                            ((long_side < QUAD_NEAR_SIDE_K * box_long) or
+                             (qa < QUAD_NEAR_FILL_K * w * h) or
+                             _quad_inside_bad(corners, x, y, w, h,
+                                              QUAD_NEAR_EDGE_K)):
+                        corners = None
+                    elif long_side < 0.70 * box_long:
+                        corners = None
+                    elif _quad_angle_bad(
+                            corners,
+                            QUAD_NEAR_COS_LIM
+                            if box_long >= QUAD_NEAR_LONG else 0.574):
                         corners = None
                     else:
-                        # 角点不能跑到亮块外框太远（否则就是某条边越过胶带摸到
-                        # 背景亮边）。超了就退回外接框：宁可稳的正矩形，
-                        # 也不要乱跳的梯形。
                         lim = QUAD_LIM_PAD + 8
                         for p in corners:
                             if (p[0] < x - lim) or (p[0] > x + w + lim) or \
@@ -1605,15 +1585,39 @@ class PaperDetector(object):
                     short_side = w if w < h else h
                     density = px / float(w * h)
                     dens_min = PAPER_DENSITY_MIN
-                    # 掠射/斜视时靶纸被压扁、外接框填充率会掉到 ~0.5，但它
-                    # "内亮外黑"极强（30 号日志：对比 73~92、暗边 83~100%）；
-                    # "木柜把纸当洞"的假块对比只有 53~65 —— 所以按对比分档。
                     if (ins - outs) >= PAPER_CONTRAST_STRONG:
                         dens_min = PAPER_DENSITY_MIN_STRONG
+                    if (box_long >= QUAD_NEAR_LONG) and \
+                            (dens_min < PAPER_DENSITY_NEAR_MIN):
+                        dens_min = PAPER_DENSITY_NEAR_MIN
                     ctr = (x + w / 2.0, y + h / 2.0)
+                    if box_long >= QUAD_NEAR_LONG:
+                        near_sides = paper_frame_sides(
+                            img, x, y, w, h, ins)
                 else:
+                    if box_long >= QUAD_NEAR_LONG:
+                        qx = qx2 = corners[0][0]
+                        qy = qy2 = corners[0][1]
+                        for p in corners:
+                            if p[0] < qx:
+                                qx = p[0]
+                            elif p[0] > qx2:
+                                qx2 = p[0]
+                            if p[1] < qy:
+                                qy = p[1]
+                            elif p[1] > qy2:
+                                qy2 = p[1]
+                        qins, qouts, qfrac = paper_contrast(
+                            img, qx, qy, qx2 - qx, qy2 - qy)
+                        if qins >= 0:
+                            ins, outs, frac = qins, qouts, qfrac
+                        near_sides = paper_frame_sides(
+                            img, qx, qy, qx2 - qx, qy2 - qy, ins)
                     density = px / max(1.0, qa)
                     dens_min = PAPER_DENSITY_QUAD_MIN
+                    if (box_long >= QUAD_NEAR_LONG) and \
+                            (dens_min < PAPER_DENSITY_NEAR_MIN):
+                        dens_min = PAPER_DENSITY_NEAR_MIN
                 aspect = long_side / max(1.0, short_side)
                 if px < PAPER_MIN_AREA:
                     why = "面积"
@@ -1625,32 +1629,23 @@ class PaperDetector(object):
                 elif aspect < PAPER_ASPECT_MIN or \
                         aspect > PAPER_ASPECT_MAX:
                     why = "比例"
-                elif (density < dens_min) or (density > 1.08):
-                    # 上限 1.08：四边形面积比亮块还小 8% 以上 = 拟合塌缩在亮块
-                    # 内部（现场日志 [长边67px 密1.54] 那种远处误锁就是这么来的；
-                    # 真靶纸实测 密 0.78~1.02，四边形只会比亮块大、不会小）。
+                elif (density < dens_min) or \
+                        (density > (QUAD_NEAR_DENSITY_HI
+                                    if (corners is not None and
+                                        box_long >= QUAD_NEAR_LONG)
+                                    else 1.08)):
                     why = "密度"
+                elif (box_long >= QUAD_NEAR_LONG) and (near_sides < 3):
+                    why = "黑框"
                 elif ((x <= 1) or (y <= 1) or
                       ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1)) and \
                         (corners is None) and (box_long < 90):
-                    # ⚠ 2026-10-11 修正：上一版写"贴边 + 四边形拟合成功才采纳"，
-                    #   但这是**死循环** —— 靶纸被转到画面边时角点必然跑到画面外，
-                    #   四边形一定拟合失败 -> 还是被贴边丢掉。现场日志实证：
-                    #   [39775px 框258 内202 外127 暗边100% ✗贴边] 就是这么丢的。
-                    #   现在：贴边 + 拟合失败 + **块够大(>=90px)** -> 判为
-                    #   "被画面裁掉的靶纸"，放行（用外接框中心，略偏但比丢靶好）；
-                    #   只有"贴边 + 拟合失败 + 块也小"才是噪声/背景边缘，才弃。
-                    #   120 -> 90（2026-10-11 深夜）：远处纸从画面边缘进入时只有
-                    #   ~100px（日志 [5419px 框102 内156 外108 暗边92% ✗贴边]
-                    #   每一帧都在），120 的刀把它一直挡在外面。
                     why = "贴边"
                 elif ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
                     why = "对比"
                 elif frac < PAPER_DARK_FRAC_MIN:
                     why = "暗边"
             if n <= 6:
-                # 带上密度 + 是"四"(四边形)还是"框"(外接框)——现场复盘时一眼看出
-                # 是哪条路被哪道闸门挡住（30 号日志那次就是因为没这个数，查了一轮）。
                 dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
                     px, box_long, ins, outs, frac * 100.0, density,
                     ("四" if corners is not None else "框"),
@@ -1660,8 +1655,11 @@ class PaperDetector(object):
             if why:
                 continue
             score = px * (0.5 + min(ins - outs, 80) / 80.0)
-            # 选优：激光点附近的候选优先（激光打在谁身上谁才是靶纸），
-            # 同一档里再比评分（面积×对比）。
+            score *= 0.5 + 0.5 * (density if density < 1.0 else 1.0)
+            if prefer and self.have and self.last_long > 1.0:
+                d = abs(ctr[0] - self.u) + abs(ctr[1] - self.v)
+                ds = abs(long_side - self.last_long) / self.last_long
+                score *= 1.0 / (1.0 + d / 80.0 + ds * 2.0)
             dc = abs(ctr[0] - SPOT_UV[0]) + abs(ctr[1] - SPOT_UV[1])
             key = (1 if dc <= SPOT_PREF_PX else 0, score)
             if best is None or key > best[0]:
@@ -1669,6 +1667,19 @@ class PaperDetector(object):
                               ins, outs, corners, ctr[0], ctr[1]))
         if best is None:
             return None, n, dbg
+        bx, by, bw, bh = best[1][1], best[1][2], best[1][3], best[1][4]
+        keep = []
+        for cb in self.cands:
+            ccx = cb[0] + cb[2] * 0.5
+            ccy = cb[1] + cb[3] * 0.5
+            is_best = (cb[0] == bx and cb[1] == by and
+                       cb[2] == bw and cb[3] == bh)
+            if (not is_best) and (bx <= ccx <= bx + bw) and \
+                    (by <= ccy <= by + bh):
+                continue
+            keep.append((cb[0], cb[1], cb[2], cb[3],
+                         1 if is_best else 0))
+        self.cands = keep
         return best[1], n, dbg
 
 
@@ -2480,8 +2491,10 @@ def main():
     print("=" * 60)
     print("K230 瞄准程序启动  %dx%d (S=%.2f K=%.2fpx/°)  靶纸=白纸亮块+暗框"
           % (IMG_W, IMG_H, S_SCALE, VIS_K))
-    log("[CFG] 检测=灰度直出+二值闭运算 显示=无 逐帧SD示踪=%s"
-        % ("开" if TRACE_EVERY > 0 else "关"))
+    log("[CFG] 检测=%s 显示=无 逐帧SD示踪=%s"
+        % ("灰度直出+连续白块/暗框" if GRAY_DIRECT
+           else "RGB+连续白块/暗框",
+           "开" if TRACE_EVERY > 0 else "关"))
     print("=" * 60)
     global _log_f
     if LOG_TO_FILE:

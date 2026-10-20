@@ -72,7 +72,7 @@ PAPER_DENSITY_QUAD_MIN = 0.65
 PAPER_DENSITY_NEAR_MIN = 0.72
 PAPER_CONTRAST_MIN = 30
 PAPER_DARK_MARGIN = 25
-PAPER_DARK_FRAC_MIN = 0.55
+PAPER_DARK_FRAC_MIN = 0.80
 QUAD_SCAN_N = 3
 QUAD_PERP_PX = 1
 QUAD_AREA_LO = 0.50
@@ -129,7 +129,7 @@ SPOT_ADAPT_LIMIT = 6.0
 SPOT_PREF_PX = int(round(70 * S_SCALE))
 SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]
 USE_FIXED_LASER = True
-LASER_UV = (int(round(312 * S_SCALE)), int(round(252 * S_SCALE)))
+LASER_UV = (int(round(323 * S_SCALE)), int(round(246 * S_SCALE)))
 CALIB_LASER = False
 
 
@@ -389,6 +389,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
     so = 0
     ni = 0
     no = 0
+    outer_vals = []
     if use_arr:
         get_luma = px_luma_arr
     else:
@@ -400,6 +401,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
             ni += 1
     for p in o:
         v = get_luma(img, p[0], p[1])
+        outer_vals.append(v)
         if v >= 0:
             so += v
             no += 1
@@ -407,8 +409,7 @@ def paper_contrast(img, x, y, w, h, use_arr=False):
         return -1, -1, 0.0
     ins = si / float(ni)
     ok = 0
-    for p in o:
-        v = get_luma(img, p[0], p[1])
+    for v in outer_vals:
         if v >= 0 and v < (ins - PAPER_DARK_MARGIN):
             ok += 1
     return ins, so / float(no), ok / float(no)
@@ -844,21 +845,32 @@ class PaperDetector(object):
         self.err = 0
         self.err_msg = ""
         self.last_long = 0.0
+        self.vel_u = 0.0
+        self.vel_v = 0.0
+        self.prev_cu = None
+        self.prev_cv = None
 
-    def roi(self):
-        L = max(self.w, self.h)
-        if L < 200.0:
-            k = (200.0 - L) / 140.0
-            if k > 1.0:
-                k = 1.0
-            elif k < 0.0:
-                k = 0.0
-            pad = TRACK_PAD + (TRACK_PAD_FAR - TRACK_PAD) * k
-        else:
-            pad = TRACK_PAD
-        r = int(L * TRACK_K) + int(pad)
-        x = int(self.u - r)
-        y = int(self.v - r)
+    def roi(self, expand=1.0):
+        L = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
+        pu = self.u + self.vel_u * 0.70
+        pv = self.v + self.vel_v * 0.70
+        if pu < 0:
+            pu = 0
+        elif pu >= IMG_W:
+            pu = IMG_W - 1
+        if pv < 0:
+            pv = 0
+        elif pv >= IMG_H:
+            pv = IMG_H - 1
+        _v = abs(self.vel_u)
+        if abs(self.vel_v) > _v:
+            _v = abs(self.vel_v)
+        r = int(L * 0.60 + 18 + min(36.0, _v * 2.0))
+        if self.lost > 0:
+            r += min(TRACK_PAD_FAR, self.lost * 8)
+        r = int(r * expand)
+        x = int(pu - r)
+        y = int(pv - r)
         if x < 0:
             x = 0
         if y < 0:
@@ -948,7 +960,12 @@ class PaperDetector(object):
             self.u, self.v, self.w, self.h = cu, cv, w, h
             self.have = True
             self.corners = c
+            self.prev_cu, self.prev_cv = cu, cv
         else:
+            if (self.lost == 0) and (self.prev_cu is not None):
+                self.vel_u = 0.5 * self.vel_u + 0.5 * (cu - self.prev_cu)
+                self.vel_v = 0.5 * self.vel_v + 0.5 * (cv - self.prev_cv)
+            self.prev_cu, self.prev_cv = cu, cv
             if 0.0 < cand[5] < FAR_LONG_PX:
                 k = SMOOTH_FAR
             elif cand[5] >= QUAD_NEAR_LONG:
@@ -1003,21 +1020,27 @@ class PaperDetector(object):
         n = 0
         dbg = ""
         self.did_full = False
+        _stable = (self.lost == 0)
+        _seed_every = 24 if _stable else SEED_EVERY
+        _recheck_every = 60 if _stable else RE_CHECK_EVERY
         try:
             if self.have and self.lost < LOST_FULL:
-                if ((self.frame % SEED_EVERY) == 0) or (self.meas is None):
+                if ((self.frame % _seed_every) == 0) or (self.meas is None):
                     cand, n, dbg = self._find(img, self.roi(), th_ad)
                 else:
                     cand, n, dbg = self._find(img, self.roi(), th_ad,
                                               self.meas)
                     if cand is None:
                         cand, n, dbg = self._find(img, self.roi(), th_ad)
+                    if cand is None:
+                        _roi2 = self.roi(1.6)
+                        cand, n, dbg = self._find(img, _roi2, th_ad)
                 if (cand is not None) and \
                         (not self._size_ok(cand[5], cand[7],
                                            cand[8] - cand[9])):
                     dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
                     cand = None
-                if (self.frame % RE_CHECK_EVERY) == 0:
+                if (self.frame % _recheck_every) == 0:
                     cb, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
                                             th_ad, prefer=False)
                     self.did_full = True
@@ -1086,6 +1109,8 @@ class PaperDetector(object):
                 cand = None
         if cand is None:
             self.lost += 1
+            self.vel_u *= 0.5
+            self.vel_v *= 0.5
             if self.pend is not None:
                 self.state = "确认%d/%d" % (self.pend[3], CONFIRM_N)
             elif (not self.have) or (self.lost >= LOST_FULL):
@@ -1112,9 +1137,14 @@ class PaperDetector(object):
         n = 0
         dbg = ""
         self.cands = []
+        if GRAY_DIRECT:
+            _gth = int(max(0, min(255, th * 255 / 100.0)))
+            _thresholds = [(_gth, 255)]
+        else:
+            _thresholds = [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
+                            -PAPER_B_MAX, PAPER_B_MAX)]
         blobs = img.find_blobs(
-            [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
-              -PAPER_B_MAX, PAPER_B_MAX)],
+            _thresholds,
             roi=roi, merge=False,
             area_threshold=PAPER_MIN_AREA,
             pixels_threshold=PAPER_MIN_AREA)
@@ -1130,10 +1160,12 @@ class PaperDetector(object):
             if w < 8 or h < 8:
                 continue
             box_long = w if w > h else h
-            ins, outs, frac = paper_contrast(img, x, y, w, h)
             why = ""
             corners = None
             qa = 0.0
+            ins = 0
+            outs = 0
+            frac = 0.0
             near_sides = 4
             ctr = (x + w / 2.0, y + h / 2.0)
             if box_long < PAPER_MIN_LONG * 0.8 or \
@@ -1142,7 +1174,13 @@ class PaperDetector(object):
                 long_side = box_long
                 short_side = w if w < h else h
                 density = px / float(w * h)
+            elif box_long > (PAPER_ASPECT_MAX * 1.3) * min(w, h):
+                why = "比例"
+                long_side = box_long
+                short_side = w if w < h else h
+                density = px / float(w * h)
             else:
+                ins, outs, frac = paper_contrast(img, x, y, w, h)
                 q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
                 if q is not None:
                     corners, ctr, long_side, short_side, qa = q
@@ -1863,7 +1901,9 @@ class ClosePaperDetector(PaperDetector):
         self.close_hit = False
         return PaperDetector.detect(self, img)
 
-
+# ============================================================================
+#  视觉：激光光斑
+# ============================================================================
 class SpotDetector(object):
     def __init__(self):
         self.u = IMG_W / 2.0
