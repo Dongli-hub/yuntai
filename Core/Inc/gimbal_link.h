@@ -29,7 +29,6 @@
 typedef struct
 {
     uint8_t mode;              /* GP_MODE_xxx */
-    uint8_t laser;             /* 1 = 请求点激光 */
     uint8_t aim_valid;         /* 上位机本帧视觉有效 */
     uint8_t flags;             /* 原始 flags，备用 */
     uint8_t boost;             /* 拐角加强中 */
@@ -40,6 +39,12 @@ typedef struct
     uint8_t unwind_dps;        /* 解绕速度 (°/s)，来自 UNWIND 消息 */
     uint16_t px_ut, px_vt;     /* 靶心像素坐标（K230 上报） */
     uint16_t px_us, px_vs;     /* 激光光斑像素坐标 */
+    int16_t vis_err_u_px;      /* 新视觉协议：靶心-激光的 U 像素差 */
+    int16_t vis_err_v_px;      /* 新视觉协议：靶心-激光的 V 像素差 */
+    uint8_t vis_direct_error;  /* 1 = 使用上面的直接像素差，不再相减 */
+    float   vis_yaw_deg;       /* ASCII 原版视觉协议：偏航角误差 */
+    float   vis_pitch_deg;     /* ASCII 原版视觉协议：俯仰角误差 */
+    uint8_t vis_direct_angle;  /* 1 = 直接使用上面的角度误差 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */

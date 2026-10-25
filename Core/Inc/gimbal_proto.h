@@ -41,6 +41,8 @@
  *   [8]    flags  [9] quality
  *   [10..11] kx100 = 像素/度 × 100（i16 小端）—— 可选，见下。
  * ut/vt = 靶心像素，us/vs = 激光光斑像素。
+ * 0x16：新 K230 视觉直接发送靶心减激光的像素差（各 int16 像素），
+ *       后跟 flags(u8) + quality(u8)，H723 收到后直接进入 AIM。
  * 头部 seq = 视觉帧序号：只有 K230 产生新检测结果时才 +1。
  * 同一视觉帧可以重复发送（喂看门狗），重复包的 seq 不变。
  *
@@ -53,6 +55,8 @@
 #define GP_MSG_AIM            0x10u    /* 下：视觉像素坐标上报（30Hz 保持，核心指令） */
 #define GP_AIM_PAYLOAD_LEN    10u      /* AIM payload 长度（老格式：无 K） */
 #define GP_AIM_PAYLOAD_LEN_K  12u      /* AIM payload 长度（新格式：带 kx100） */
+#define GP_MSG_AIM_ERROR_PX   0x16u    /* 下：直接像素差，err_u/err_v + flags + quality */
+#define GP_AIM_ERROR_PAYLOAD_LEN 6u
 #define GP_MSG_MODE           0x11u    /* 下：工作模式 */
 #define GP_MSG_HEARTBEAT      0x12u    /* 下：心跳 */
 #define GP_MSG_SET_ZERO       0x13u    /* 下：把当前朝向记为偏置零点 */

@@ -307,9 +307,9 @@
 
 /* ---- 偏航偏置的变化率限幅 ----
  * 视觉只有约 3 FPS，偏置是每帧一次的阶梯信号。250°/s 会在两帧之间把
- * 一个误检跳变直接甩成几十度；压到 80°/s，既能在 0.2s 内走完常见的
+ * 一个误检跳变直接甩成几十度；压到 60°/s，既能在 0.2s 内走完常见的
  * 十几度修正，又不会让机构跟着单帧噪声猛冲。 */
-#define YAW_TGT_RATE_DPS        80.0f
+#define YAW_TGT_RATE_DPS        60.0f
 #define YAW_RETURN_RATE_DPS     60.0f
 
 /* ---- 偏航静摩擦补偿（2026-09-30 新增）----
@@ -389,10 +389,10 @@
                                          /* 现场"持续上下晃"= 典型的积分+延迟低频振荡，
                                           * 俯仰积分原来比偏航强 40 倍（18 vs 0.44 rpm/(deg·s)），
                                           * 收到 12 之后再靠 D 压。 */
-#define PITCH_KD                 0.08f  /* 2026-10-14: 0.05->0.08（配合 KP 15 一起提速；
+#define PITCH_KD                 0.12f  /* 2026-10-24: 0.20->0.12（降低编码器噪声引起的抖动；
                                          * 2026-10-10: 0.03->0.05（偏置已有斜坡，误差曲线连续，
                                          /* 可以多给一点阻尼；再大就会放大编码器量化噪声） */
-#define PITCH_OUT_RPM          120.0f   /* 约 720°/s，够甩开了 */
+#define PITCH_OUT_RPM           80.0f   /* 约 480°/s；限制捕获瞬间的冲击 */
 #define PITCH_ILIM               0.70f  /* 积分限幅；2026-10-09：0.40 -> 0.70
                                          /* ki*ilim = 14rpm > 脱困转速(约10rpm)，
                                           * 这样积分才推得动轴，消掉"俯仰死区"。原注释：
@@ -402,9 +402,16 @@
 #define PITCH_DEADZONE_DEG       0.03f  /* 死区，抑制编码器量化噪声 */
 #define PITCH_FF_RPM_PER_RADS   15.0f   /* ≈1.6 倍理论抵消量 */
 #define PITCH_FF_SIGN          (-1.0f)
-#define PITCH_TRAVEL_LIMIT_DEG  80.0f   /* 相对上电位置的行程软限位 */
-#define PITCH_TGT_RATE_DPS     150.0f   /* 俯仰目标角速率限幅（防饱和打摆，见控制里说明） */
+#define PITCH_TRAVEL_LIMIT_DEG  95.0f   /* 相对上电位置的行程软限位 */
+#define PITCH_TGT_RATE_DPS      60.0f   /* 视觉目标斜坡，避免捕获瞬间猛跳 */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
+#define AUTO_SEARCH_ENABLE             1
+#define AUTO_START_PITCH_UP_DEG        10.0f
+#define AUTO_SEARCH_YAW_RATE_DPS       45.0f
+#define AUTO_SEARCH_PITCH_STEP_DEG      5.0f
+#define AUTO_SEARCH_PITCH_LIMIT_DEG    90.0f
+#define AUTO_SEARCH_PITCH_SLEW_DPS      8.0f
+#define AUTO_SEARCH_PITCH_SIGN         -1.0f
 /* 底盘转速前馈（0x12）用的偏航电机反馈新鲜度上限：反馈断流/过期就把前馈停掉，
  * 免得拿着几十毫秒前的旧转速当"底盘在转"去给一脚。 */
 #define YAW_BASE_FF_FB_TIMEOUT_MS 50u
@@ -469,24 +476,6 @@
 #define UNWIND_RPM_MIN           15.0f  /* 下限：低于脱困转速就推不动，解绕会"卡住不动" */
 #define UNWIND_KP                  8.0f /* rpm/deg，相对角闭环 */
 #define UNWIND_TOL_DEG             3.0f /* 相对角进这个范围就算解绕完成 */
-
-/* ---- 激光输出（可选）----
- *
- * 当前接法：激光直接接电源，【上电就常亮】-> LASER_ALWAYS_ON = 1。
- *   此时固件不去控制激光（也控制不了），但会【如实】把"激光是亮的"
- *   报给上位机（遥测 flags 的 LASER_ON 位恒为 1），
- *   也不再打印会误导人的 [LASER] ON/OFF 日志。
- *
- * 以后接了 GPIO 控制线（PC4 是空闲脚，接激光模块的 MOS/驱动输入）：
- *   把 LASER_GPIO_ENABLE 改成 1、LASER_ALWAYS_ON 改成 0 即可。
- *
- * 为什么以后要接：发挥部分(3) 画圆要求"起跑前关激光"，
- * 否则靶心会留下一个孤立深斑 + 一条径向拖痕，D2 直接超差。
- */
-#define LASER_GPIO_ENABLE          0
-#define LASER_ALWAYS_ON            1
-#define LASER_GPIO_PORT         GPIOC
-#define LASER_PIN               GPIO_PIN_4
 
 /* ==========================================================================
  * 二、内部状态
@@ -564,9 +553,21 @@ static float      g_plat_dtheta;    /* 平台俯仰相对基准的变化量（ra
 static float      g_plat_comp;      /* 当前生效的平台俯仰补偿量（deg，含变化率限幅） */
 static float      g_pitch_motor_lock;/* 上电锁定的俯仰电机角（deg） */
 static float      g_pitch_tgt_deg;  /* 当前俯仰目标（deg），仅用于调试打印 */
+static uint8_t    g_auto_search_active;
+static uint8_t    g_auto_search_raster;
+static uint8_t    g_target_seen_once;
+static uint8_t    g_auto_search_acquired_now;
+static uint8_t    g_auto_search_valid_streak;
+static uint8_t    g_auto_search_last_seq;
+static float      g_auto_search_pitch_offset_deg;
+static float      g_auto_search_pitch_magnitude_deg;
+static uint8_t    g_auto_search_pitch_up;
+static float      g_auto_search_yaw_sweep_deg;
+static float      g_auto_search_yaw_target_deg;
+static float      g_pitch_search_base;
+static uint32_t   g_auto_search_log_ms;
 
 static uint8_t    g_fault;
-static uint8_t    g_laser_on;
 static uint32_t   g_runaway_ms;
 static float      g_pitch_pos_deg;  /* 调试用 */
 static uint8_t    g_unwind_done;    /* 本次解绕是否已完成并重锁过基准 */
@@ -588,6 +589,8 @@ static uint32_t g_last_err_read_ms;
  * 是现场"顶不住/一跳一跳/指令无效"的样子。回读到不对（连续 2 次）就重写一次。*/
 static uint8_t  g_yaw_mode_bad_cnt;
 static uint8_t  g_pitch_mode_bad_cnt;
+static uint8_t  g_yaw_mode_recoveries;
+static uint8_t  g_pitch_mode_recoveries;
 static uint8_t  g_yaw_mode_rb = 0xFFu;    /* 最近回读到的模式（0xFF=还没读到）*/
 static uint8_t  g_pitch_mode_rb = 0xFFu;
 static uint8_t  g_yaw_loop_rb = 0xFFu;    /* 最近回读到的"闭环使能"状态 */
@@ -622,7 +625,8 @@ static uint8_t  g_yaw_torque_bak;    /* 力矩脚本启动前的模式设置（�
  * 电流脉冲比一比（见 g_yaw_test_run==3 那段），判不出来就保持 +1，靠控制环里
  * 那道 >3.5rad/s 的保命闸兜底。*/
 static float    g_torque_sign = 1.0f;
-static uint8_t  g_torque_sign_checked;   /* 开机只自动查一次 */
+/* Torque polarity is already calibrated on this gimbal. */
+static uint8_t  g_torque_sign_checked = 1u;
 static float    g_sign_int_plus, g_sign_int_minus;
 static float    g_iq_filt;               /* 力矩指令一阶低通状态（防高频颤动）*/
 /* ---- 力矩指令下发节拍（2026-10-13，见控制环里的说明）----
@@ -991,44 +995,6 @@ static void fmt_f(char *out, int cap, float v, int decimals)
 }
 
 /* ==========================================================================
- * 四、激光输出
- * ========================================================================== */
-
-static void laser_init(void)
-{
-#if LASER_GPIO_ENABLE
-    GPIO_InitTypeDef gpio = {0};
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    HAL_GPIO_WritePin(LASER_GPIO_PORT, LASER_PIN, GPIO_PIN_RESET);
-    gpio.Pin   = LASER_PIN;
-    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
-    gpio.Pull  = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(LASER_GPIO_PORT, &gpio);
-#endif
-}
-
-static void laser_apply(uint8_t on)
-{
-#if LASER_ALWAYS_ON
-    /* 激光硬件常亮：不控制，只如实上报状态 */
-    (void)on;
-    g_laser_on = 1u;
-#else
-    if (on == g_laser_on)
-    {
-        return;
-    }
-    g_laser_on = on;
-#if LASER_GPIO_ENABLE
-    HAL_GPIO_WritePin(LASER_GPIO_PORT, LASER_PIN,
-                      on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-#endif
-    gimbal_link_log(on ? "[LASER] ON" : "[LASER] OFF");
-#endif
-}
-
-/* ==========================================================================
  * 五、编码器反馈
  * ========================================================================== */
 
@@ -1140,16 +1106,22 @@ static void yuntai_read_feedback(uint32_t now)
             else if (mb <= 5u)
             {
                 g_yaw_mode_bad_cnt++;
-                /* ⚠ 2026-10-13：**只告警、不重写**（同 CLOSED_LOOP 处说明：
-                 * 运行期反复写会清掉驱动器内部状态）。*/
                 if (g_yaw_mode_bad_cnt >= 2u)
                 {
                     g_yaw_mode_bad_cnt = 0u;
+                    if (g_yaw_mode_recoveries < 3u)
+                    {
+                        g_yaw_mode_recoveries++;
+                        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                            expect);
+                        jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+                    }
                     {
                         char eb[64];
                         snprintf(eb, sizeof(eb),
-                                 "[MOTOR] WARN yaw mode=%u expect=%u",
-                                 (unsigned)mb, (unsigned)expect);
+                                 "[MOTOR] yaw mode=%u expect=%u retry=%u",
+                                 (unsigned)mb, (unsigned)expect,
+                                 (unsigned)g_yaw_mode_recoveries);
                         gimbal_link_log(eb);
                     }
                 }
@@ -1210,11 +1182,19 @@ static void yuntai_read_feedback(uint32_t now)
                 if (g_pitch_mode_bad_cnt >= 2u)
                 {
                     g_pitch_mode_bad_cnt = 0u;
+                    if (g_pitch_mode_recoveries < 3u)
+                    {
+                        g_pitch_mode_recoveries++;
+                        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                                            expect_p);
+                        jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+                    }
                     {
                         char eb[64];
                         snprintf(eb, sizeof(eb),
-                                 "[MOTOR] WARN pit mode=%u expect=%u",
-                                 (unsigned)mb, (unsigned)expect_p);
+                                 "[MOTOR] pit mode=%u expect=%u retry=%u",
+                                 (unsigned)mb, (unsigned)expect_p,
+                                 (unsigned)g_pitch_mode_recoveries);
                         gimbal_link_log(eb);
                     }
                 }
@@ -1307,12 +1287,18 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_LIMIT_PITCH_DEG 20.0f
 #define VIS_FREEZE_MS       150u     /* 多久没有新帧 -> 冻住偏置 */
 #define VIS_DEADBAND_PX     3.0f     /* 像素死区（防图像噪声被积分） */
+#define VIS_DIRECT_DEADBAND_YAW_DEG   0.05f
+#define VIS_DIRECT_DEADBAND_PITCH_DEG 0.05f
 /* 像素误差一阶滤波：0.7 -> 0.8 -> 0.9（新帧才更新）。群延迟 =(1-α)/α×帧周期
  * （帧周期 ≈30ms）：0.7→12ms、0.8→6ms、0.9→3ms。
  * ⚠(37) 这条延迟直接决定"能用的环路增益上限"（相位余量），所以在
  *   打不动执行机构迟滞的前提下，这里每削 3ms 都是白赚的。
  *   0.9 的代价是误差噪声多一点；配合 3px 死区 + 速率滤波已经够用。*/
 #define VIS_EMA             0.9f
+/* The vision frame only updates the destination. The actual target advances
+ * continuously at the control-loop rate so the torque loop does not receive a
+ * hold-step-hold sequence once per camera frame. */
+#define VIS_TARGET_TAU_S     0.045f
 /* ---- 瞬态闸门（2026-10-11 移植自原 K230 侧，治"直角弯甩靶"）----
  * 现场（21 号日志）：过直角弯时平台被底盘拖着转，视觉误差瞬间冲到 40~50px；
  * 旧外环把这段"转弯滞后"当真实误差积分，2 秒就把偏置卷到 40°+（平台绝对
@@ -1347,13 +1333,22 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  *   "被甩时不要把假误差卷进偏置"的保护还在：①这个连续缩放；②偏置
  *   anti-windup（指令顶限幅时不再往同方向涨）。参考代码里没有这一层。*/
 #define VIS_GATE_DPS        35.0f    /* 平台自转角速度门限（°/s） */
+#define VIS_JUMP_PX          45.0f   /* 单帧靶心跳变门限（px，两轴和） */
+#define VIS_JUMP_CONFIRM_N   2u      /* 跳变连续确认帧数 */
+#define VIS_JUMP_DEG          8.0f   /* 直接角度模式下的单帧跳变门限 */
+#define VIS_ACQUIRE_MAX_YAW_DEG   30.0f
+#define VIS_ACQUIRE_MAX_PITCH_DEG  8.0f
 
 static float    g_vis_eu, g_vis_ev;              /* 滤波后的像素误差 */
 static float    g_vis_yaw_off, g_vis_pitch_off;  /* 外环输出：偏置（度） */
+static float    g_vis_yaw_target_deg;             /* 最新视觉目标 */
+static float    g_vis_pitch_target_deg;
+static uint8_t  g_vis_target_valid;
 static uint32_t g_vis_last_ms;                   /* 已处理的帧时间戳 */
 static uint8_t  g_vis_seen;                      /* 是否已收到过有效帧 */
 static float    g_vis_rate_u, g_vis_rate_v;      /* 误差变化率（px/s，滤波） */
 static float    g_vis_eu_prev, g_vis_ev_prev;    /* 上一帧原始误差 */
+static uint8_t  g_vis_jump_cnt;                  /* 跳变确认计数 */
 static float    g_vis_gate_scale = 1.0f;         /* 瞬态连续缩放因子（1=不限制） */
 static float    g_vis_k_override = 0.0f;         /* 手动覆盖 K（GP_PARAM_VIS_K，0=不覆盖） */
 static float    g_vis_kp_yaw = VIS_KP_YAW;       /* 可在线改（PARAM 0x0E） */
@@ -1400,15 +1395,20 @@ static void vis_outer_reset(void)
     g_vis_ev = 0.0f;
     g_vis_yaw_off = 0.0f;
     g_vis_pitch_off = 0.0f;
+    g_vis_yaw_target_deg = 0.0f;
+    g_vis_pitch_target_deg = 0.0f;
+    g_vis_target_valid = 0u;
     g_vis_seen = 0u;
     g_vis_last_ms = 0u;
     g_vis_rate_u = 0.0f;
     g_vis_rate_v = 0.0f;
     g_vis_eu_prev = 0.0f;
     g_vis_ev_prev = 0.0f;
+    g_vis_jump_cnt = 0u;
     g_vis_gate_scale = 1.0f;
 }
 
+#if 0
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                            uint32_t now, float dt, float gyro_z_dps)
 {
@@ -1428,33 +1428,75 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         g_vis_last_ms = cmd->px_ms;
         if (cmd->aim_valid)
         {
-            float eu = (float)cmd->px_ut - (float)cmd->px_us;
-            float ev = (float)cmd->px_vt - (float)cmd->px_vs;
-            /* 误差变化率（px/s，一阶滤波）——瞬态闸门判据用 */
-            g_vis_rate_u += 0.5f * (((eu - g_vis_eu_prev) / dtf) -
-                                    g_vis_rate_u);
-            g_vis_rate_v += 0.5f * (((ev - g_vis_ev_prev) / dtf) -
-                                    g_vis_rate_v);
-            g_vis_eu_prev = eu;
-            g_vis_ev_prev = ev;
-            if (fabsf(eu) < (VIS_DEADBAND_PX * ks))
+            float eu = (cmd->vis_direct_angle != 0u)
+                       ? (cmd->vis_yaw_deg * k)
+                       : ((cmd->vis_direct_error != 0u)
+                          ? (float)cmd->vis_err_u_px
+                          : ((float)cmd->px_ut - (float)cmd->px_us));
+            float ev = (cmd->vis_direct_angle != 0u)
+                       ? (cmd->vis_pitch_deg * k)
+                       : ((cmd->vis_direct_error != 0u)
+                          ? (float)cmd->vis_err_v_px
+                          : ((float)cmd->px_vt - (float)cmd->px_vs));
+            if ((g_vis_seen == 0u) &&
+                (g_auto_search_acquired_now == 0u) &&
+                ((fabsf(eu) > (VIS_ACQUIRE_MAX_YAW_DEG * k)) ||
+                 (fabsf(ev) > (VIS_ACQUIRE_MAX_PITCH_DEG * k))))
             {
-                eu = 0.0f;
+                g_vis_jump_cnt = 0u;
+                return;
             }
-            if (fabsf(ev) < (VIS_DEADBAND_PX * ks))
+            uint8_t jump_hold = 0u;
+            /* 平台没有明显自转时，单帧几十像素的跳变更像误检/靶心跳变；
+             * 连续两帧都跳才认作真实快速运动，避免一帧错误点直接推偏置。 */
+            if ((g_vis_seen != 0u) &&
+                    ((fabsf(eu - g_vis_eu_prev) +
+                      fabsf(ev - g_vis_ev_prev)) > VIS_JUMP_PX) &&
+                    (fabsf(gyro_z_dps) < VIS_GATE_DPS))
             {
-                ev = 0.0f;
-            }
-            if (g_vis_seen == 0u)
-            {
-                g_vis_eu = eu;      /* 第一帧直接落座（不慢慢爬） */
-                g_vis_ev = ev;
-                g_vis_seen = 1u;
+                if (g_vis_jump_cnt < (VIS_JUMP_CONFIRM_N - 1u))
+                {
+                    g_vis_jump_cnt++;
+                    jump_hold = 1u;
+                }
+                else
+                {
+                    g_vis_jump_cnt = 0u;
+                }
             }
             else
             {
-                g_vis_eu += VIS_EMA * (eu - g_vis_eu);
-                g_vis_ev += VIS_EMA * (ev - g_vis_ev);
+                g_vis_jump_cnt = 0u;
+            }
+            if (jump_hold == 0u)
+            {
+                /* 误差变化率（px/s，一阶滤波）——瞬态闸门判据用 */
+                g_vis_rate_u += 0.5f * (((eu - g_vis_eu_prev) / dtf) -
+                                        g_vis_rate_u);
+                g_vis_rate_v += 0.5f * (((ev - g_vis_ev_prev) / dtf) -
+                                        g_vis_rate_v);
+                g_vis_eu_prev = eu;
+                g_vis_ev_prev = ev;
+                if (fabsf(eu) < (VIS_DEADBAND_PX * ks))
+                {
+                    eu = 0.0f;
+                }
+                if (fabsf(ev) < (VIS_DEADBAND_PX * ks))
+                {
+                    ev = 0.0f;
+                }
+                if (g_vis_seen == 0u)
+                {
+                    g_vis_eu = eu;      /* 第一帧直接落座（不慢慢爬） */
+                    g_vis_ev = ev;
+                    g_vis_seen = 1u;
+                    g_auto_search_acquired_now = 0u;
+                }
+                else
+                {
+                    g_vis_eu += VIS_EMA * (eu - g_vis_eu);
+                    g_vis_ev += VIS_EMA * (ev - g_vis_ev);
+                }
             }
         }
     }
@@ -1519,6 +1561,183 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                                  -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
     }
 }
+#endif
+
+/**
+ * Direct visual target update.
+ *
+ * Each valid frame moves the previous absolute target toward the pose plus
+ * physical residual. The yaw/pitch inner PIDs remain the only PIDs.
+ */
+static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
+                           uint32_t now, float dt, float gyro_z_dps)
+{
+    float yaw_deg, pitch_deg;
+    float filtered_yaw, filtered_pitch;
+    uint8_t jump_hold = 0u;
+    uint8_t new_frame;
+    const float k = vis_k_px_deg(cmd);
+    const float rad2deg = 57.29578f;
+
+    if ((mode != GP_MODE_AIM) || (g_auto_search_active != 0u) ||
+        (cmd->rx_count == 0u))
+    {
+        g_vis_yaw_off = 0.0f;
+        g_vis_pitch_off = 0.0f;
+        g_vis_yaw_target_deg = 0.0f;
+        g_vis_pitch_target_deg = 0.0f;
+        g_vis_target_valid = 0u;
+        return;
+    }
+    /* Hold through a short dropout; an explicit 404 still switches to STAB. */
+    if ((cmd->aim_valid == 0u) || ((now - cmd->px_ms) > VIS_FREEZE_MS))
+    {
+        return;
+    }
+    new_frame = (uint8_t)(cmd->px_ms != g_vis_last_ms);
+    if (new_frame != 0u)
+    {
+        if (cmd->vis_direct_angle != 0u)
+        {
+            yaw_deg = cmd->vis_yaw_deg;
+            pitch_deg = cmd->vis_pitch_deg;
+        }
+        else if (cmd->vis_direct_error != 0u)
+        {
+            yaw_deg = (float)cmd->vis_err_u_px / k;
+            pitch_deg = (float)cmd->vis_err_v_px / k;
+        }
+        else
+        {
+            yaw_deg = ((float)cmd->px_ut - (float)cmd->px_us) / k;
+            pitch_deg = ((float)cmd->px_vt - (float)cmd->px_vs) / k;
+        }
+
+        if ((g_vis_seen == 0u) && (g_auto_search_acquired_now == 0u) &&
+            ((fabsf(yaw_deg) > VIS_ACQUIRE_MAX_YAW_DEG) ||
+             (fabsf(pitch_deg) > VIS_ACQUIRE_MAX_PITCH_DEG)))
+        {
+            g_vis_last_ms = cmd->px_ms;
+            return;
+        }
+
+        if ((g_vis_seen != 0u) &&
+            ((fabsf(yaw_deg - g_vis_eu_prev) +
+              fabsf(pitch_deg - g_vis_ev_prev)) > VIS_JUMP_DEG) &&
+            (fabsf(gyro_z_dps) < VIS_GATE_DPS))
+        {
+            if (g_vis_jump_cnt < (VIS_JUMP_CONFIRM_N - 1u))
+            {
+                g_vis_jump_cnt++;
+                jump_hold = 1u;
+            }
+            else
+            {
+                g_vis_jump_cnt = 0u;
+            }
+        }
+        else
+        {
+            g_vis_jump_cnt = 0u;
+        }
+        g_vis_last_ms = cmd->px_ms;
+
+        if (jump_hold == 0u)
+        {
+            g_vis_eu_prev = yaw_deg;
+            g_vis_ev_prev = pitch_deg;
+            if (g_vis_seen == 0u)
+            {
+                filtered_yaw = yaw_deg;
+                filtered_pitch = pitch_deg;
+                g_vis_seen = 1u;
+                g_auto_search_acquired_now = 0u;
+            }
+            else
+            {
+                filtered_yaw = g_vis_eu + VIS_EMA * (yaw_deg - g_vis_eu);
+                filtered_pitch = g_vis_ev + VIS_EMA * (pitch_deg - g_vis_ev);
+            }
+            g_vis_eu = filtered_yaw;
+            g_vis_ev = filtered_pitch;
+            if (fabsf(filtered_yaw) < VIS_DIRECT_DEADBAND_YAW_DEG)
+            {
+                filtered_yaw = 0.0f;
+            }
+            if (fabsf(filtered_pitch) < VIS_DIRECT_DEADBAND_PITCH_DEG)
+            {
+                filtered_pitch = 0.0f;
+            }
+
+            g_vis_yaw_target_deg = clampf(
+                (angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * rad2deg) +
+                    VIS_SIGN_YAW * filtered_yaw,
+                -g_vis_limyaw_deg, g_vis_limyaw_deg);
+            g_vis_pitch_target_deg = clampf(
+                ((g_pitch_fb.seen != 0u)
+                    ? (g_pitch_fb.cont - g_pitch_motor_lock)
+                    : g_vis_pitch_off) +
+                    VIS_SIGN_PITCH * filtered_pitch,
+                -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
+            g_vis_target_valid = 1u;
+        }
+    }
+
+    if (g_vis_target_valid != 0u)
+    {
+        float dt_safe = clampf(dt, 0.001f, 0.02f);
+        float alpha = dt_safe / (VIS_TARGET_TAU_S + dt_safe);
+        g_vis_yaw_off += alpha * (g_vis_yaw_target_deg - g_vis_yaw_off);
+        g_vis_pitch_off += alpha * (g_vis_pitch_target_deg - g_vis_pitch_off);
+        g_vis_yaw_off = clampf(g_vis_yaw_off,
+                               -g_vis_limyaw_deg, g_vis_limyaw_deg);
+        g_vis_pitch_off = clampf(g_vis_pitch_off,
+                                 -VIS_LIMIT_PITCH_DEG,
+                                 VIS_LIMIT_PITCH_DEG);
+    }
+}
+
+static void yuntai_startup_search_start(void)
+{
+    g_pitch_search_base = g_pitch_motor_lock;
+    g_auto_search_pitch_offset_deg = 0.0f;
+    g_auto_search_pitch_magnitude_deg = 0.0f;
+    g_auto_search_pitch_up = 1u;
+    g_auto_search_yaw_sweep_deg = 0.0f;
+    g_auto_search_yaw_target_deg = 0.0f;
+    g_auto_search_valid_streak = 0u;
+    g_auto_search_last_seq = gimbal_link_cmd()->vision_seq;
+    g_auto_search_active = (uint8_t)AUTO_SEARCH_ENABLE;
+    g_auto_search_raster = 0u;
+    if (g_auto_search_active != 0u)
+    {
+        gimbal_link_log("[SEARCH] initial pitch-up 10deg");
+    }
+}
+
+static void yuntai_lost_search_start(void)
+{
+    if (g_target_seen_once == 0u)
+    {
+        yuntai_startup_search_start();
+        return;
+    }
+
+    g_pitch_search_base = g_pitch_motor_lock;
+    g_auto_search_pitch_offset_deg = 0.0f;
+    g_auto_search_pitch_magnitude_deg = 0.0f;
+    g_auto_search_pitch_up = 1u;
+    g_auto_search_yaw_sweep_deg = 0.0f;
+    g_auto_search_yaw_target_deg = 0.0f;
+    g_auto_search_valid_streak = 0u;
+    g_auto_search_last_seq = gimbal_link_cmd()->vision_seq;
+    g_auto_search_active = (uint8_t)AUTO_SEARCH_ENABLE;
+    g_auto_search_raster = 1u;
+    if (g_auto_search_active != 0u)
+    {
+        gimbal_link_log("[SEARCH] yaw 360deg, pitch both sides");
+    }
+}
 
 static void yuntai_lock_reference(void)
 {
@@ -1532,6 +1751,10 @@ static void yuntai_lock_reference(void)
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
     g_pitch_motor_lock  = g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f;
     g_pitch_tgt_deg     = g_pitch_motor_lock;
+    g_auto_search_pitch_offset_deg = 0.0f;
+    g_auto_search_yaw_sweep_deg = 0.0f;
+    g_auto_search_yaw_target_deg = 0.0f;
+    g_auto_search_valid_streak = 0u;
 
     g_yaw_fb.zero       = g_yaw_fb.cont;     /* 相对偏航角从这里开始算 0 */
     g_pitch_fb.zero     = g_pitch_fb.cont;
@@ -1790,6 +2013,10 @@ static void yuntai_control(uint32_t now)
         g_prev_mode   = mode;
         g_unwind_done = 0u;
         g_yaw_off_prev = g_yaw_off_applied;   /* 防模式切换后第一拍算出假的变化率 */
+        if (mode == GP_MODE_AIM)
+        {
+            vis_outer_reset();
+        }
     }
 
     /* ---- 主动查一次俯仰位置（10ms = 100Hz）----
@@ -1841,13 +2068,123 @@ static void yuntai_control(uint32_t now)
     if (gimbal_link_take_zero_req())
     {
         yuntai_lock_reference();
+        yuntai_lost_search_start();
     }
 
-    /* ---- 激光：只有 AIM 模式且上位机请求时才亮 ---- */
-    laser_apply((uint8_t)((mode == GP_MODE_AIM) && (cmd->laser != 0u)));
+    /* ---- 找靶：每圈水平转 360deg，再小步改变俯仰角。 ---- */
+    if (g_auto_search_active != 0u)
+    {
+        uint8_t vision_fresh = (uint8_t)(
+            (cmd->rx_count != 0u) &&
+            ((now - cmd->px_ms) <= VIS_FREEZE_MS)
+        );
+        uint8_t new_vision_frame = (uint8_t)(
+            vision_fresh && (cmd->vision_seq != g_auto_search_last_seq)
+        );
+
+        if (new_vision_frame)
+        {
+            g_auto_search_last_seq = cmd->vision_seq;
+            if (cmd->aim_valid != 0u)
+            {
+                if (g_auto_search_valid_streak < 3u)
+                {
+                    g_auto_search_valid_streak++;
+                }
+            }
+            else
+            {
+                g_auto_search_valid_streak = 0u;
+            }
+        }
+        if ((!vision_fresh) || (cmd->aim_valid == 0u))
+        {
+            g_auto_search_valid_streak = 0u;
+        }
+        if ((vision_fresh != 0u) && (cmd->aim_valid != 0u) &&
+            (g_auto_search_valid_streak >= 3u))
+        {
+            g_auto_search_active = 0u;
+            g_auto_search_raster = 0u;
+            g_target_seen_once = 1u;
+            g_auto_search_acquired_now = 1u;
+            yuntai_lock_reference();
+            gimbal_link_log("[SEARCH] target acquired -> AIM");
+        }
+    }
+    if ((g_auto_search_active != 0u) &&
+        ((mode == GP_MODE_STAB) || (mode == GP_MODE_AIM)))
+    {
+        if (g_auto_search_raster == 0u)
+        {
+            if (g_auto_search_pitch_offset_deg < AUTO_START_PITCH_UP_DEG)
+            {
+                g_auto_search_pitch_offset_deg +=
+                    AUTO_SEARCH_PITCH_SLEW_DPS * dt;
+                if (g_auto_search_pitch_offset_deg > AUTO_START_PITCH_UP_DEG)
+                    g_auto_search_pitch_offset_deg = AUTO_START_PITCH_UP_DEG;
+            }
+        }
+        else
+        {
+            g_auto_search_yaw_sweep_deg += AUTO_SEARCH_YAW_RATE_DPS * dt;
+            g_auto_search_yaw_target_deg += AUTO_SEARCH_YAW_RATE_DPS * dt;
+            if (g_auto_search_yaw_sweep_deg >= 360.0f)
+            {
+                g_auto_search_yaw_sweep_deg -= 360.0f;
+                if (pitch_fb_ok)
+                {
+                    if (g_auto_search_pitch_up != 0u)
+                    {
+                        g_auto_search_pitch_magnitude_deg +=
+                            AUTO_SEARCH_PITCH_STEP_DEG;
+                        if (g_auto_search_pitch_magnitude_deg >
+                            AUTO_SEARCH_PITCH_LIMIT_DEG)
+                        {
+                            g_auto_search_pitch_magnitude_deg =
+                                AUTO_SEARCH_PITCH_LIMIT_DEG;
+                        }
+                        g_auto_search_pitch_offset_deg =
+                            g_auto_search_pitch_magnitude_deg;
+                        g_auto_search_pitch_up = 0u;
+                    }
+                    else
+                    {
+                        g_auto_search_pitch_offset_deg =
+                            -g_auto_search_pitch_magnitude_deg;
+                        g_auto_search_pitch_up = 1u;
+                    }
+                }
+            }
+        }
+        if ((now - g_auto_search_log_ms) >= 1000u)
+        {
+            char sb[96];
+            char y0[12], p0[12], e0[12], e1[12];
+            g_auto_search_log_ms = now;
+            fmt_f(y0, sizeof(y0), g_auto_search_yaw_sweep_deg, 1);
+            fmt_f(p0, sizeof(p0),
+                  AUTO_SEARCH_PITCH_SIGN * g_auto_search_pitch_offset_deg, 1);
+            if (cmd->aim_valid != 0u)
+            {
+                fmt_f(e0, sizeof(e0), cmd->vis_yaw_deg, 1);
+                fmt_f(e1, sizeof(e1), cmd->vis_pitch_deg, 1);
+                snprintf(sb, sizeof(sb),
+                         "[SEARCH] yaw=%s pitch=%s err=(%s,%s) deg",
+                         y0, p0, e0, e1);
+            }
+            else
+            {
+                snprintf(sb, sizeof(sb),
+                         "[SEARCH] yaw=%s pitch=%s target=none", y0, p0);
+            }
+            gimbal_link_log(sb);
+        }
+    }
 
     /* ---- 视觉外环：像素坐标 -> 瞄准偏置（1kHz 连续积分，见"六A"）---- */
-    vis_outer_step(cmd, mode, now, dt, gyro_c[2] * rad2deg);
+    vis_outer_step(cmd, (g_auto_search_active != 0u) ? GP_MODE_STAB : mode,
+                   now, dt, gyro_c[2] * rad2deg);
 
     /* ======================================================================
      * 偏航轴
@@ -1904,9 +2241,14 @@ static void yuntai_control(uint32_t now)
         /* ---- 偏置斜坡（见 YAW_TGT_RATE_DPS 说明）---- */
         /* 偏置来自上面的视觉外环（新架构）；非 AIM 时回 0（安全行为） */
         float off_cmd = (mode == GP_MODE_AIM) ? g_vis_yaw_off : 0.0f;
+        if (g_auto_search_active != 0u)
         {
-            float rate = (mode == GP_MODE_AIM) ? YAW_TGT_RATE_DPS
-                                               : YAW_RETURN_RATE_DPS;
+            off_cmd += g_auto_search_yaw_target_deg;
+        }
+        {
+            float rate = ((mode == GP_MODE_AIM) ||
+                          (g_auto_search_active != 0u))
+                         ? YAW_TGT_RATE_DPS : YAW_RETURN_RATE_DPS;
             float dmax = rate * dt;
             if (off_cmd > (g_yaw_off_applied + dmax))
             {
@@ -2432,7 +2774,14 @@ static void yuntai_control(uint32_t now)
         {
             plat_comp = g_plat_comp; /* IMU 异常：冻结在最后一次补偿值 */
         }
-        float tgt = g_pitch_motor_lock + off_deg + plat_comp;
+        float search_off = (g_auto_search_active != 0u)
+                           ? (AUTO_SEARCH_PITCH_SIGN *
+                              g_auto_search_pitch_offset_deg)
+                           : 0.0f;
+        float base_pitch = (g_auto_search_active != 0u)
+                           ? g_pitch_search_base
+                           : g_pitch_motor_lock;
+        float tgt = base_pitch + off_deg + plat_comp + search_off;
         /* 行程软限位：别撞机构、别把线扯断 */
         tgt = clampf(tgt, g_pitch_motor_lock - PITCH_TRAVEL_LIMIT_DEG,
                           g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
@@ -2443,7 +2792,9 @@ static void yuntai_control(uint32_t now)
          * 改成斜坡（150°/s）之后误差始终只有 1~2°，环路一直工作在线性区：
          * 既不打摆，响应也够快（视觉环需要的偏置变化只有几度/秒）。 */
         {
-            float dmax_t = PITCH_TGT_RATE_DPS * dt;
+            float dmax_t = ((g_auto_search_active != 0u)
+                            ? AUTO_SEARCH_PITCH_SLEW_DPS
+                            : PITCH_TGT_RATE_DPS) * dt;
             if (tgt > g_pitch_tgt_deg + dmax_t)
             {
                 tgt = g_pitch_tgt_deg + dmax_t;
@@ -2657,19 +3008,16 @@ static void yuntai_debug(uint32_t now)
         {
             char e0[12], e1[12];
             char k0[12];
-            char gf[12];
             uint32_t vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms)
                                                   : 9999u;
             fmt_f(e0, sizeof(e0), g_vis_eu, 0);
             fmt_f(e1, sizeof(e1), g_vis_ev, 0);
-            fmt_f(gf, sizeof(gf), g_vis_gate_scale * 100.0f, 0);
             /* k = 本帧实际用的像素/度：K230 换了分辨率时这里会跟着变
              * （不变 = 那边没带上 K，还在用默认 7.8）。 */
             fmt_f(k0, sizeof(k0), vis_k_px_deg(cmd), 2);
             snprintf(buf, sizeof(buf),
-                     "[VIS] off=%s %s eu=%s ev=%s k=%s gf=%s v=%u",
-                     b4, b5, e0, e1, k0,
-                     gf, (unsigned)vis_age);
+                     "[VIS] off=%s %s err_deg=%s,%s k=%s age=%u",
+                     b4, b5, e0, e1, k0, (unsigned)vis_age);
         }
     }
     gimbal_link_log(buf);
@@ -2682,7 +3030,6 @@ static void yuntai_debug(uint32_t now)
 void yuntai_init(void)
 {
     can_bsp_init();
-    laser_init();
     /* ⚠ 告诉 AHRS"我们多久调一次它"：必须等于 1000/IMU_PERIOD_MS。
      * 之前这里写死 1000Hz，而实际只在 IMU_PERIOD_MS=2ms（500Hz）调用，
      * 于是四元数积分步长 halfT 只有真实的一半 —— 姿态角"走一半"。
@@ -2693,7 +3040,6 @@ void yuntai_init(void)
     mahonySampleFreq *= 2.0f;   /* =1000Hz：姿态积分减半（昨天那版的行为） */
 #endif
     ahrs_init(imuQuat);
-    g_laser_on = 0u;
     g_fault    = FAULT_NONE;
     g_state    = YUNTAI_STATE_BMI088_INIT;
     g_state_ms = HAL_GetTick();
@@ -2730,7 +3076,6 @@ static void yuntai_update_telem(uint32_t now)
     if (g_state == YUNTAI_STATE_RUNNING)      t.flags |= GP_ST_READY;
     if (g_state >= YUNTAI_STATE_SET_MODE)     t.flags |= GP_ST_SPEED_MODE;
     if (enc_fresh(&g_pitch_fb, now, PITCH_FB_TIMEOUT_MS)) t.flags |= GP_ST_ENCODER_OK;
-    if (g_laser_on)                           t.flags |= GP_ST_LASER_ON;
     t.uptime_ms = now;
     gimbal_link_set_telem(&t);
 }
@@ -2932,6 +3277,7 @@ void yuntai_control_loop(void)
             g_pitch_pid.integral_limit = g_pitch_ilim;
             g_pitch_pid.dead_zone      = PITCH_DEADZONE_DEG;
             yuntai_lock_reference();
+            yuntai_startup_search_start();
             g_state    = YUNTAI_STATE_RUNNING;
             g_state_ms = now;
             g_last_ctrl_ms = now;

@@ -5,7 +5,7 @@
   *
   * 三个关键工程决定：
   *  1) 收：只用 RXNE 中断 + 软件环形缓冲，不碰 DMA、不改 .ioc。
-  *     115200 下最高 11.5k 中断/s，对 550MHz 的 H723 完全不算负担，
+ *     921600 下文本视觉帧约 80Hz，对 550MHz 的 H723 不算负担，
   *     而且中断里只做"存一个字节"这一件事，绝不解析。
   *  2) 发：用 HAL_UART_Transmit_IT + 发送环形缓冲，绝不阻塞主循环。
   *     若用阻塞发送，一帧 28 字节要 2.4ms，会把 2ms 的 IMU 节拍拖歪。
@@ -92,6 +92,14 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 #define GL_LOG_PERIOD_MS     50u     /* 调试文本最快 20 条/s */
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
+#define GL_TEXT_BUF_SIZE     48u
+
+/* K230 computes angle at 0.28/PIXEL_SCALE = 0.1867 deg/px for 480x360.
+ * H723's proven calibration is 7.8 px/deg = 0.128205 deg/px. */
+#define K230_ANGLE_PER_PX      0.1866667f
+#define H723_ANGLE_PER_PX      0.1282051f
+#define K230_TO_H723_ANGLE_SCALE \
+    (H723_ANGLE_PER_PX / K230_ANGLE_PER_PX)
 
 /* ========================== 缓冲区 ========================== */
 #ifndef GL_RX_BUF_SIZE
@@ -127,6 +135,8 @@ static uint32_t          s_last_hb_ack_ms;
 static uint32_t          s_log_dropped;
 static uint32_t          s_rx_bytes;        /* 链路上收到的原始字节数 */
 static uint8_t           s_rx_any_logged;   /* 是否已经打过"收到第一个字节" */
+static char              s_text_line[GL_TEXT_BUF_SIZE];
+static uint8_t           s_text_len;
 
 /* ========================== TX 环形缓冲 ========================== */
 
@@ -290,6 +300,152 @@ void gimbal_link_log_force(const char *text)
     gimbal_link_log(text);
 }
 
+static int32_t gl_parse_text_x100(const char **cursor, uint8_t *ok)
+{
+    const char *p = *cursor;
+    int32_t sign = 1;
+    int32_t whole = 0;
+    int32_t frac = 0;
+    uint8_t digits = 0u;
+    uint8_t frac_digits = 0u;
+
+    while (*p == ' ')
+    {
+        p++;
+    }
+    if (*p == '-')
+    {
+        sign = -1;
+        p++;
+    }
+    else if (*p == '+')
+    {
+        p++;
+    }
+    while ((*p >= '0') && (*p <= '9'))
+    {
+        if (digits < 6u)
+        {
+            whole = whole * 10 + (int32_t)(*p - '0');
+            digits++;
+        }
+        p++;
+    }
+    if (*p == '.')
+    {
+        p++;
+        while ((*p >= '0') && (*p <= '9'))
+        {
+            if (frac_digits < 2u)
+            {
+                frac = frac * 10 + (int32_t)(*p - '0');
+                frac_digits++;
+            }
+            p++;
+        }
+        if (frac_digits == 1u)
+        {
+            frac *= 10;
+        }
+    }
+    *cursor = p;
+    *ok = (uint8_t)(digits > 0u);
+    return sign * (whole * 100 + frac);
+}
+
+static void gl_handle_text_line(uint32_t now_ms)
+{
+    const char *p = s_text_line;
+    uint8_t ok_yaw;
+    uint8_t ok_pitch;
+    int32_t yaw_x100;
+    int32_t pitch_x100;
+    uint8_t lost;
+    uint8_t was_aim;
+
+    yaw_x100 = gl_parse_text_x100(&p, &ok_yaw);
+    if ((!ok_yaw) || (*p != ','))
+    {
+        return;
+    }
+    p++;
+    pitch_x100 = gl_parse_text_x100(&p, &ok_pitch);
+    if ((!ok_pitch) || ((*p != ',') && (*p != '\0')))
+    {
+        return;
+    }
+
+    lost = (uint8_t)((yaw_x100 == 40400) && (pitch_x100 == 40400));
+    was_aim = (uint8_t)(s_cmd.mode == GP_MODE_AIM);
+    s_cmd.mode = lost ? GP_MODE_STAB : GP_MODE_AIM;
+    s_cmd.vis_direct_angle = 1u;
+    s_cmd.vis_direct_error = 0u;
+    s_cmd.vis_k_x100 = 536u;
+    s_cmd.vision_seq++;
+    s_cmd.px_ms = now_ms;
+    s_cmd.rx_count++;
+    s_cmd.aim_valid = (uint8_t)(lost ? 0u : 1u);
+    s_cmd.locked = (uint8_t)(lost ? 0u : 1u);
+    s_cmd.quality = (uint8_t)(lost ? 0u : 200u);
+    s_cmd.boost = 0u;
+    s_cmd.drawing = 0u;
+    s_cmd.vis_yaw_deg = lost ? 0.0f
+        : (((float)yaw_x100 / 100.0f) * K230_TO_H723_ANGLE_SCALE);
+    /* The new K230 code does not enable the old camera VFLIP, so its pitch
+     * direction is reversed relative to the existing H723 image convention. */
+    s_cmd.vis_pitch_deg = lost ? 0.0f
+        : (-(float)pitch_x100 / 100.0f * K230_TO_H723_ANGLE_SCALE);
+    s_last_aim_ms = now_ms;
+    if ((!lost) && (!was_aim))
+    {
+        s_last_log_ms = 0u;
+        gimbal_link_log("[LINK] ASCII ANGLE -> AIM");
+    }
+    if (lost && was_aim)
+    {
+        s_zero_req = 1u;
+        s_last_log_ms = 0u;
+        gimbal_link_log("[LINK] vision lost -> STAB + relock pose");
+    }
+    if (!s_alive)
+    {
+        s_alive = 1u;
+        s_last_log_ms = 0u;
+        gimbal_link_log("[LINK] ASCII vision connected");
+    }
+}
+
+static void gl_text_feed_byte(uint8_t byte, uint32_t now_ms)
+{
+    if (byte == '\r')
+    {
+        return;
+    }
+    if (byte == '\n')
+    {
+        if (s_text_len > 0u)
+        {
+            s_text_line[s_text_len] = '\0';
+            gl_handle_text_line(now_ms);
+        }
+        s_text_len = 0u;
+        return;
+    }
+    if ((byte < 32u) || (byte > 126u))
+    {
+        s_text_len = 0u;
+        return;
+    }
+    if (s_text_len < (GL_TEXT_BUF_SIZE - 1u))
+    {
+        s_text_line[s_text_len++] = (char)byte;
+    }
+    else
+    {
+        s_text_len = 0u;
+    }
+}
+
 /* ========================== 收到一帧 ========================== */
 
 static void gl_handle_frame(uint32_t now_ms)
@@ -319,8 +475,9 @@ static void gl_handle_frame(uint32_t now_ms)
             {
                 s_cmd.vis_k_x100 = 0u;      /* 老格式（10 字节）-> 用默认 K */
             }
+            s_cmd.vis_direct_error = 0u;
+            s_cmd.vis_direct_angle = 0u;
             s_cmd.px_ms      = now_ms;
-            s_cmd.laser      = (uint8_t)((s_cmd.flags & GP_AIM_LASER_ON) ? 1u : 0u);
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
             s_cmd.boost      = (uint8_t)((s_cmd.flags & GP_AIM_BOOST) ? 1u : 0u);
             s_cmd.drawing    = (uint8_t)((s_cmd.flags & GP_AIM_DRAWING) ? 1u : 0u);
@@ -331,6 +488,42 @@ static void gl_handle_frame(uint32_t now_ms)
             {
                 s_alive = 1u;
                 gimbal_link_log("[LINK] 上位机已连接");
+            }
+        }
+        break;
+
+    case GP_MSG_AIM_ERROR_PX:
+        /* New K230 vision protocol: target-minus-laser is calculated on K230.
+         * The H723 must not subtract px_ut-px_us again. */
+        if (s_parser.len >= GP_AIM_ERROR_PAYLOAD_LEN)
+        {
+            uint8_t was_aim = (uint8_t)(s_cmd.mode == GP_MODE_AIM);
+            s_cmd.vis_err_u_px = gp_get_i16(&s_parser.payload[0]);
+            s_cmd.vis_err_v_px = gp_get_i16(&s_parser.payload[2]);
+            s_cmd.vis_direct_error = 1u;
+            s_cmd.vis_direct_angle = 0u;
+            s_cmd.mode      = GP_MODE_AIM;
+            if (!was_aim)
+            {
+                s_last_log_ms = 0u;
+                gimbal_link_log("[LINK] ERROR_PX -> AIM");
+            }
+            s_cmd.flags     = s_parser.payload[4];
+            s_cmd.quality   = s_parser.payload[5];
+            s_cmd.vision_seq = s_parser.seq;
+            s_cmd.aim_valid = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
+            s_cmd.locked    = (uint8_t)((s_cmd.flags & GP_AIM_LOCKED) ? 1u : 0u);
+            s_cmd.boost     = 0u;
+            s_cmd.drawing   = 0u;
+            s_cmd.vis_k_x100 = 536u;
+            s_cmd.px_ms     = now_ms;
+            s_cmd.rx_count++;
+            s_last_aim_ms   = now_ms;
+            if (!s_alive)
+            {
+                s_alive = 1u;
+                s_last_log_ms = 0u;
+                gimbal_link_log("[LINK] ERROR_PX vision connected -> AIM");
             }
         }
         break;
@@ -354,11 +547,6 @@ static void gl_handle_frame(uint32_t now_ms)
             else
             {
                 s_cmd.mode = GP_MODE_STAB;           /* 非法模式一律走安全态 */
-            }
-            /* 非 AIM 模式下不允许点激光 */
-            if (s_cmd.mode != GP_MODE_AIM)
-            {
-                s_cmd.laser = 0u;
             }
             gl_send(GP_MSG_ACK, (const uint8_t[]){GP_MSG_MODE, 0u}, 2u);
         }
@@ -439,6 +627,7 @@ void gimbal_link_init(void)
     s_last_hb_ack_ms = 0u;
     s_rx_bytes = 0u;
     s_rx_any_logged = 0u;
+    s_text_len = 0u;
     memset(&s_cmd, 0, sizeof(s_cmd));
     memset(&s_telem, 0, sizeof(s_telem));
     /* 上电默认模式：
@@ -463,7 +652,7 @@ void gimbal_link_init(void)
      */
     {
         static const char banner[] =
-            "\r\nYUNTAI LINK BANNER 115200 8N1\r\n";
+            "\r\nYUNTAI LINK BANNER 921600 8N1\r\n";
         HAL_UART_Transmit(&GL_TX_HUART, (uint8_t *)banner,
                           (uint16_t)(sizeof(banner) - 1u), 50u);
         gimbal_link_log("[LINK] " GL_LINK_NAME " ready");
@@ -550,6 +739,7 @@ void gimbal_link_poll(uint32_t now_ms)
         {
             s_rx_tail = 0u;
         }
+        gl_text_feed_byte(b, now_ms);
         if (gp_parser_feed(&s_parser, b))
         {
             gl_handle_frame(now_ms);
@@ -573,7 +763,14 @@ void gimbal_link_poll(uint32_t now_ms)
     {
         s_alive = 0u;
         s_cmd.mode             = GP_MODE_STAB;
-        s_cmd.laser            = 0u;
+        /* Do not leave the last valid target latched after the stream dies.
+         * The auto-search state machine uses aim_valid, so a stale 1 would
+         * "acquire" the old target after only a few control cycles and cancel
+         * the search without receiving a new camera frame. */
+        s_cmd.aim_valid        = 0u;
+        s_cmd.locked           = 0u;
+        s_cmd.quality          = 0u;
+        s_zero_req             = 1u;
         s_last_log_ms = 0u;
         gimbal_link_log("[LINK] AIM 断流 -> 自动切 STAB + 关激光");
     }
