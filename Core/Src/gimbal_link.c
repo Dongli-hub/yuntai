@@ -9,7 +9,7 @@
   *     而且中断里只做"存一个字节"这一件事，绝不解析。
   *  2) 发：用 HAL_UART_Transmit_IT + 发送环形缓冲，绝不阻塞主循环。
   *     若用阻塞发送，一帧 28 字节要 2.4ms，会把 2ms 的 IMU 节拍拖歪。
-  *  3) 看门狗：0.5s 收不到 AIM 就自动切 STAB + 关激光。
+ *  3) 看门狗：250ms 收不到 AIM 就自动切 STAB + 关激光。
   *
   * 2026-10-06 迁移到 K230：
   *  - 链路外设从 USART1(PA9/PA10) 换到 UART7，接 K230 的 IO9(TXD)/IO10(RXD)。
@@ -21,6 +21,7 @@
 
 #include "gimbal_link.h"
 #include "gimbal_proto.h"
+#include "debug_uart.h"
 #include "usart.h"
 #include <string.h>
 #include <stdio.h>
@@ -88,15 +89,17 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 
 /* ========================== 可调参数 ========================== */
 #define GL_TELEM_PERIOD_MS   20u     /* 遥测周期：20ms = 50Hz */
-#define GL_WATCHDOG_MS       500u    /* AIM 断流多久后自动降级到 STAB */
+#define GL_WATCHDOG_MS       250u    /* 正常视觉约 80Hz；连续断流后回 STAB */
 #define GL_LOG_PERIOD_MS     50u     /* 调试文本最快 20 条/s */
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
-#define GL_TEXT_BUF_SIZE     48u
+#define GL_TEXT_BUF_SIZE     128u
 
-/* K230 computes angle at 0.28/PIXEL_SCALE = 0.1867 deg/px for 480x360.
+/* K230 sends 0.14 deg/px at 640x480 (480x360 was 0.186667 deg/px).
  * H723's proven calibration is 7.8 px/deg = 0.128205 deg/px. */
-#define K230_ANGLE_PER_PX      0.1866667f
+#define K230_ANGLE_PER_PX      0.14f
+#define K230_ANGLE_X100_PER_PX 14
+#define K230_PX_PER_DEG_X100   714u
 #define H723_ANGLE_PER_PX      0.1282051f
 #define K230_TO_H723_ANGLE_SCALE \
     (H723_ANGLE_PER_PX / K230_ANGLE_PER_PX)
@@ -231,6 +234,11 @@ static void gl_tx_pump(void)
 /* HAL 发送完成回调（中断上下文）：推进 tail */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
+    if (huart == &huart10)
+    {
+        debug_uart10_tx_complete();
+        return;
+    }
     if (huart != &GL_TX_HUART)
     {
         return;
@@ -246,6 +254,11 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 /* 出错时也要让发送通道恢复，否则一次错误就把遥测永久卡死 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+    if (huart == &huart10)
+    {
+        debug_uart10_tx_complete();
+        return;
+    }
     if ((huart != &GL_TX_HUART) && (huart != &GL_RX_HUART))
     {
         return;
@@ -353,13 +366,22 @@ static int32_t gl_parse_text_x100(const char **cursor, uint8_t *ok)
     return sign * (whole * 100 + frac);
 }
 
+static int32_t gl_abs_i32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
 static void gl_handle_text_line(uint32_t now_ms)
 {
     const char *p = s_text_line;
     uint8_t ok_yaw;
     uint8_t ok_pitch;
+    uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
+    int32_t aux[5] = {0, 0, 0, 0, 0};
+    uint8_t aux_n = 0u;
+    uint8_t aux_i;
     uint8_t lost;
     uint8_t was_aim;
 
@@ -374,13 +396,60 @@ static void gl_handle_text_line(uint32_t now_ms)
     {
         return;
     }
+    /* K230 新版在第 3~7 列附带靶心/激光像素和距离，仅用于诊断；
+     * 老版只有前两列时仍按原协议工作。 */
+    for (aux_i = 0u; aux_i < 5u; aux_i++)
+    {
+        if (*p != ',')
+        {
+            break;
+        }
+        p++;
+        aux[aux_i] = gl_parse_text_x100(&p, &ok_aux);
+        if (!ok_aux)
+        {
+            return;
+        }
+        aux_n++;
+    }
 
     lost = (uint8_t)((yaw_x100 == 40400) && (pitch_x100 == 40400));
+    if (!lost)
+    {
+        /* ASCII 链路偶发丢字节时，小数点缺失会把 1.83 变成 183。
+         * 用同一帧的像素坐标反算角度，避免坏帧直接进入控制环。 */
+        if ((gl_abs_i32(yaw_x100) > 5500) ||
+            (gl_abs_i32(pitch_x100) > 4000))
+        {
+            return;
+        }
+        if (aux_n >= 4u)
+        {
+            if (((aux[0] == 0) && (aux[1] == 0) &&
+                 (aux[2] == 0) && (aux[3] == 0)) ||
+                (aux[0] < 0) || (aux[0] > 100000) ||
+                (aux[1] < 0) || (aux[1] > 100000) ||
+                (aux[2] < 0) || (aux[2] > 100000) ||
+                (aux[3] < 0) || (aux[3] > 100000))
+            {
+                return;
+            }
+            int32_t yaw_px_x100 =
+                (aux[0] - aux[2]) * K230_ANGLE_X100_PER_PX / 100;
+            int32_t pitch_px_x100 =
+                (aux[1] - aux[3]) * K230_ANGLE_X100_PER_PX / 100;
+            if ((gl_abs_i32(yaw_x100 - yaw_px_x100) > 200) ||
+                (gl_abs_i32(pitch_x100 - pitch_px_x100) > 200))
+            {
+                return;
+            }
+        }
+    }
     was_aim = (uint8_t)(s_cmd.mode == GP_MODE_AIM);
     s_cmd.mode = lost ? GP_MODE_STAB : GP_MODE_AIM;
     s_cmd.vis_direct_angle = 1u;
     s_cmd.vis_direct_error = 0u;
-    s_cmd.vis_k_x100 = 536u;
+    s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
     s_cmd.rx_count++;
@@ -395,6 +464,33 @@ static void gl_handle_text_line(uint32_t now_ms)
      * direction is reversed relative to the existing H723 image convention. */
     s_cmd.vis_pitch_deg = lost ? 0.0f
         : (-(float)pitch_x100 / 100.0f * K230_TO_H723_ANGLE_SCALE);
+    if (aux_n >= 4u)
+    {
+        int32_t tx = aux[0] / 100;
+        int32_t ty = aux[1] / 100;
+        int32_t lx = aux[2] / 100;
+        int32_t ly = aux[3] / 100;
+        if (tx < 0) tx = 0;
+        if (tx > 65535) tx = 65535;
+        if (ty < 0) ty = 0;
+        if (ty > 65535) ty = 65535;
+        if (lx < 0) lx = 0;
+        if (lx > 65535) lx = 65535;
+        if (ly < 0) ly = 0;
+        if (ly > 65535) ly = 65535;
+        s_cmd.px_ut = (uint16_t)tx;
+        s_cmd.px_vt = (uint16_t)ty;
+        s_cmd.px_us = (uint16_t)lx;
+        s_cmd.px_vs = (uint16_t)ly;
+    }
+    else
+    {
+        s_cmd.px_ut = 0u;
+        s_cmd.px_vt = 0u;
+        s_cmd.px_us = 0u;
+        s_cmd.px_vs = 0u;
+    }
+    s_cmd.vis_distance_m = (aux_n >= 5u) ? (aux[4] / 100.0f) : 0.0f;
     s_last_aim_ms = now_ms;
     if ((!lost) && (!was_aim))
     {
@@ -457,7 +553,7 @@ static void gl_handle_frame(uint32_t now_ms)
          * ut/vt = 靶心像素，us/vs = 激光光斑像素；偏置由 yuntai_task 现算。
          * 新上位机还会在后面带 2 字节 kx100 = 像素/度 ×100（分辨率可切换，
          * K 跟着帧走）；只带 10 字节的老上位机照样收，vis_k_x100 保持 0
-         * -> 外环用默认 7.8。 */
+         * -> 外环用当前默认 7.142857。 */
         if (s_parser.len >= GP_AIM_PAYLOAD_LEN)
         {
             s_cmd.px_ut      = gp_get_u16(&s_parser.payload[0]);
@@ -515,7 +611,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.locked    = (uint8_t)((s_cmd.flags & GP_AIM_LOCKED) ? 1u : 0u);
             s_cmd.boost     = 0u;
             s_cmd.drawing   = 0u;
-            s_cmd.vis_k_x100 = 536u;
+            s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
             s_cmd.px_ms     = now_ms;
             s_cmd.rx_count++;
             s_last_aim_ms   = now_ms;
@@ -763,10 +859,7 @@ void gimbal_link_poll(uint32_t now_ms)
     {
         s_alive = 0u;
         s_cmd.mode             = GP_MODE_STAB;
-        /* Do not leave the last valid target latched after the stream dies.
-         * The auto-search state machine uses aim_valid, so a stale 1 would
-         * "acquire" the old target after only a few control cycles and cancel
-         * the search without receiving a new camera frame. */
+        /* Do not leave the last valid target latched after the stream dies. */
         s_cmd.aim_valid        = 0u;
         s_cmd.locked           = 0u;
         s_cmd.quality          = 0u;

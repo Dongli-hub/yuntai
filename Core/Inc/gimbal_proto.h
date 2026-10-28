@@ -46,11 +46,11 @@
  * 头部 seq = 视觉帧序号：只有 K230 产生新检测结果时才 +1。
  * 同一视觉帧可以重复发送（喂看门狗），重复包的 seq 不变。
  *
- * ⚠ 为什么要带 K（px/°）：K230 的处理分辨率是可切换的（640x480/800x600），
- *   px/° 随分辨率同比变化（7.8 → 9.75）。外环的 e_deg = e_px / K，K 用错
+ * ⚠ 为什么要带 K（px/°）：K230 的处理分辨率是可切换的（480x360/640x480），
+ *   px/° 随分辨率同比变化（5.36 → 7.14）。外环的 e_deg = e_px / K，K 用错
  *   25% 就等于把外环增益悄悄改了 25%（表现是"比之前更容易来回摆"）。
  *   所以让 K230 每帧带着 K 走，换分辨率不用重烧 H723。
- *   兼容：只有一个 10 字节 payload 的老上位机照样能跑 —— 这时用默认 7.8。
+ *   兼容：只有一个 10 字节 payload 的老上位机照样能跑 —— 这时用默认 7.142857。
  *         只认 10 字节的老固件遇到 12 字节帧也没事（多出来两个字节被忽略）。 */
 #define GP_MSG_AIM            0x10u    /* 下：视觉像素坐标上报（30Hz 保持，核心指令） */
 #define GP_AIM_PAYLOAD_LEN    10u      /* AIM payload 长度（老格式：无 K） */
@@ -82,7 +82,7 @@
  */
 #define GP_PARAM_DUMP            0x00u  /* 下发它 = 让 H723 回一行当前参数 */
 #define GP_PARAM_YAW_FF_SIGN     0x01u  /* ±1，前馈符号 */
-#define GP_PARAM_YAW_FF_GAIN     0x02u  /* rpm/(rad/s) */
+#define GP_PARAM_YAW_FF_GAIN     0x02u  /* 视觉目标角倍率（默认 1.00） */
 #define GP_PARAM_PITCH_FF_SIGN   0x03u  /* ±1，前馈符号（俯仰振荡第一嫌疑人） */
 #define GP_PARAM_PITCH_FF_GAIN   0x04u  /* rpm/(rad/s)，0 = 关掉前馈 */
 #define GP_PARAM_PITCH_KP        0x05u  /* rpm/deg */
@@ -98,12 +98,12 @@
 /* 0x0C：偏航积分限幅。ki*该值 = 积分单独能给出的最大 rpm。
  *       必须小于"能推动轴的最小转速"（约 10rpm），否则轴会被积分推着慢慢转。 */
 #define GP_PARAM_YAW_ILIM        0x0Cu
-/* 0x0D：视觉外环的 K（像素/度）。默认 7.8（= 640x480 档标定值）。
+/* 0x0D：视觉外环的 K（像素/度）。默认 7.142857（= 640x480 档标定值）。
  *       正常不用手动发 —— K230 每帧的 AIM 里带着 K（见 GP_AIM_PAYLOAD_LEN_K）。
  *       留这个入口是为了排查："是不是 K 用错了" 时能在现场直接覆盖它试一把。 */
 #define GP_PARAM_VIS_K           0x0Du
-/* 0x0E：视觉外环偏航 KP（1/s）。每个视觉帧最多修正 65% 的残差，
- *       再受单帧 8° 限幅；默认 6.0。0x0F 为旧 KD，已不再使用。 */
+/* 0x0E/0x0F：视觉外环偏航 KP/KD。外环输入角度误差、直接输出视觉目标角；
+ *             默认 KP=1.5，KD=0.07。 */
 #define GP_PARAM_VIS_KP_YAW      0x0Eu
 #define GP_PARAM_VIS_KD_YAW      0x0Fu
 /* 0x10：偏航输出限幅（rpm）。它同时管两件事：①前馈能在多快的底盘转速下还
@@ -178,7 +178,7 @@
  *   默认 2000 = 20ms（50Hz）；嫌迟钝往 1000/500 调；0 = 关掉节流（旧行为）。
  *   调试时可以 (0x1E, 5000) 拉长到 50ms 对比，看是不是这个原因。*/
 #define GP_PARAM_TQ_WR_MS        0x1Eu
-/* 0x1F：俯仰视觉外环 KP（1/s），默认 6.0。0x20 为旧 KD，已不再使用。 */
+/* 0x1F/0x20：视觉外环俯仰 KP/KD，默认 1.0 与 0.05。 */
 #define GP_PARAM_VIS_KP_PITCH    0x1Fu
 #define GP_PARAM_VIS_KD_PITCH    0x20u
 /* 偏航力矩环"积分项最大贡献"（mA）。2026-10-13 十版新增：
@@ -188,9 +188,10 @@
  *   18  = 0.18A（参考原值，默认）
  *   60  = 0.6A （轴"慢慢漂/推不动"就往这加；我们静摩擦实测 ~0.5A）*/
 #define GP_PARAM_TQ_I_LIM        0x21u
-/* 0x22 / 0x23：旧"速度记忆"参数，保留编号，当前固件忽略。 */
-#define GP_PARAM_VIS_KII_YAW     0x22u
-#define GP_PARAM_VIS_KII_PITCH   0x23u
+/* 0x22 / 0x23：视觉外环偏航/俯仰积分增益 Ki（1/s）。
+ * 外环现在直接输出目标角，默认 yaw=3.0、pitch=2.0。 */
+#define GP_PARAM_VIS_KI_YAW      0x22u
+#define GP_PARAM_VIS_KI_PITCH    0x23u
 /* 0x24：旧"偏置速率限幅"，保留编号，当前固件忽略。 */
 #define GP_PARAM_VIS_RATE_LIM    0x24u
 /* 0x25：旧"方位变化率前馈"增益，保留编号，当前固件忽略。 */

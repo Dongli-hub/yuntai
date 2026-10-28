@@ -76,7 +76,14 @@ void BMI088_GYRO_NS_H(void)
 
 uint8_t BMI088_read_write_byte(uint8_t txdata)
 {
-    uint8_t rx_data;
-    HAL_SPI_TransmitReceive(&BMI088_USING_SPI_UNIT, &txdata, &rx_data, 1, 1000);
+    uint8_t rx_data = 0xFFu;
+    /* One byte at the configured SPI clock takes a few microseconds.
+     * Never allow a transient SPI fault to hold the 2 ms control loop for
+     * 1 s: with the 0.5 s IWDG that would reset the H723 and release pitch. */
+    if (HAL_SPI_TransmitReceive(&BMI088_USING_SPI_UNIT, &txdata, &rx_data,
+                                1u, 2u) != HAL_OK)
+    {
+        return 0xFFu;
+    }
     return rx_data;
 }

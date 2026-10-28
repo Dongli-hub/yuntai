@@ -5,6 +5,8 @@
 #include <stdlib.h>
 
 static char g_tx_buf[256];
+static char g_uart10_buf[256];
+static volatile uint8_t g_uart10_tx_busy;
 
 static void ftoa(char *buf, float val, int decimals)
 {
@@ -29,6 +31,49 @@ static void ftoa(char *buf, float val, int decimals)
 }
 
 void debug_uart_init(void) {}
+
+/* USART10 专用蓝牙调试口：TX=PE03，115200 8N1。
+ * 使用单缓冲中断发送；上一帧未发完时直接丢本帧，不能阻塞 1kHz 控制。 */
+void debug_uart10_init(void)
+{
+    /* 精简调参表：原始靶心/激光像素 + 视觉 PID + 云台响应。
+     * 链路计数、启动阶段和复位诊断仍由协议 TEXT 日志按需输出。 */
+    static const char header[] =
+        "ms,mode,aim,src,age,seq,tu,tv,su,sv,dist,ey,ep,wy,wp,ay,ap,"
+        "iyy,iyp,yr,gyro,ycmd,yiq,ybase,pit,ptgt,pcmd,piq,vfps,flt\r\n";
+    HAL_NVIC_SetPriority(USART10_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(USART10_IRQn);
+    (void)debug_uart10_send(header);
+}
+
+uint8_t debug_uart10_send(const char *msg)
+{
+    size_t n;
+
+    if ((msg == NULL) || (g_uart10_tx_busy != 0u))
+    {
+        return 0u;
+    }
+    n = strlen(msg);
+    if ((n == 0u) || (n >= sizeof(g_uart10_buf)))
+    {
+        return 0u;
+    }
+    memcpy(g_uart10_buf, msg, n);
+    g_uart10_tx_busy = 1u;
+    if (HAL_UART_Transmit_IT(&huart10, (uint8_t *)g_uart10_buf,
+                             (uint16_t)n) != HAL_OK)
+    {
+        g_uart10_tx_busy = 0u;
+        return 0u;
+    }
+    return 1u;
+}
+
+void debug_uart10_tx_complete(void)
+{
+    g_uart10_tx_busy = 0u;
+}
 
 /*
  * 调试输出改走协议里的 TEXT 消息（0x93），由上位机打印。

@@ -44,6 +44,7 @@ typedef struct
     uint8_t vis_direct_error;  /* 1 = 使用上面的直接像素差，不再相减 */
     float   vis_yaw_deg;       /* ASCII 原版视觉协议：偏航角误差 */
     float   vis_pitch_deg;     /* ASCII 原版视觉协议：俯仰角误差 */
+    float   vis_distance_m;    /* ASCII 诊断字段：目标距离（米） */
     uint8_t vis_direct_angle;  /* 1 = 直接使用上面的角度误差 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
@@ -73,7 +74,7 @@ void               gimbal_link_rx_isr(void);          /* 在 UART7_IRQHandler �
 uint8_t            gimbal_link_is_rx_uart(UART_HandleTypeDef *huart);
 void               gimbal_link_set_telem(const GimbalTelem_t *t);
 const GimbalCmd_t *gimbal_link_cmd(void);
-uint8_t            gimbal_link_alive(void);           /* 1 = 最近 0.5s 收到过 AIM */
+uint8_t            gimbal_link_alive(void);           /* 1 = 看门狗时间内收到过 AIM */
 uint8_t            gimbal_link_take_zero_req(void);   /* 读并清"重新锁零"请求 */
 void               gimbal_link_log(const char *text); /* 调试文本 -> 上位机 */
 /* 同上，但绕过"50ms 最快一条"的限速：调参回执必须发出去 */

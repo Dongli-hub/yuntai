@@ -38,7 +38,7 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(DTCMRAM) + LENGTH(DTCMRAM);    /* end of RAM */
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
-_Min_Stack_Size = 0x400; /* required amount of stack */
+_Min_Stack_Size = 0x2000; /* enlarged for 20Hz telemetry/printf call stack */
 
 /* Specify the memory areas */
 MEMORY
@@ -152,6 +152,15 @@ SECTIONS
     . = ALIGN(4);
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
+  } >DTCMRAM
+
+  /* Reset-preserved state (IWDG/software reset does not clear RAM). */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
   } >DTCMRAM
 
   /* User_heap_stack section, used to check that there is enough RAM left */

@@ -40,6 +40,12 @@ typedef struct { uint32_t ISR; uint32_t RDR; uint32_t ICR; uint32_t dummy[4]; } 
 typedef struct { uint32_t dummy[2]; } FDCAN_GlobalTypeDef;
 typedef struct { uint32_t dummy[2]; } GPIO_TypeDef;
 typedef struct { uint32_t dummy[2]; } SPI_TypeDef;
+typedef struct { uint32_t RSR; } RCC_TypeDef;
+typedef struct { uint32_t CFSR; uint32_t HFSR; } SCB_TypeDef;
+
+#define RCC ((RCC_TypeDef *)0x58024000u)
+#define SCB ((SCB_TypeDef *)0xE000ED00u)
+#define __DSB() do { } while (0)
 
 typedef struct { USART_TypeDef *Instance; uint32_t dummy[10]; } UART_HandleTypeDef;
 typedef struct { SPI_TypeDef   *Instance; uint32_t dummy[6];  } SPI_HandleTypeDef;
@@ -91,6 +97,7 @@ typedef struct
 #define GPIOA ((GPIO_TypeDef *)0x1000)
 #define GPIOC ((GPIO_TypeDef *)0x2000)
 #define USART1_IRQn 37
+#define USART10_IRQn 156
 
 /* 4) 用到的 HAL API（只声明） */
 uint32_t HAL_GetTick(void);
@@ -125,6 +132,15 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h);
 #define __HAL_UART_DISABLE_IT(h, it)  do { (void)(h); } while (0)
 #define __HAL_UART_CLEAR_FLAG(h, f)   do { (void)(h); } while (0)
 #define __HAL_UART_GET_FLAG(h, f)     0u
+#define RCC_FLAG_IWDG1RST             0x9Au
+#define RCC_RSR_RMVF                  0x00010000u
+#define RCC_RSR_IWDG1RSTF             0x04000000u
+#define RCC_RSR_SFTRSTF               0x01000000u
+#define RCC_RSR_BORRSTF               0x00200000u
+#define RCC_RSR_PORRSTF               0x00800000u
+#define RCC_RSR_PINRSTF               0x00400000u
+#define __HAL_RCC_GET_FLAG(f)         0u
+#define __HAL_RCC_CLEAR_RESET_FLAGS() do { } while (0)
 #define UART_IT_RXNE          0u
 #define UART_CLEAR_OREF       0u
 #define UART_CLEAR_FEF        0u
@@ -149,6 +165,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h);
 
 /* 6) 真实头文件里被屏蔽掉、但业务代码要用的 extern */
 extern UART_HandleTypeDef  huart1;
+extern UART_HandleTypeDef  huart10;
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 extern SPI_HandleTypeDef   hspi2;

@@ -55,7 +55,8 @@
 void SystemClock_Config(void);
 static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
-
+static void Board_IwdgStart(void);
+static void Board_IwdgFeed(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -121,6 +122,7 @@ int main(void)
   /* 先打开板上电源输出（PC13/PC14/PC15）：各排针的 5V 都靠它，
    * K230 也是从这里取电的，所以必须最早打开。 */
   Board_PowerEnable();
+  debug_uart10_init();
 
 #if (UART_TX_TEST_MODE == 1)
   /* 自检 1：UART7 引脚扫描（不会返回） */
@@ -134,6 +136,7 @@ int main(void)
    * 否则云台启动日志发不出去（表现为上位机一直收不到 GIMBAL_STATE）。 */
   gimbal_link_init();
   yuntai_init();
+  Board_IwdgStart();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -143,6 +146,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    Board_IwdgFeed();
     yuntai_control_loop();
   }
   /* USER CODE END 3 */
@@ -207,6 +211,22 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* 独立看门狗：主循环或 HardFault 卡住约 0.5 秒后自动复位。
+ * LSI≈32kHz，PR=4(/64)，RLR=250 -> 约 0.5 秒。 */
+static void Board_IwdgStart(void)
+{
+  IWDG1->KR   = 0xCCCCu;  /* start */
+  IWDG1->KR   = 0x5555u;  /* write enable */
+  IWDG1->PR   = 4u;
+  IWDG1->RLR  = 250u;
+  IWDG1->WINR = 0x0FFFu;  /* no window restriction */
+  IWDG1->KR   = 0xAAAAu;  /* reload */
+}
+
+static void Board_IwdgFeed(void)
+{
+  IWDG1->KR = 0xAAAAu;
+}
 
 /* USER CODE END 4 */
 

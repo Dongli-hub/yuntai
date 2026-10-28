@@ -199,14 +199,14 @@
  *   所以它不会把刚压下去的高频抖重新引回来 —— 这正是现在最该动的那一个旋钮。
  *   0x18 在线可改（30000 = 300）。*/
 #define YAW_KP                 300.0f   /* rpm/rad（0x18 可在线改） */
-#define YAW_KI                  30.0f   /* rpm/(rad*s)（0x19） */
+#define YAW_KI                  15.0f   /* rpm/(rad*s)（0x19；2026-10-25 30->15） */
 #define YAW_KD                  10.0f   /* rpm/(rad/s)（0x1A；微分已加 5ms 低通） */
 /* ⚠ 2026-10-11 深夜(31)：50 -> 80 rpm（约 480°/s）。不改这个数的话，前馈
  *   (66.85 rpm/(rad/s)) 在底盘转速 >43°/s 时**自己就把指令顶到限幅**，环路
  *   退化成 bang-bang —— 掠射位姿下这种"一顿一顿"最要命。抬到 80 之后，
  *   前馈保持线性到 ~69°/s 的底盘转速；真需要更快时电机自己会先饱和。
  *   限幅同时是"跑飞保护"的一环，所以别超过电机实际能跟上的量级。*/
-#define YAW_OUT_RPM             80.0f   /* 输出限幅；约 480°/s 的补偿能力 */
+#define YAW_OUT_RPM             120.0f  /* 输出限幅；约 720°/s 的补偿能力 */
 /* ⚠ 2026-09-30 现场事故：这里原来是 1.0，而 ki=30 -> 积分单独就能给出 30rpm，
  *   是"能推动轴的最小转速"（≈10rpm）的 3 倍。后果：只要有一点点残余误差
  *   （陀螺零偏残留、基准误差），积分就会顶到限幅、**把轴慢慢推着匀速转** ——
@@ -248,7 +248,7 @@
  *   ⇒ 回到 36 号那一版（11，实测最平滑）：damp 与 match 同值。*/
 /* ⚠ 2026-10-12 深夜：**回到 bf3bf46 的等效值**（damp=66.85、match=0）。
  *   现式：pid - damp×gyro + (damp-match)×off_rate。 */
-#define YAW_FF_RPM_PER_RADS     0.0f    /* 视觉转速前馈（match；0x02 在线可改） */
+#define YAW_VIS_ANGLE_GAIN      1.0f    /* 视觉目标角倍率（0x02 在线可改） */
 /* ⚠⚠ 2026-10-13（46 号日志："抖动幅度比原来大了"）—— 收回上一版的判断：
  *   把阻尼从 66.85 收到 15 之后振幅反而变大，说明这一轴的抖动**不是高增益
  *   速度反馈自激，而是"粘-滑"极限环**（静摩擦大：滑环）：
@@ -304,13 +304,7 @@
  *       (0x12, 955)  = 反符号试试（若陀螺/编码器方向约定与上面不符）*/
 #define YAW_BASE_FF_RPM_PER_RADS (-9.55f)
 #define YAW_FF_SIGN            (-1.0f)
-
-/* ---- 偏航偏置的变化率限幅 ----
- * 视觉只有约 3 FPS，偏置是每帧一次的阶梯信号。250°/s 会在两帧之间把
- * 一个误检跳变直接甩成几十度；压到 60°/s，既能在 0.2s 内走完常见的
- * 十几度修正，又不会让机构跟着单帧噪声猛冲。 */
-#define YAW_TGT_RATE_DPS        60.0f
-#define YAW_RETURN_RATE_DPS     60.0f
+#define YAW_BASE_RATE_LIMIT_RADS  0.60f
 
 /* ---- 偏航静摩擦补偿（2026-09-30 新增）----
  * 现场逐帧实测：视觉环给出 1.5° 的目标变化时，平台 0.7 秒只走了 0.34° ——
@@ -380,19 +374,22 @@
  *   一会儿跑出去，视觉环怎么调都收敛不了。
  *   在线把 KP 降到 8、KI 降到 20 之后，俯仰电机角立刻静如止水（跳变 0.0）。
  *   所以默认值改成安全预设。要更快再往上加，但"一次只动一个数"。 */
-#define PITCH_KP                15.0f   /* rpm/deg；2026-10-14: 12->15（内环提速，
+#define PITCH_KP                12.0f   /* rpm/deg；2026-10-25: 15->12（抑制自激跳变，
+                                         * 现场记录15°容易自激、12°为折中）
                                          * 直接压"视觉外环 + 内环 50~100ms 滞后"
                                          * 引起的 ~1Hz 慢摆；1kHz 下每拍增益
                                          * 6×15×0.001=0.09，离发散门限还很远） */
                                          /* （8 迟钝、15 自激，12 是新的折中） */
-#define PITCH_KI                12.0f   /* rpm/(deg*s)；2026-10-10: 18->12。
+#define PITCH_KI                 0.8f   /* rpm/(deg*s)；2026-10-25: 2->0.8，
+                                         * 保留少量积分消静差，同时压低俯仰自激。
+                                         * 2026-10-10: 18->12。
                                          /* 现场"持续上下晃"= 典型的积分+延迟低频振荡，
                                           * 俯仰积分原来比偏航强 40 倍（18 vs 0.44 rpm/(deg·s)），
                                           * 收到 12 之后再靠 D 压。 */
 #define PITCH_KD                 0.12f  /* 2026-10-24: 0.20->0.12（降低编码器噪声引起的抖动；
                                          * 2026-10-10: 0.03->0.05（偏置已有斜坡，误差曲线连续，
                                          /* 可以多给一点阻尼；再大就会放大编码器量化噪声） */
-#define PITCH_OUT_RPM           80.0f   /* 约 480°/s；限制捕获瞬间的冲击 */
+#define PITCH_OUT_RPM           120.0f  /* 约 720°/s；限制捕获瞬间的冲击 */
 #define PITCH_ILIM               0.70f  /* 积分限幅；2026-10-09：0.40 -> 0.70
                                          /* ki*ilim = 14rpm > 脱困转速(约10rpm)，
                                           * 这样积分才推得动轴，消掉"俯仰死区"。原注释：
@@ -401,17 +398,9 @@
                                          * 但又不能大到积分自己就能把输出顶满 */
 #define PITCH_DEADZONE_DEG       0.03f  /* 死区，抑制编码器量化噪声 */
 #define PITCH_FF_RPM_PER_RADS   15.0f   /* ≈1.6 倍理论抵消量 */
-#define PITCH_FF_SIGN          (-1.0f)
+#define PITCH_FF_SIGN          (-1.0f)  /* 与 0x0A 默认符号一致 */
 #define PITCH_TRAVEL_LIMIT_DEG  95.0f   /* 相对上电位置的行程软限位 */
-#define PITCH_TGT_RATE_DPS      60.0f   /* 视觉目标斜坡，避免捕获瞬间猛跳 */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
-#define AUTO_SEARCH_ENABLE             1
-#define AUTO_START_PITCH_UP_DEG        10.0f
-#define AUTO_SEARCH_YAW_RATE_DPS       45.0f
-#define AUTO_SEARCH_PITCH_STEP_DEG      5.0f
-#define AUTO_SEARCH_PITCH_LIMIT_DEG    90.0f
-#define AUTO_SEARCH_PITCH_SLEW_DPS      8.0f
-#define AUTO_SEARCH_PITCH_SIGN         -1.0f
 /* 底盘转速前馈（0x12）用的偏航电机反馈新鲜度上限：反馈断流/过期就把前馈停掉，
  * 免得拿着几十毫秒前的旧转速当"底盘在转"去给一脚。 */
 #define YAW_BASE_FF_FB_TIMEOUT_MS 50u
@@ -424,15 +413,14 @@
  * "电机相对底座"的角度。底座整体倾斜时这个角压根不变 -> 位置环误差为 0
  * -> 电机一动不动 -> 镜头跟着底座一起低头，激光就从靶心跑掉了。
  * 位置环不会自己发现这件事，必须由 IMU 告诉它"世界倾斜了多少"，
- * 再把俯仰目标反向挪同样的角度 —— 这就是本段的作用。
+ * 再按 IMU 平台俯仰变化修正编码器目标 —— 这就是本段的作用。
  *
  * 前馈（陀螺）和这里的分工：
  *   陀螺前馈：只对【正在倾斜】的那一瞬间起作用（快，但没有绝对基准）
  *   平台补偿：负责【倾斜之后的持续角度】（慢，但有绝对基准）
  * 两个都要有，缺一个都会"倾斜完就偏"。
  *
- * 符号：补偿方向 sign_c 与前馈符号 sign_ff 是【相反】的
- *   （sign_c = -sign_ff；老固件实测 FF=-1、COMP=+1 就是这个关系）
+ * 符号：最终方向由 0x0A 的 ±1 决定，必须现场确认。
  *   前馈测法：前后快倾底座，工具算 corr(陀螺, 电机角速度)，应为【负】
  *   补偿测法：慢慢把底座倾斜 10°，靶面光斑应【基本不动】；
  *             若光斑动得比关闭时还大 -> 符号取反
@@ -441,10 +429,10 @@
  * 表现就是"底座一低头，镜头跟着低，电机不管"。
  * 现场可以随时用 GP_MSG_PARAM(0x0A) 在线改：0 = 关，±1 = 开并定方向。
  */
-#define PITCH_PLAT_COMP          1          /* 1 = 默认打开（老固件行为） */
-#define PITCH_PLAT_SIGN         (1.0f)      /* 初始符号；在线可改，见上 */
-#define PLAT_COMP_ACC_TAU_S      2.0f       /* 互补滤波：加速度计修正时间常数 */
-#define PLAT_COMP_RATE_DPS      60.0f       /* 补偿目标变化率限幅（°/s） */
+#define PITCH_PLAT_COMP          1          /* 自稳时由 IMU 修正编码器目标：
+                                             * 电机目标 = 锁定编码器角 + 平台俯仰变化。
+                                             * 最终位置闭环仍使用电机编码器。 */
+#define PITCH_PLAT_SIGN         (-1.0f)     /* 0x0A 可在线关闭或反向 */
 
 /* ---- 陀螺零偏标定（解决「上电后云台朝一个方向慢慢转」）----
  *
@@ -522,10 +510,40 @@ static float imuAngle[3];           /* [0]=yaw [1]=pitch [2]=roll，单位 rad *
 
 static YuntaiState g_state = YUNTAI_STATE_BMI088_INIT;
 static uint32_t    g_state_ms;      /* 当前状态的进入时刻 */
+static uint8_t     g_fast_recovery; /* 看门狗复位后缩短重复自检时间 */
+typedef struct
+{
+    uint32_t magic;
+    uint32_t sequence;
+    uint32_t last_stage;
+    uint32_t last_ms;
+    uint32_t fault_type;
+    uint32_t cfsr;
+    uint32_t hfsr;
+    int16_t  yaw_torque_x100;
+    int16_t  pitch_torque_x100;
+} YuntaiRetained_t;
+
+#define YUNTAI_RETAINED_MAGIC 0x59414E54u
+__attribute__((section(".noinit"), used))
+static YuntaiRetained_t g_retained;
+static uint32_t    g_boot_reset_reason;
+static uint32_t    g_boot_stage;
+static uint32_t    g_boot_last_ms;
+static uint32_t    g_boot_fault_type;
+static uint32_t    g_boot_cfsr;
+static uint32_t    g_boot_hfsr;
 static uint32_t    g_last_imu_ms;
 static uint32_t    g_last_ctrl_ms;
 static uint32_t    g_ctrl_period_ms = CONTROL_PERIOD_DEFAULT_MS; /* 在线可改 0x1C */
 static uint32_t    g_last_dbg_ms;
+static uint32_t    g_last_uart10_log_ms;
+static uint8_t     g_uart10_boot_logged;
+static uint32_t    g_vis_fps_win_ms;
+static uint32_t    g_vis_fps_frames;
+static uint8_t     g_vis_fps_seq;
+static uint8_t     g_vis_fps_mode = 0xFFu;
+static float       g_vis_fps;
 /* 调试行交替开关：TEXT 单条上限 60 字符，[DBG]/[VIS] 两条轮着发 */
 static uint8_t     g_dbg_toggle;
 static uint32_t    g_last_fbwarn_ms;
@@ -539,6 +557,27 @@ static uint8_t     g_cmd_sent;      /* 状态机里"只发一次"的指令是否
 static uint8_t     g_imu_ok;
 static uint32_t    g_bmi_retry;
 
+void yuntai_mark_stage(uint32_t stage)
+{
+    uint32_t now = HAL_GetTick();
+    if ((g_retained.last_stage != stage) ||
+        ((now - g_retained.last_ms) >= 100u))
+    {
+        g_retained.last_stage = stage;
+        g_retained.last_ms = now;
+    }
+}
+
+void yuntai_record_fault(uint32_t fault_type)
+{
+    g_retained.fault_type = fault_type;
+    g_retained.cfsr = SCB->CFSR;
+    g_retained.hfsr = SCB->HFSR;
+    g_retained.sequence++;
+    g_retained.magic = YUNTAI_RETAINED_MAGIC;
+    __DSB();
+}
+
 
 static PID_Controller g_yaw_pid;
 static PID_Controller g_pitch_pid;
@@ -549,23 +588,10 @@ static EncFb_t    g_pitch_fb;       /* 俯仰电机编码器（FDCAN2） */
 
 static float      g_yaw_lock_rad;   /* 上电锁定的绝对方位（rad） */
 static float      g_pitch_plat_lock;/* 上电锁定的平台俯仰（rad） */
-static float      g_plat_dtheta;    /* 平台俯仰相对基准的变化量（rad），互补滤波估计 */
+static float      g_plat_dtheta;    /* 平台俯仰相对锁定零点的变化量（rad） */
 static float      g_plat_comp;      /* 当前生效的平台俯仰补偿量（deg，含变化率限幅） */
 static float      g_pitch_motor_lock;/* 上电锁定的俯仰电机角（deg） */
 static float      g_pitch_tgt_deg;  /* 当前俯仰目标（deg），仅用于调试打印 */
-static uint8_t    g_auto_search_active;
-static uint8_t    g_auto_search_raster;
-static uint8_t    g_target_seen_once;
-static uint8_t    g_auto_search_acquired_now;
-static uint8_t    g_auto_search_valid_streak;
-static uint8_t    g_auto_search_last_seq;
-static float      g_auto_search_pitch_offset_deg;
-static float      g_auto_search_pitch_magnitude_deg;
-static uint8_t    g_auto_search_pitch_up;
-static float      g_auto_search_yaw_sweep_deg;
-static float      g_auto_search_yaw_target_deg;
-static float      g_pitch_search_base;
-static uint32_t   g_auto_search_log_ms;
 
 static uint8_t    g_fault;
 static uint32_t   g_runaway_ms;
@@ -645,9 +671,6 @@ static float    g_iq_filt;               /* 力矩指令一阶低通状态（防
 static uint32_t g_torque_wr_ms   = 0u;
 static uint32_t g_last_torque_wr_ms;
 /* 实际接到目标角上的偏航偏置（做过变化率限幅，见 yuntai_control 里的说明） */
-static float      g_yaw_off_applied;
-/* 上一拍的偏置（用来算"视觉要求的转动速度"，见 yaw 前馈说明） */
-static float      g_yaw_off_prev;
 static uint8_t    g_bias_cal;       /* 1 = 正在采陀螺零偏样本（见 gyro_bias_accumulate） */
 static float      g_yaw_err_rad;    /* 偏航角度环当前误差（rad），给零偏自校准判据用 */
 static uint8_t    g_yaw_stiction_on;/* 当前是否正在做静摩擦补偿（调试打印用） */
@@ -666,7 +689,7 @@ static float      g_yaw_kd = YAW_KD;                      /* 可在线改（PARA
  * 一轮下来什么也试不出来。
  */
 static float g_yaw_ff_sign    = YAW_FF_SIGN;
-static float g_yaw_ff_gain    = YAW_FF_RPM_PER_RADS;
+static float g_yaw_vis_gain   = YAW_VIS_ANGLE_GAIN;
 static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x11 */
 /* ⚠⚠ 2026-10-12 现场(38 号日志)后**又改回默认关**：
  *   38 号日志里 yaw 电机"指令 -16→-33rpm 时原地不动 2~3 秒，随后突然甩成
@@ -686,7 +709,10 @@ static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x1
  *   有延迟，两者相减就冒出一个假的"底盘转速"，前馈于是**变成正反馈**，越喂越振。
  *   ⇒ 想再启用必须把估计器做得更慢（现在 τ≈50ms）并现场验证 wb= 静止时不翻。
  *   默认 0 = 关；想试 (0x12, 50)；符号反了就发负值。*/
-static float g_yaw_base_ff    = 0.0f;
+/* 2026-10-27: small chassis feedforward for the near->far start transient.
+ * Keep it conservative because the base estimate still contains some
+ * platform self-motion. */
+static float g_yaw_base_ff    = 0.5f;
 static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
 static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
 static float   g_yaw_pos_last;                   /* 上一帧电机位置（deg） */
@@ -764,7 +790,8 @@ static float   g_tq_kd    = 2000.0f;   /* mA/(rad/s)（=2.0 A/(rad/s)；0x11）
                                         * 我们这条是电流域的直接对应（0.08Nm/(rad/s)），
                                         * 复查过相位余量：3ms 延迟下 25Hz 处环路增益只有
                                         * 0.21，稳。嫌顶不住往 0x11=250/300 加，嫌抖往 100 收。*/
-static float   g_tq_ki    = 8000.0f;   /* mA/(rad·s)（=8 A/(rad·s)；0x16）*/
+static float   g_tq_ki    = 4000.0f;   /* mA/(rad·s)（=4 A/(rad·s)；0x16）
+                                        * 2026-10-25: 8->4，降低力矩模式积分。*/
 /* 积分项最大贡献（mA）= 1.5A。相当于给积分单独加一个"小盖子"（总输出另有 0x17 的
  * 8A 限幅）：
  *   · 这一轴摩擦只需要 ~0.5A，1.5A 有 3 倍余量，平时几乎不参与；
@@ -814,7 +841,7 @@ static float   g_yaw_ilim_ma = 1500.0f;
  *   (0x15,600) kp 6（默认）    (0x16,800) ki 8（默认）
  *   (0x21,1500) 积分上限 1.5A（默认）/ (0x21,500) 0.5A（更保守）
  *   (0x1D,250) 脱困补偿 2.5A（= 默认，2026-10-14 十三版）/ (0x1D,0) 关掉它*/
-static float   g_yaw_off_rate;         /* 视觉目标角速度（rad/s，AIM 才有）*/
+static float   g_yaw_off_rate;         /* 视觉目标角变化率（rad/s，AIM 才有）*/
 
 /* ---- 俯仰力矩模式——⚠⚠⚠ 2026-10-14 试过并**失败回退，默认关闭** ----
  * 尝试：俯仰也搬进力矩模式、反馈用 IMU 俯仰（世界系，与偏航同构）。
@@ -834,6 +861,7 @@ static float   g_ptq_ki   = 20000.0f;  /* mA/(rad·s)（0x06）*/
 static float   g_pitch_ilim_a = 3.0f;  /* 电流限幅 A（0x08）*/
 static float   g_pitch_tq_i;           /* 积分（mA）*/
 static float   g_pitch_iq_ma;          /* 最近输出（mA，给日志）*/
+static float   g_pitch_iq_filt;        /* 俯仰力矩指令一阶低通状态 */
 static float   g_pitch_imu_lock;       /* 锁基准时的 IMU 俯仰（rad）*/
 static float   g_pbreak_i;             /* 俯仰脱困电流（A）*/
 static uint8_t g_pbreak_stuck, g_pbreak_want;
@@ -1219,157 +1247,91 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * ========================================================================== */
 
 /* ==========================================================================
- * 六A、视觉外环（2026-10-11 新架构）
- *   K230 现在只上报"靶心像素 + 光斑像素"，瞄准偏置（修正量）全部改在这里算。
- *   为什么搬过来：原 K230 侧是 40Hz"一帧跳一步"地发偏置，链路上还串着滤波、
- *   自适应增益、速率限幅，等效延迟 100~200ms（现场：静止能打中，但回正慢、
- *   不灵敏）。放到 500Hz 控制节拍里之后，偏置是连续积出来的，延迟链只剩视觉。
+ * 六A、视觉外环
  *
- *   外环律（与原 K230 侧同构，只是连续化）：
- *       e_px   = (ut-us, vt-vs)                   像素误差
- *       e_deg  = e_px / K                         角误差（°，K = 像素/度）
- *       bias'  = SIGN * VIS_KP * e_deg            (°/s)，限幅 ±VIS_RATE_*_DPS
- *       bias   = clamp(∫bias' dt, ±VIS_LIMIT_*_DEG)
- *   K 从哪来：优先 AIM 帧里带的 kx100（K230 的分辨率可切换，px/° 跟着变），
- *             没有就用默认 7.8；GP_PARAM_VIS_K 可以手动覆盖（排查用）。
- *   保护：① aim_valid=0 或 >VIS_FREEZE_MS 没新帧 -> 冻住偏置（不清零，原地等）；
- *         ② 非 AIM 模式不积分（下游本来就有回 0 斜坡）。
- *   调参入口：下面 VIS_* 宏。P 太大 -> 近处来回摆；太小 -> 回正慢。
+ * K230 只负责把图像误差转换成角度误差。H723 在视觉帧到来时运行一次
+ * PID，直接输出视觉目标角：
+ *   yaw  : 锁定 IMU 角 + 视觉目标角 -> 位置环 -> 电流
+ *   pitch: 锁定编码器角 + IMU 平台俯仰 + 视觉目标角
+ *          -> 编码器位置环 -> 速度环 -> 电流
+ * 没有有效视觉帧时视觉目标角保持不变，目标角变化率前馈为零，
+ * 只剩 IMU 自稳控制。
+ *
+ * 这里不再做 alpha-beta、目标预测、误差 EMA、跳变确认或额外微分滤波。
+ * 视觉外环参数可在运行期调整：
+ *   0x0E/0x0F  yaw  Kp/Kd
+ *   0x1F/0x20  pitch Kp/Kd
+ *   0x22/0x23  yaw/pitch Ki
  * ======================================================================== */
-/* 像素/度（原 K230 的 K）。2026-10-11：K230 的处理分辨率变成可切换的
- * （640x480 / 800x600 / 480x360），px/° 随分辨率同比变化，所以 K 改成
- * **每帧跟着 AIM 走**（payload 尾部 2 字节 kx100）；没有它就用下面这个默认值
- * （= 640x480 档的现场标定值）。这样换分辨率不用重烧 H723。 */
-#define VIS_K_PX_DEG        7.8f     /* 像素/度：默认 7.8（640x480 档标定值） */
-#define VIS_K_MIN           4.0f     /* 合法范围：外面给的值不可信就用默认 */
+#define VIS_K_PX_DEG        7.142857f
+#define VIS_K_MIN           4.0f
 #define VIS_K_MAX           16.0f
-/* ⚠ 2026-10-11 现场（22 号日志）：手一动（平台约 -10°/s 被拖出去）时，偏置被
- * 积到 ~20°/s ≈ 实际需求（10°/s）的两倍 -> 冲过头、视野变斜 -> 丢靶。
- * KP 4.0 砍半到 2.0：偏置速率≈需求速率（一阶无静差跟随），不再过冲。
- * 直道回正若嫌慢：优先加 KD（下面）而不是加 KP，一次只动一个数。*/
-/* ⚠ 2026-10-11 深夜 逐条对照参考代码（用户要求"查延迟"）：
- *   外环是一条**积分链**：bias' = KP × e_deg（1/s），所以闭环时间常数
- *   τ = 1/KP —— KP=2.0 时 **τ = 0.5s**：100px(12.8°) 的误差收敛到 10px 要
- *   2.3τ ≈ 1.15s，这就是"回正慢/滞后长"的主因。
- *   参考代码（QGimbal-Vision/control/pid.py: kp=140, 归一化误差）换算到同一
- *   量纲 ≈ 10.2 (1/s) ≈ 我们的 5 倍（τ≈0.1s）—— 所以"他们的效果好"。
- *   现在把 KP 提到 6.0（τ≈0.17s，≈2.3 倍参考），同时
- *   ① 把瞬态闸门从"冻结"改成"软闸门"（见下）、② 加了饱和 anti-windup ——
- *   这两条就是当初把 KP 砍到 2.0 的原因（冲过头），现在它们没了。
- *   想再快/再稳：PARAM 0x0E（KP）、0x0F（KD）在线调，不用重烧。*/
-/* ⚠ 2026-10-11 深夜(31)：用户要求"像自稳环一样看不见滞后"（掠射位姿下画面
- *   变化最剧烈）。6.0 -> 12.0：跟随静差 = 目标角速度 / (KP/(1+KD))，翻倍后再
- *   砍一半；稳定余量还很大（环路纯延迟 ≈ 视觉一帧 25ms，判据 KP·T < 1，
- *   12×0.025 = 0.3，还有 3 倍余量）。想再快用 PARAM 0x0E 在线加。*/
-/* ⚠ 2026-10-11 深夜(32)：用户现场 —— 反应快了，但收敛时"快速左右振动"。
- *   这是典型的相位余量不足（真正的滞后在执行机构：驱动器速度环 + 死区，
- *   约 50~100ms，比视觉那 25ms 大）。加大 KD 正好两件事一起办：
- *     ① 阻尼（相位超前）；② KD 同时是"目标速度前馈"（移动靶靠它）。
- *   注意这个式子下 有效环路增益 ≈ KP/(1+KD)，所以 KP 跟着一起抬，
- *   响应速度不掉：12/1.25 = 9.6  ->  14/1.45 = 9.7（一样快）+ 阻尼翻倍。*/
-/* ⚠ 2026-10-11 深夜(35)：14 -> 16，同时 KD 0.45 -> 0.60（用户："可以再加大 D"）。
- *   现场 40Hz 示踪：误差以 **1.59Hz** 来回翻（81 次/51s），跟随时静差
- *   = (1+KD)/KP × 目标角速度 —— 16/1.60 = 10.0，与上一版 14/1.45 = 9.66 相当
- *   （速度不掉），但**超前量多了**（KD 从 0.45 到 0.60），压 1~2Hz 这种摆动更有效。*/
-#define VIS_KP_YAW          16.0f    /* 1/s：每 1° 误差给出的偏置角速度 */
-#define VIS_KP_PITCH        11.0f
-/* 微分阻尼（对应"微分滤波"：直接复用已经滤波的误差变化率 g_vis_rate_*）：
- *   rate += SIGN * KD * d(e_deg)/dt ，KD 单位 = 秒；置 0 = 关闭。
- * 作用：误差在快速收敛时提前"踩刹车"，压住过冲/来回摆。*/
-#define VIS_KD_YAW          0.60f
-#define VIS_KD_PITCH        0.45f
-#define VIS_D_LIMIT_DPS     40.0f    /* 微分项限幅（°/s）：防图像噪声喂进来 */
-#define VIS_SIGN_YAW       -1.0f     /* 与原 K230 的 SIGN_YAW/PITCH 一致 */
+
+/* 视觉PID输出作为视觉偏置角的增量速率。
+ * 偏置角在上一帧基础上持续积分，最终目标角 = IMU锁定角 + 偏置角。
+ * 俯仰检测存在离散跳变，Kd 过大时会把像素抖动放大成高频目标角摆动，
+ * 因此俯仰 Kp/Kd 比参考值更保守。 */
+#define VIS_KP_YAW          8.0f
+#define VIS_KI_YAW          0.0f
+#define VIS_KD_YAW          0.40f
+#define VIS_KP_PITCH        8.0f
+#define VIS_KI_PITCH        0.0f
+#define VIS_KD_PITCH        0.25f
+
+#define VIS_SIGN_YAW       -1.0f
 #define VIS_SIGN_PITCH     -1.0f
-#define VIS_RATE_YAW_DPS    120.0f   /* 偏置角速度限幅（°/s） */
-#define VIS_RATE_PITCH_DPS  60.0f
-#define VIS_LIMIT_YAW_DEG   120.0f   /* 偏置绝对限幅（与原 MAX_YAW_DEG 一致） */
-#define VIS_LIMIT_PITCH_DEG 20.0f
-#define VIS_FREEZE_MS       150u     /* 多久没有新帧 -> 冻住偏置 */
-#define VIS_DEADBAND_PX     3.0f     /* 像素死区（防图像噪声被积分） */
-#define VIS_DIRECT_DEADBAND_YAW_DEG   0.05f
-#define VIS_DIRECT_DEADBAND_PITCH_DEG 0.05f
-/* 像素误差一阶滤波：0.7 -> 0.8 -> 0.9（新帧才更新）。群延迟 =(1-α)/α×帧周期
- * （帧周期 ≈30ms）：0.7→12ms、0.8→6ms、0.9→3ms。
- * ⚠(37) 这条延迟直接决定"能用的环路增益上限"（相位余量），所以在
- *   打不动执行机构迟滞的前提下，这里每削 3ms 都是白赚的。
- *   0.9 的代价是误差噪声多一点；配合 3px 死区 + 速率滤波已经够用。*/
-#define VIS_EMA             0.9f
-/* The vision frame only updates the destination. The actual target advances
- * continuously at the control-loop rate so the torque loop does not receive a
- * hold-step-hold sequence once per camera frame. */
-#define VIS_TARGET_TAU_S     0.045f
-/* ---- 瞬态闸门（2026-10-11 移植自原 K230 侧，治"直角弯甩靶"）----
- * 现场（21 号日志）：过直角弯时平台被底盘拖着转，视觉误差瞬间冲到 40~50px；
- * 旧外环把这段"转弯滞后"当真实误差积分，2 秒就把偏置卷到 40°+（平台绝对
- * yaw 被推走 42°）-> 相机直接转离靶纸 -> 丢靶。
- * 但转弯时平台【绝对朝向】根本不需要变（内环稳定环负责扛住底盘），那段
- * 误差是纯滞后 —— 所以要"冻住积分"。脉冲式，同原设计：
- *   触发（误差变化率>80px/s 或平台自转>35°/s）-> 冻 200ms；
- *   冻满后强制放行 300ms（防长时间机动把闭环饿死）。*/
-/* ⚠ 2026-10-11 深夜 再改（用户："检测到误差到电机回正之间延迟太长"）：
- *   现场日志(25/27) 实测：**28% 的采样时刻处在"冻结 200ms"里**（最大 194ms），
- *   而参考代码里根本没有这一层 —— 它就是我们自己加的**纯滞后**。
- *   现在把它改成"软闸门"：触发时把偏置速率压到 VIS_GATE_SOFT（25%），
- *   而不是清零。既保留"转弯时不拿假误差卷偏置"的保护（再加上面的
- *   anti-windup 兜底），又不把跟随掐死。*/
-#define VIS_GATE_PX_S      600.0f    /* 像素误差变化率闸门（px/s）：80->120->600
-                                      * 为什么放到 600：现场日志(29) 里"手一动
-                                      * 整个台子"的合法快速跟随有 400~500px/s，
-                                      * 120 会把**正常跟随**也压到 25% 速率
-                                      * （日志里 1/3 的采样时刻在软闸门里）。
-                                      * 600px/s ≈ 15px/帧 @40fps —— 真目标单帧
-                                      * 跳这么多不可能是跟随（那是误检/换目标），
-                                      * 而"被甩"这种转折由下面的陀螺闸门兜底。*/
-/* ⚠⚠ 2026-10-11 深夜(33) 第三次改 —— 用户："转弯时振动特别严重，一顿一顿"。
- *   原因就是上面这套**脉冲式**软闸门：它按"触发 200ms / 放行 300ms"的节拍
- *   把环路增益在 14 和 3.5 之间来回切 —— 增益以 ~2Hz 方波跳动，平台自然
- *   "一顿一顿"。而触发它的陀螺门限 35°/s 恰好就是转弯时最常出现的值。
- *   现在换成**连续缩放**（不再有任何时间窗/脉冲）：
- *       因子 = 1 / (1 + 超限倍数)
- *     gyro 超过 VIS_GATE_DPS 的倍数、像素速率超过 VIS_GATE_PX_S 的倍数，
- *     两者各算一个因子取小的。超限越多压得越狠（平滑、无节拍），
- *     正常情况下（不超限）= 1.0，一点不影响灵敏度。
- *   "被甩时不要把假误差卷进偏置"的保护还在：①这个连续缩放；②偏置
- *   anti-windup（指令顶限幅时不再往同方向涨）。参考代码里没有这一层。*/
-#define VIS_GATE_DPS        35.0f    /* 平台自转角速度门限（°/s） */
-#define VIS_JUMP_PX          45.0f   /* 单帧靶心跳变门限（px，两轴和） */
-#define VIS_JUMP_CONFIRM_N   2u      /* 跳变连续确认帧数 */
-#define VIS_JUMP_DEG          8.0f   /* 直接角度模式下的单帧跳变门限 */
-#define VIS_ACQUIRE_MAX_YAW_DEG   30.0f
-#define VIS_ACQUIRE_MAX_PITCH_DEG  8.0f
+#define VIS_RATE_YAW_DPS    250.0f   /* 视觉偏置角速度限幅 */
+#define VIS_RATE_PITCH_DPS  250.0f
+#define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
+#define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
+#define VIS_LIMIT_YAW_DEG   120.0f
+#define VIS_LIMIT_PITCH_DEG  20.0f
+#define VIS_FREEZE_MS       150u
+#define VIS_ERROR_YAW_LIMIT_DEG   30.0f
+#define VIS_ERROR_PITCH_LIMIT_DEG 20.0f
+/* Pixel centroids move in discrete steps.  0.35 deg yaw (~2.7 px) and
+ * 0.20 deg pitch (~1.6 px) are the quiet band where a centroid jump must
+ * not keep winding the visual target angle. */
+#define VIS_DEADBAND_YAW_DEG       0.35f
+#define VIS_DEADBAND_PITCH_DEG     0.20f
+#define VIS_JUMP_YAW_DEG           5.0f
+#define VIS_JUMP_PITCH_DEG         2.0f
+#define VIS_JUMP_MATCH_YAW_DEG     2.0f
+#define VIS_JUMP_MATCH_PITCH_DEG   0.8f
+#define VIS_JUMP_RETURN_YAW_DEG    1.0f
+#define VIS_JUMP_RETURN_PITCH_DEG  0.5f
 
-static float    g_vis_eu, g_vis_ev;              /* 滤波后的像素误差 */
-static float    g_vis_yaw_off, g_vis_pitch_off;  /* 外环输出：偏置（度） */
-static float    g_vis_yaw_target_deg;             /* 最新视觉目标 */
-static float    g_vis_pitch_target_deg;
-static uint8_t  g_vis_target_valid;
-static uint32_t g_vis_last_ms;                   /* 已处理的帧时间戳 */
-static uint8_t  g_vis_seen;                      /* 是否已收到过有效帧 */
-static float    g_vis_rate_u, g_vis_rate_v;      /* 误差变化率（px/s，滤波） */
-static float    g_vis_eu_prev, g_vis_ev_prev;    /* 上一帧原始误差 */
-static uint8_t  g_vis_jump_cnt;                  /* 跳变确认计数 */
-static float    g_vis_gate_scale = 1.0f;         /* 瞬态连续缩放因子（1=不限制） */
-static float    g_vis_k_override = 0.0f;         /* 手动覆盖 K（GP_PARAM_VIS_K，0=不覆盖） */
-static float    g_vis_kp_yaw = VIS_KP_YAW;       /* 可在线改（PARAM 0x0E） */
-static float    g_vis_kd_yaw = VIS_KD_YAW;       /* 可在线改（PARAM 0x0F） */
-static float    g_vis_limyaw_deg = VIS_LIMIT_YAW_DEG;  /* 可在线改（PARAM 0x27） */
-/* ⚠ 2026-10-14（56 号联调日志："整体可以，但晃动比较厉害"）：
- *   逐行看像素差，晃动**几乎全在俯仰轴**：竖直分量周期性地甩到 ±40~58px
- *   （≈±5~8°），水平分量只有 ±6px。俯仰的视觉外环原来是**编译期常量**
- *   （KP=11/s、KD=0.45），没有在线旋钮 —— 所以先把它做成可调并默认软化：
- *     KP 11→6（外环交叉频率 ≈1.75Hz 太贴近俯仰内环带宽，是"内外环打架"的典型），
- *     KD 0.45→0.7（补阻尼）。分别用 0x1F / 0x20 在线改。*/
-static float    g_vis_kp_pitch = 4.5f;           /* 可在线改（PARAM 0x1F） */
-static float    g_vis_kd_pitch = 0.85f;          /* 可在线改（PARAM 0x20） */
-static float    g_yaw_out_rpm = YAW_OUT_RPM;     /* 可在线改（PARAM 0x10） */
-/* 偏航指令是否已经贴着限幅（+1/-1/0），给下面的视觉偏置做 anti-windup。
- * 现场日志(25)：被扰动那 2 秒里 Yc 一直贴在 ±48（限幅 ±50），而视觉偏置
- * 还在往同一方向涨到 ±24° —— 平台已经满舵了，再加偏置只会"攒账"，
- * 等扰动过去还得把这些多出来的偏置收回来（表现：甩出去 → 慢慢回正）。 */
-static float    g_yaw_sat_dir = 0.0f;
+typedef struct
+{
+    float integral_angle_deg;
+    float prev_error_deg;
+    uint8_t have_prev;
+} VisPidState_t;
 
-/** 本帧实际用哪个 K：手动覆盖 > AIM 帧带的 > 默认 7.8（超范围一律退回默认） */
+static VisPidState_t g_vis_pid_yaw;
+static VisPidState_t g_vis_pid_pitch;
+static float   g_vis_yaw_rate_dps;                /* 视觉偏置角速度 */
+static float   g_vis_pitch_rate_dps;
+static float   g_vis_yaw_error_deg;
+static float   g_vis_pitch_error_deg;
+static float   g_vis_yaw_applied_rate_dps;        /* 内环角速度前馈 */
+static float   g_vis_yaw_angle_deg;               /* 累计视觉偏置角 */
+static float   g_vis_pitch_angle_deg;
+static float   g_vis_jump_yaw_deg;
+static float   g_vis_jump_pitch_deg;
+static uint8_t g_vis_jump_pending;
+static uint32_t g_vis_last_ms;
+static uint32_t g_vis_applied_ms;
+static float   g_vis_k_override;
+static float   g_vis_kp_yaw = VIS_KP_YAW;
+static float   g_vis_ki_yaw = VIS_KI_YAW;
+static float   g_vis_kd_yaw = VIS_KD_YAW;
+static float   g_vis_kp_pitch = VIS_KP_PITCH;
+static float   g_vis_ki_pitch = VIS_KI_PITCH;
+static float   g_vis_kd_pitch = VIS_KD_PITCH;
+static float   g_vis_limyaw_deg = VIS_LIMIT_YAW_DEG;
+static float   g_yaw_out_rpm = YAW_OUT_RPM;
+
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
     float k = 0.0f;
@@ -1389,372 +1351,235 @@ static float vis_k_px_deg(const GimbalCmd_t *cmd)
     return k;
 }
 
-static void vis_outer_reset(void)
+static void vis_pid_reset(VisPidState_t *pid)
 {
-    g_vis_eu = 0.0f;
-    g_vis_ev = 0.0f;
-    g_vis_yaw_off = 0.0f;
-    g_vis_pitch_off = 0.0f;
-    g_vis_yaw_target_deg = 0.0f;
-    g_vis_pitch_target_deg = 0.0f;
-    g_vis_target_valid = 0u;
-    g_vis_seen = 0u;
-    g_vis_last_ms = 0u;
-    g_vis_rate_u = 0.0f;
-    g_vis_rate_v = 0.0f;
-    g_vis_eu_prev = 0.0f;
-    g_vis_ev_prev = 0.0f;
-    g_vis_jump_cnt = 0u;
-    g_vis_gate_scale = 1.0f;
+    pid->integral_angle_deg = 0.0f;
+    pid->prev_error_deg = 0.0f;
+    pid->have_prev = 0u;
 }
-
-#if 0
-static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
-                           uint32_t now, float dt, float gyro_z_dps)
-{
-    /* 本帧的像素尺度：K 越大说明处理分辨率越高，死区/闸门这些"像素单位"的
-     * 阈值必须跟着放大，否则换个分辨率它们的物理含义就变了。 */
-    const float k  = vis_k_px_deg(cmd);
-    const float ks = k / VIS_K_PX_DEG;
-
-    /* ---- 新帧才更新误差（像素 -> 变化率 -> 死区 -> EMA）---- */
-    if ((cmd->rx_count != 0u) && (cmd->px_ms != g_vis_last_ms))
-    {
-        float dtf = (float)(cmd->px_ms - g_vis_last_ms) / 1000.0f;
-        if ((dtf < 0.001f) || (dtf > 1.0f))
-        {
-            dtf = 0.025f;               /* 首帧/异常间隔按 40fps 估 */
-        }
-        g_vis_last_ms = cmd->px_ms;
-        if (cmd->aim_valid)
-        {
-            float eu = (cmd->vis_direct_angle != 0u)
-                       ? (cmd->vis_yaw_deg * k)
-                       : ((cmd->vis_direct_error != 0u)
-                          ? (float)cmd->vis_err_u_px
-                          : ((float)cmd->px_ut - (float)cmd->px_us));
-            float ev = (cmd->vis_direct_angle != 0u)
-                       ? (cmd->vis_pitch_deg * k)
-                       : ((cmd->vis_direct_error != 0u)
-                          ? (float)cmd->vis_err_v_px
-                          : ((float)cmd->px_vt - (float)cmd->px_vs));
-            if ((g_vis_seen == 0u) &&
-                (g_auto_search_acquired_now == 0u) &&
-                ((fabsf(eu) > (VIS_ACQUIRE_MAX_YAW_DEG * k)) ||
-                 (fabsf(ev) > (VIS_ACQUIRE_MAX_PITCH_DEG * k))))
-            {
-                g_vis_jump_cnt = 0u;
-                return;
-            }
-            uint8_t jump_hold = 0u;
-            /* 平台没有明显自转时，单帧几十像素的跳变更像误检/靶心跳变；
-             * 连续两帧都跳才认作真实快速运动，避免一帧错误点直接推偏置。 */
-            if ((g_vis_seen != 0u) &&
-                    ((fabsf(eu - g_vis_eu_prev) +
-                      fabsf(ev - g_vis_ev_prev)) > VIS_JUMP_PX) &&
-                    (fabsf(gyro_z_dps) < VIS_GATE_DPS))
-            {
-                if (g_vis_jump_cnt < (VIS_JUMP_CONFIRM_N - 1u))
-                {
-                    g_vis_jump_cnt++;
-                    jump_hold = 1u;
-                }
-                else
-                {
-                    g_vis_jump_cnt = 0u;
-                }
-            }
-            else
-            {
-                g_vis_jump_cnt = 0u;
-            }
-            if (jump_hold == 0u)
-            {
-                /* 误差变化率（px/s，一阶滤波）——瞬态闸门判据用 */
-                g_vis_rate_u += 0.5f * (((eu - g_vis_eu_prev) / dtf) -
-                                        g_vis_rate_u);
-                g_vis_rate_v += 0.5f * (((ev - g_vis_ev_prev) / dtf) -
-                                        g_vis_rate_v);
-                g_vis_eu_prev = eu;
-                g_vis_ev_prev = ev;
-                if (fabsf(eu) < (VIS_DEADBAND_PX * ks))
-                {
-                    eu = 0.0f;
-                }
-                if (fabsf(ev) < (VIS_DEADBAND_PX * ks))
-                {
-                    ev = 0.0f;
-                }
-                if (g_vis_seen == 0u)
-                {
-                    g_vis_eu = eu;      /* 第一帧直接落座（不慢慢爬） */
-                    g_vis_ev = ev;
-                    g_vis_seen = 1u;
-                    g_auto_search_acquired_now = 0u;
-                }
-                else
-                {
-                    g_vis_eu += VIS_EMA * (eu - g_vis_eu);
-                    g_vis_ev += VIS_EMA * (ev - g_vis_ev);
-                }
-            }
-        }
-    }
-    /* ---- 冻结判据：无效帧 / 断流 / 太久没新帧 / 非 AIM 模式 ---- */
-    if ((mode != GP_MODE_AIM) || (cmd->rx_count == 0u) ||
-        (cmd->aim_valid == 0u) ||
-        ((now - g_vis_last_ms) > VIS_FREEZE_MS))
-    {
-        return;             /* 冻住偏置：不积分、不清零 */
-    }
-    /* ---- 瞬态"连续"缩放（见宏说明）：超限越多压得越狠，没有任何时间窗 ----
-     * 旧版是"触发就冻/按 200ms+300ms 的节拍压到 25%"，那是平台"一顿一顿"
-     * 的直接来源（环路增益被切成方波）。现在只用瞬时量算比例：
-     *   因子 = 1 / (1 + 超限倍数)，两个判据各算一个取小。不超限 = 1.0。*/
-    float gate_scale = 1.0f;
-    {
-        float r_lim = VIS_GATE_PX_S * ks;
-        float r_max = fabsf(g_vis_rate_u);
-        if (fabsf(g_vis_rate_v) > r_max)
-        {
-            r_max = fabsf(g_vis_rate_v);
-        }
-        if (r_max > r_lim)
-        {
-            gate_scale = r_lim / r_max;         /* 1/(1+倍数) 的等价写法 */
-        }
-        float g_abs = fabsf(gyro_z_dps);
-        if (g_abs > VIS_GATE_DPS)
-        {
-            float gs = VIS_GATE_DPS / g_abs;
-            if (gs < gate_scale)
-            {
-                gate_scale = gs;
-            }
-        }
-    }
-    /* ---- 500Hz 连续积分出偏置（P + 微分阻尼，见宏说明）---- */
-    {
-        float du_dps = clampf(g_vis_rate_u / k, -200.0f, 200.0f);
-        float dv_dps = clampf(g_vis_rate_v / k, -200.0f, 200.0f);
-        float du_d = clampf(g_vis_kd_yaw * du_dps,
-                            -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
-        float dv_d = clampf(g_vis_kd_pitch * dv_dps,
-                            -VIS_D_LIMIT_DPS, VIS_D_LIMIT_DPS);
-        float ru = gate_scale * VIS_SIGN_YAW * (g_vis_kp_yaw * (g_vis_eu / k) +
-                                                du_d);
-        float rv = gate_scale * VIS_SIGN_PITCH * \
-                   (g_vis_kp_pitch * (g_vis_ev / k) + dv_d);
-        /* ---- 偏航 anti-windup：指令已经顶着限幅时，不许再往同一方向加偏置
-         * （反向的修正照收）。没有这一条：平台满舵期间偏置一直涨，
-         * 扰动结束后要花好几秒把这些虚账收回来（现场：甩出去又慢慢回正）。*/
-        if (((g_yaw_sat_dir > 0.0f) && (ru > 0.0f)) ||
-            ((g_yaw_sat_dir < 0.0f) && (ru < 0.0f)))
-        {
-            ru = 0.0f;
-        }
-        ru = clampf(ru, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS);
-        rv = clampf(rv, -VIS_RATE_PITCH_DPS, VIS_RATE_PITCH_DPS);
-        g_vis_yaw_off = clampf(g_vis_yaw_off + ru * dt,
-                               -g_vis_limyaw_deg, g_vis_limyaw_deg);
-        g_vis_pitch_off = clampf(g_vis_pitch_off + rv * dt,
-                                 -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
-    }
-}
-#endif
 
 /**
- * Direct visual target update.
- *
- * Each valid frame moves the previous absolute target toward the pose plus
- * physical residual. The yaw/pitch inner PIDs remain the only PIDs.
+ * 一次视觉外环 PID 计算。
+ * 输入角度误差，输出视觉偏置角速度；额外的Ki默认关闭，
+ * 偏置角由调用者持续积分。
  */
-static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
-                           uint32_t now, float dt, float gyro_z_dps)
+static float vis_pid_step(VisPidState_t *pid, float error_deg, float dt,
+                          float kp, float ki, float kd, float out_limit)
 {
-    float yaw_deg, pitch_deg;
-    float filtered_yaw, filtered_pitch;
-    uint8_t jump_hold = 0u;
-    uint8_t new_frame;
-    const float k = vis_k_px_deg(cmd);
-    const float rad2deg = 57.29578f;
+    float p;
+    float d = 0.0f;
+    float next_i;
+    float out;
 
-    if ((mode != GP_MODE_AIM) || (g_auto_search_active != 0u) ||
-        (cmd->rx_count == 0u))
+    dt = clampf(dt, 0.001f, 0.100f);
+    p = kp * error_deg;
+    if (pid->have_prev != 0u)
     {
-        g_vis_yaw_off = 0.0f;
-        g_vis_pitch_off = 0.0f;
-        g_vis_yaw_target_deg = 0.0f;
-        g_vis_pitch_target_deg = 0.0f;
-        g_vis_target_valid = 0u;
+        d = clampf(kd * ((error_deg - pid->prev_error_deg) / dt),
+                   -VIS_D_LIMIT_ANGLE_DEG, VIS_D_LIMIT_ANGLE_DEG);
+    }
+    next_i = clampf(pid->integral_angle_deg + (ki * error_deg * dt),
+                    -VIS_I_LIMIT_ANGLE_DEG, VIS_I_LIMIT_ANGLE_DEG);
+    out = p + next_i + d;
+
+    if (((out > out_limit) && (error_deg > 0.0f)) ||
+        ((out < -out_limit) && (error_deg < 0.0f)))
+    {
+        out = p + pid->integral_angle_deg + d;  /* anti-windup */
+    }
+    else
+    {
+        pid->integral_angle_deg = next_i;
+    }
+
+    pid->prev_error_deg = error_deg;
+    pid->have_prev = 1u;
+    return clampf(out, -out_limit, out_limit);
+}
+
+static void vis_outer_reset(void)
+{
+    vis_pid_reset(&g_vis_pid_yaw);
+    vis_pid_reset(&g_vis_pid_pitch);
+    g_vis_yaw_rate_dps = 0.0f;
+    g_vis_pitch_rate_dps = 0.0f;
+    g_vis_yaw_error_deg = 0.0f;
+    g_vis_pitch_error_deg = 0.0f;
+    g_vis_yaw_applied_rate_dps = 0.0f;
+    g_vis_yaw_angle_deg = 0.0f;
+    g_vis_pitch_angle_deg = 0.0f;
+    g_vis_jump_yaw_deg = 0.0f;
+    g_vis_jump_pitch_deg = 0.0f;
+    g_vis_jump_pending = 0u;
+    g_vis_last_ms = 0u;
+    g_vis_applied_ms = 0u;
+}
+
+static void vis_read_error_deg(const GimbalCmd_t *cmd, float k,
+                               float *yaw_deg, float *pitch_deg)
+{
+    if (cmd->vis_direct_angle != 0u)
+    {
+        *yaw_deg = cmd->vis_yaw_deg;
+        *pitch_deg = cmd->vis_pitch_deg;
+    }
+    else if (cmd->vis_direct_error != 0u)
+    {
+        *yaw_deg = (float)cmd->vis_err_u_px / k;
+        *pitch_deg = (float)cmd->vis_err_v_px / k;
+    }
+    else
+    {
+        *yaw_deg = ((float)cmd->px_ut - (float)cmd->px_us) / k;
+        *pitch_deg = ((float)cmd->px_vt - (float)cmd->px_vs) / k;
+    }
+}
+
+static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
+                           uint32_t now)
+{
+    if ((mode != GP_MODE_AIM) || (cmd->rx_count == 0u))
+    {
+        g_vis_yaw_rate_dps = 0.0f;
+        g_vis_pitch_rate_dps = 0.0f;
+        g_vis_yaw_applied_rate_dps = 0.0f;
+        g_vis_jump_pending = 0u;
         return;
     }
-    /* Hold through a short dropout; an explicit 404 still switches to STAB. */
+
     if ((cmd->aim_valid == 0u) || ((now - cmd->px_ms) > VIS_FREEZE_MS))
     {
+        g_vis_yaw_rate_dps = 0.0f;
+        g_vis_pitch_rate_dps = 0.0f;
+        g_vis_yaw_applied_rate_dps = 0.0f;
+        g_vis_jump_pending = 0u;
         return;
     }
-    new_frame = (uint8_t)(cmd->px_ms != g_vis_last_ms);
-    if (new_frame != 0u)
+
+    if (cmd->px_ms != g_vis_last_ms)
     {
-        if (cmd->vis_direct_angle != 0u)
-        {
-            yaw_deg = cmd->vis_yaw_deg;
-            pitch_deg = cmd->vis_pitch_deg;
-        }
-        else if (cmd->vis_direct_error != 0u)
-        {
-            yaw_deg = (float)cmd->vis_err_u_px / k;
-            pitch_deg = (float)cmd->vis_err_v_px / k;
-        }
-        else
-        {
-            yaw_deg = ((float)cmd->px_ut - (float)cmd->px_us) / k;
-            pitch_deg = ((float)cmd->px_vt - (float)cmd->px_vs) / k;
-        }
+        float frame_dt = 0.0125f;
+        float yaw_deg;
+        float pitch_deg;
+        const float k = vis_k_px_deg(cmd);
 
-        if ((g_vis_seen == 0u) && (g_auto_search_acquired_now == 0u) &&
-            ((fabsf(yaw_deg) > VIS_ACQUIRE_MAX_YAW_DEG) ||
-             (fabsf(pitch_deg) > VIS_ACQUIRE_MAX_PITCH_DEG)))
+        if ((g_vis_applied_ms != 0u) && (cmd->px_ms > g_vis_applied_ms))
         {
-            g_vis_last_ms = cmd->px_ms;
-            return;
-        }
-
-        if ((g_vis_seen != 0u) &&
-            ((fabsf(yaw_deg - g_vis_eu_prev) +
-              fabsf(pitch_deg - g_vis_ev_prev)) > VIS_JUMP_DEG) &&
-            (fabsf(gyro_z_dps) < VIS_GATE_DPS))
-        {
-            if (g_vis_jump_cnt < (VIS_JUMP_CONFIRM_N - 1u))
-            {
-                g_vis_jump_cnt++;
-                jump_hold = 1u;
-            }
-            else
-            {
-                g_vis_jump_cnt = 0u;
-            }
-        }
-        else
-        {
-            g_vis_jump_cnt = 0u;
+            frame_dt = (float)(cmd->px_ms - g_vis_applied_ms) / 1000.0f;
         }
         g_vis_last_ms = cmd->px_ms;
 
-        if (jump_hold == 0u)
+        vis_read_error_deg(cmd, k, &yaw_deg, &pitch_deg);
+        yaw_deg = clampf(VIS_SIGN_YAW * yaw_deg,
+                         -VIS_ERROR_YAW_LIMIT_DEG,
+                         VIS_ERROR_YAW_LIMIT_DEG);
+        pitch_deg = clampf(VIS_SIGN_PITCH * pitch_deg,
+                           -VIS_ERROR_PITCH_LIMIT_DEG,
+                           VIS_ERROR_PITCH_LIMIT_DEG);
+        if (fabsf(yaw_deg) < VIS_DEADBAND_YAW_DEG)
         {
-            g_vis_eu_prev = yaw_deg;
-            g_vis_ev_prev = pitch_deg;
-            if (g_vis_seen == 0u)
-            {
-                filtered_yaw = yaw_deg;
-                filtered_pitch = pitch_deg;
-                g_vis_seen = 1u;
-                g_auto_search_acquired_now = 0u;
-            }
-            else
-            {
-                filtered_yaw = g_vis_eu + VIS_EMA * (yaw_deg - g_vis_eu);
-                filtered_pitch = g_vis_ev + VIS_EMA * (pitch_deg - g_vis_ev);
-            }
-            g_vis_eu = filtered_yaw;
-            g_vis_ev = filtered_pitch;
-            if (fabsf(filtered_yaw) < VIS_DIRECT_DEADBAND_YAW_DEG)
-            {
-                filtered_yaw = 0.0f;
-            }
-            if (fabsf(filtered_pitch) < VIS_DIRECT_DEADBAND_PITCH_DEG)
-            {
-                filtered_pitch = 0.0f;
-            }
-
-            g_vis_yaw_target_deg = clampf(
-                (angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * rad2deg) +
-                    VIS_SIGN_YAW * filtered_yaw,
-                -g_vis_limyaw_deg, g_vis_limyaw_deg);
-            g_vis_pitch_target_deg = clampf(
-                ((g_pitch_fb.seen != 0u)
-                    ? (g_pitch_fb.cont - g_pitch_motor_lock)
-                    : g_vis_pitch_off) +
-                    VIS_SIGN_PITCH * filtered_pitch,
-                -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
-            g_vis_target_valid = 1u;
+            yaw_deg = 0.0f;
         }
-    }
+        if (fabsf(pitch_deg) < VIS_DEADBAND_PITCH_DEG)
+        {
+            pitch_deg = 0.0f;
+        }
+        g_vis_yaw_error_deg = yaw_deg;
+        g_vis_pitch_error_deg = pitch_deg;
 
-    if (g_vis_target_valid != 0u)
-    {
-        float dt_safe = clampf(dt, 0.001f, 0.02f);
-        float alpha = dt_safe / (VIS_TARGET_TAU_S + dt_safe);
-        g_vis_yaw_off += alpha * (g_vis_yaw_target_deg - g_vis_yaw_off);
-        g_vis_pitch_off += alpha * (g_vis_pitch_target_deg - g_vis_pitch_off);
-        g_vis_yaw_off = clampf(g_vis_yaw_off,
-                               -g_vis_limyaw_deg, g_vis_limyaw_deg);
-        g_vis_pitch_off = clampf(g_vis_pitch_off,
-                                 -VIS_LIMIT_PITCH_DEG,
-                                 VIS_LIMIT_PITCH_DEG);
-    }
-}
+        /* 单帧大跳保护：先挂起一帧；下一帧仍在候选附近才接受，
+         * 回到原位置则撤销。正常的小变化和平滑跟踪不经过任何滤波。 */
+        if ((g_vis_pid_yaw.have_prev != 0u) &&
+            (g_vis_pid_pitch.have_prev != 0u))
+        {
+            float yaw_from_pending = fabsf(yaw_deg - g_vis_jump_yaw_deg);
+            float pitch_from_pending = fabsf(pitch_deg - g_vis_jump_pitch_deg);
+            float yaw_from_last =
+                fabsf(yaw_deg - g_vis_pid_yaw.prev_error_deg);
+            float pitch_from_last =
+                fabsf(pitch_deg - g_vis_pid_pitch.prev_error_deg);
 
-static void yuntai_startup_search_start(void)
-{
-    g_pitch_search_base = g_pitch_motor_lock;
-    g_auto_search_pitch_offset_deg = 0.0f;
-    g_auto_search_pitch_magnitude_deg = 0.0f;
-    g_auto_search_pitch_up = 1u;
-    g_auto_search_yaw_sweep_deg = 0.0f;
-    g_auto_search_yaw_target_deg = 0.0f;
-    g_auto_search_valid_streak = 0u;
-    g_auto_search_last_seq = gimbal_link_cmd()->vision_seq;
-    g_auto_search_active = (uint8_t)AUTO_SEARCH_ENABLE;
-    g_auto_search_raster = 0u;
-    if (g_auto_search_active != 0u)
-    {
-        gimbal_link_log("[SEARCH] initial pitch-up 10deg");
-    }
-}
+            if (g_vis_jump_pending != 0u)
+            {
+                if ((yaw_from_pending <= VIS_JUMP_MATCH_YAW_DEG) &&
+                    (pitch_from_pending <= VIS_JUMP_MATCH_PITCH_DEG))
+                {
+                    g_vis_jump_pending = 0u;  /* 连续帧确认新目标 */
+                }
+                else if ((yaw_from_last <= VIS_JUMP_RETURN_YAW_DEG) &&
+                         (pitch_from_last <= VIS_JUMP_RETURN_PITCH_DEG))
+                {
+                    g_vis_jump_pending = 0u;  /* 异常帧已消失 */
+                }
+                else
+                {
+                    g_vis_jump_yaw_deg = yaw_deg;
+                    g_vis_jump_pitch_deg = pitch_deg;
+                    g_vis_yaw_rate_dps = 0.0f;
+                    g_vis_pitch_rate_dps = 0.0f;
+                    g_vis_yaw_applied_rate_dps = 0.0f;
+                    return;
+                }
+            }
+            else if ((yaw_from_last > VIS_JUMP_YAW_DEG) ||
+                     (pitch_from_last > VIS_JUMP_PITCH_DEG))
+            {
+                g_vis_jump_pending = 1u;
+                g_vis_jump_yaw_deg = yaw_deg;
+                g_vis_jump_pitch_deg = pitch_deg;
+                g_vis_yaw_rate_dps = 0.0f;
+                g_vis_pitch_rate_dps = 0.0f;
+                g_vis_yaw_applied_rate_dps = 0.0f;
+                return;
+            }
+        }
 
-static void yuntai_lost_search_start(void)
-{
-    if (g_target_seen_once == 0u)
-    {
-        yuntai_startup_search_start();
-        return;
+        /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
+         * 没有新视觉帧时偏置角保持，不清零。 */
+        {
+            float yaw_rate = g_yaw_vis_gain *
+                vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
+                             g_vis_kp_yaw, g_vis_ki_yaw,
+                             g_vis_kd_yaw, VIS_RATE_YAW_DPS);
+            float pitch_rate = vis_pid_step(&g_vis_pid_pitch, pitch_deg,
+                                             frame_dt, g_vis_kp_pitch,
+                                             g_vis_ki_pitch, g_vis_kd_pitch,
+                                             VIS_RATE_PITCH_DPS);
+            g_vis_yaw_rate_dps = yaw_rate;
+            g_vis_pitch_rate_dps = pitch_rate;
+            g_vis_yaw_angle_deg = clampf(
+                g_vis_yaw_angle_deg + yaw_rate * frame_dt,
+                -g_vis_limyaw_deg, g_vis_limyaw_deg);
+            g_vis_pitch_angle_deg = clampf(
+                g_vis_pitch_angle_deg + pitch_rate * frame_dt,
+                -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
+            g_vis_yaw_applied_rate_dps = g_vis_yaw_rate_dps;
+        }
+        g_vis_applied_ms = cmd->px_ms;
     }
-
-    g_pitch_search_base = g_pitch_motor_lock;
-    g_auto_search_pitch_offset_deg = 0.0f;
-    g_auto_search_pitch_magnitude_deg = 0.0f;
-    g_auto_search_pitch_up = 1u;
-    g_auto_search_yaw_sweep_deg = 0.0f;
-    g_auto_search_yaw_target_deg = 0.0f;
-    g_auto_search_valid_streak = 0u;
-    g_auto_search_last_seq = gimbal_link_cmd()->vision_seq;
-    g_auto_search_active = (uint8_t)AUTO_SEARCH_ENABLE;
-    g_auto_search_raster = 1u;
-    if (g_auto_search_active != 0u)
+    else
     {
-        gimbal_link_log("[SEARCH] yaw 360deg, pitch both sides");
+        /* 姿态目标保持不变，但视觉目标角变化率前馈只属于新帧。 */
+        g_vis_yaw_applied_rate_dps = 0.0f;
     }
 }
 
 static void yuntai_lock_reference(void)
 {
     g_yaw_lock_rad      = imuAngle[0];       /* 绝对方位基准 */
-    g_yaw_off_applied   = 0.0f;              /* 偏置斜坡从 0 重新起步（防重锁时跳一下） */
-    g_yaw_off_prev      = 0.0f;              /* 前馈里的"视觉要求转速"也从 0 起 */
-    vis_outer_reset();                       /* 视觉外环偏置也从 0 起步（新架构） */
+    vis_outer_reset();                       /* 视觉目标角从 0 起步 */
     g_pitch_plat_lock   = imuAngle[1];       /* 平台俯仰基准 */
     g_pitch_imu_lock    = imuAngle[1];       /* 力矩模式下俯仰的世界系基准 */
     g_plat_dtheta       = 0.0f;              /* 平台俯仰变化量从 0 重新算 */
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
     g_pitch_motor_lock  = g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f;
     g_pitch_tgt_deg     = g_pitch_motor_lock;
-    g_auto_search_pitch_offset_deg = 0.0f;
-    g_auto_search_yaw_sweep_deg = 0.0f;
-    g_auto_search_yaw_target_deg = 0.0f;
-    g_auto_search_valid_streak = 0u;
+    g_pitch_tq_i        = 0.0f;
+    g_pitch_iq_ma       = 0.0f;
+    g_pitch_iq_filt     = 0.0f;
+    g_mot_rate_f = 0.0f;
+    g_yaw_base_rate = 0.0f;
+    g_yaw_pos_ms = 0u;
 
     g_yaw_fb.zero       = g_yaw_fb.cont;     /* 相对偏航角从这里开始算 0 */
     g_pitch_fb.zero     = g_pitch_fb.cont;
@@ -1967,7 +1792,9 @@ static void yuntai_imu_update(uint32_t now)
         return;
     }
     g_last_imu_ms = now;
+    yuntai_mark_stage(16u);
     BMI088_read(gyro, acc, &temp);
+    yuntai_mark_stage(17u);
     /* 扣掉上电时标定出来的零偏。不做这一步的话，零偏会被积分成
      * "角度在匀速漂"，偏航环就会驱动平台朝一个方向慢慢转。 */
     for (i = 0u; i < 3u; i++)
@@ -2004,6 +1831,7 @@ static void yuntai_control(uint32_t now)
     float yaw_rpm, pitch_rpm;
     uint8_t pitch_fb_ok;
 
+    yuntai_mark_stage(30u);
     /* 陀螺零偏慢速自校准：平台静止时悄悄把零偏修准（见函数说明） */
     gyro_bias_track();
 
@@ -2012,7 +1840,6 @@ static void yuntai_control(uint32_t now)
     {
         g_prev_mode   = mode;
         g_unwind_done = 0u;
-        g_yaw_off_prev = g_yaw_off_applied;   /* 防模式切换后第一拍算出假的变化率 */
         if (mode == GP_MODE_AIM)
         {
             vis_outer_reset();
@@ -2048,19 +1875,16 @@ static void yuntai_control(uint32_t now)
     }
 
     /* ---- 编码器反馈：每周期抽干一次，队列永远不会堆满 ---- */
+    yuntai_mark_stage(31u);
     yuntai_read_feedback(now);
     pitch_fb_ok = enc_fresh(&g_pitch_fb, now, PITCH_FB_TIMEOUT_MS);
 
-    /* ---- 平台俯仰变化量的估计（互补滤波）----
-     * 只用陀螺积分会漂；只用加速度计会被车的加减速带偏（1m/s² ≈ 5.7°）。
-     * 所以：陀螺负责"快"（不受线加速度影响），Mahony 姿态角负责"慢"
-     * （有重力做绝对基准、不会长期漂）—— 这正是互补滤波。
-     * 这条估计是"平台俯仰补偿"的输入，见 PITCH_PLAT_COMP 的注释。 */
+    /* ---- 平台俯仰相对锁定零点的变化量 ----
+     * 直接使用 AHRS 平台俯仰角，不再额外串联互补滤波。
+     * 俯仰端点角 = 平台 IMU 俯仰 + 电机俯仰 - 锁定零点。 */
     if (g_imu_ok)
     {
-        g_plat_dtheta += gyro_c[1] * dt;
-        g_plat_dtheta += (dt / PLAT_COMP_ACC_TAU_S) *
-                         ((imuAngle[1] - g_pitch_plat_lock) - g_plat_dtheta);
+        g_plat_dtheta = angle_diff_rad(imuAngle[1], g_pitch_plat_lock);
         g_plat_dtheta = clampf(g_plat_dtheta, -1.75f, 1.75f);   /* ±100° */
     }
 
@@ -2068,127 +1892,16 @@ static void yuntai_control(uint32_t now)
     if (gimbal_link_take_zero_req())
     {
         yuntai_lock_reference();
-        yuntai_lost_search_start();
     }
 
-    /* ---- 找靶：每圈水平转 360deg，再小步改变俯仰角。 ---- */
-    if (g_auto_search_active != 0u)
-    {
-        uint8_t vision_fresh = (uint8_t)(
-            (cmd->rx_count != 0u) &&
-            ((now - cmd->px_ms) <= VIS_FREEZE_MS)
-        );
-        uint8_t new_vision_frame = (uint8_t)(
-            vision_fresh && (cmd->vision_seq != g_auto_search_last_seq)
-        );
-
-        if (new_vision_frame)
-        {
-            g_auto_search_last_seq = cmd->vision_seq;
-            if (cmd->aim_valid != 0u)
-            {
-                if (g_auto_search_valid_streak < 3u)
-                {
-                    g_auto_search_valid_streak++;
-                }
-            }
-            else
-            {
-                g_auto_search_valid_streak = 0u;
-            }
-        }
-        if ((!vision_fresh) || (cmd->aim_valid == 0u))
-        {
-            g_auto_search_valid_streak = 0u;
-        }
-        if ((vision_fresh != 0u) && (cmd->aim_valid != 0u) &&
-            (g_auto_search_valid_streak >= 3u))
-        {
-            g_auto_search_active = 0u;
-            g_auto_search_raster = 0u;
-            g_target_seen_once = 1u;
-            g_auto_search_acquired_now = 1u;
-            yuntai_lock_reference();
-            gimbal_link_log("[SEARCH] target acquired -> AIM");
-        }
-    }
-    if ((g_auto_search_active != 0u) &&
-        ((mode == GP_MODE_STAB) || (mode == GP_MODE_AIM)))
-    {
-        if (g_auto_search_raster == 0u)
-        {
-            if (g_auto_search_pitch_offset_deg < AUTO_START_PITCH_UP_DEG)
-            {
-                g_auto_search_pitch_offset_deg +=
-                    AUTO_SEARCH_PITCH_SLEW_DPS * dt;
-                if (g_auto_search_pitch_offset_deg > AUTO_START_PITCH_UP_DEG)
-                    g_auto_search_pitch_offset_deg = AUTO_START_PITCH_UP_DEG;
-            }
-        }
-        else
-        {
-            g_auto_search_yaw_sweep_deg += AUTO_SEARCH_YAW_RATE_DPS * dt;
-            g_auto_search_yaw_target_deg += AUTO_SEARCH_YAW_RATE_DPS * dt;
-            if (g_auto_search_yaw_sweep_deg >= 360.0f)
-            {
-                g_auto_search_yaw_sweep_deg -= 360.0f;
-                if (pitch_fb_ok)
-                {
-                    if (g_auto_search_pitch_up != 0u)
-                    {
-                        g_auto_search_pitch_magnitude_deg +=
-                            AUTO_SEARCH_PITCH_STEP_DEG;
-                        if (g_auto_search_pitch_magnitude_deg >
-                            AUTO_SEARCH_PITCH_LIMIT_DEG)
-                        {
-                            g_auto_search_pitch_magnitude_deg =
-                                AUTO_SEARCH_PITCH_LIMIT_DEG;
-                        }
-                        g_auto_search_pitch_offset_deg =
-                            g_auto_search_pitch_magnitude_deg;
-                        g_auto_search_pitch_up = 0u;
-                    }
-                    else
-                    {
-                        g_auto_search_pitch_offset_deg =
-                            -g_auto_search_pitch_magnitude_deg;
-                        g_auto_search_pitch_up = 1u;
-                    }
-                }
-            }
-        }
-        if ((now - g_auto_search_log_ms) >= 1000u)
-        {
-            char sb[96];
-            char y0[12], p0[12], e0[12], e1[12];
-            g_auto_search_log_ms = now;
-            fmt_f(y0, sizeof(y0), g_auto_search_yaw_sweep_deg, 1);
-            fmt_f(p0, sizeof(p0),
-                  AUTO_SEARCH_PITCH_SIGN * g_auto_search_pitch_offset_deg, 1);
-            if (cmd->aim_valid != 0u)
-            {
-                fmt_f(e0, sizeof(e0), cmd->vis_yaw_deg, 1);
-                fmt_f(e1, sizeof(e1), cmd->vis_pitch_deg, 1);
-                snprintf(sb, sizeof(sb),
-                         "[SEARCH] yaw=%s pitch=%s err=(%s,%s) deg",
-                         y0, p0, e0, e1);
-            }
-            else
-            {
-                snprintf(sb, sizeof(sb),
-                         "[SEARCH] yaw=%s pitch=%s target=none", y0, p0);
-            }
-            gimbal_link_log(sb);
-        }
-    }
-
-    /* ---- 视觉外环：像素坐标 -> 瞄准偏置（1kHz 连续积分，见"六A"）---- */
-    vis_outer_step(cmd, (g_auto_search_active != 0u) ? GP_MODE_STAB : mode,
-                   now, dt, gyro_c[2] * rad2deg);
+    /* ---- 视觉外环：角度误差 -> 视觉目标角 ---- */
+    yuntai_mark_stage(32u);
+    vis_outer_step(cmd, mode, now);
 
     /* ======================================================================
      * 偏航轴
      * ==================================================================== */
+    yuntai_mark_stage(33u);
     if ((mode == GP_MODE_UNWIND) && (g_yaw_fb.seen != 0u))
     {
         /* 解绕：暂时不用 IMU，改用电机自己的编码器，把相对角慢慢转回 0。
@@ -2238,61 +1951,24 @@ static void yuntai_control(uint32_t now)
          *   目标 = 上电锁定的绝对方位 + 偏置
          * 偏置只在 AIM 模式下生效；STAB/IDLE 时偏置恒为 0，
          * 也就是"保持上电时的朝向不动" —— 这是掉线后的安全行为。 */
-        /* ---- 偏置斜坡（见 YAW_TGT_RATE_DPS 说明）---- */
-        /* 偏置来自上面的视觉外环（新架构）；非 AIM 时回 0（安全行为） */
-        float off_cmd = (mode == GP_MODE_AIM) ? g_vis_yaw_off : 0.0f;
-        if (g_auto_search_active != 0u)
-        {
-            off_cmd += g_auto_search_yaw_target_deg;
-        }
-        {
-            float rate = ((mode == GP_MODE_AIM) ||
-                          (g_auto_search_active != 0u))
-                         ? YAW_TGT_RATE_DPS : YAW_RETURN_RATE_DPS;
-            float dmax = rate * dt;
-            if (off_cmd > (g_yaw_off_applied + dmax))
-            {
-                off_cmd = g_yaw_off_applied + dmax;
-            }
-            else if (off_cmd < (g_yaw_off_applied - dmax))
-            {
-                off_cmd = g_yaw_off_applied - dmax;
-            }
-            g_yaw_off_applied = off_cmd;
-        }
-        float off_rad = off_cmd / rad2deg;
-        float err = angle_diff_rad(g_yaw_lock_rad + off_rad, imuAngle[0]);
-        /* 死区：误差很小时不再驱动积分（防"慢慢爬"），见 YAW_DEADBAND_DEG */
+        /* 自稳目标角 = 锁定 IMU 角 + 视觉目标角。 */
+        float visual_rad =
+            ((mode == GP_MODE_AIM) ? g_vis_yaw_angle_deg : 0.0f) / rad2deg;
+        float err = angle_diff_rad(g_yaw_lock_rad + visual_rad, imuAngle[0]);
         if (fabsf(err) < (YAW_DEADBAND_DEG / rad2deg))
         {
             err = 0.0f;
         }
         PID_Update(&g_yaw_pid, err, 0.0f, dt);
-        /* 前馈：车体怎么转，前馈就让电机反向跟多少。
-         * 它才是"手一动电机立刻跟着动"的原因；角度环只负责精修。
-         *
-         * ⚠ 2026-10-10 关键修正：IMU 装在【云台】上，gyro_z 测的是云台自己的
-         *   角速度 —— 分不清"底盘带着转"和"视觉让我们转"。
-         *   底盘转的那部分必须反着出力（抗扰）；可视觉要求的转动也被当成干扰
-         *   反向拖住，就变成"转弯结束回正时发飘、视觉跟得慢"。
-         *   所以这里把"视觉要求的转速"d(偏置)/dt 从陀螺里扣掉，前馈只反映底盘。
-         *   （9.26 那版没有这一项，这也是它为什么看着"更直接"的原因之一。） */
+
+        /* 视觉目标角变化率作为偏航速率前馈；STAB/无目标时为零。 */
         {
-            float off_rate = 0.0f;
-            if (dt > 1e-6f)
-            {
-                off_rate = (off_cmd - g_yaw_off_prev) / dt / rad2deg;  /* rad/s */
-            }
-            g_yaw_off_prev = off_cmd;
-            g_yaw_off_rate = off_rate;   /* 给力矩模式的"目标速度前馈"用 */
-            /* 速率项拆成两个方向（见 YAW_RATE_DAMP_RPM_PER_RADS 说明）：
-             *   阻尼  = -damp × (平台速率 - 视觉要求速率)   —— 抗扰/压抖
-             *   前馈  = +match × 视觉要求速率              —— 按视觉要求平滑跟
-             * 两者都乘 g_yaw_ff_sign，现场那个"前馈符号"旋钮仍然管用。*/
-            yaw_rpm = g_yaw_pid.out +
-                      g_yaw_ff_sign * (g_yaw_rate_damp *
-                                       (gyro_c[2] - off_rate) +
-                                       g_yaw_ff_gain * off_rate);
+            float visual_rate_dps =
+                (mode == GP_MODE_AIM) ? g_vis_yaw_applied_rate_dps : 0.0f;
+            g_yaw_off_rate = visual_rate_dps / rad2deg;  /* deg/s -> rad/s */
+            yaw_rpm = g_yaw_pid.out
+                    + g_yaw_ff_sign * g_yaw_rate_damp *
+                      (gyro_c[2] - g_yaw_off_rate);
             /* ---- 底盘转速估计（2026-10-13 晚；给"速度前馈"用）----
              * 恒等式：底盘转速 = 平台陀螺 − 电机相对转速。
              * ⚠ 驱动器自报的 spd 字段在偏航上恒为 0（不可信），所以改用**电机位置
@@ -2304,7 +1980,12 @@ static void yuntai_control(uint32_t now)
              *      会从"陀螺与位置差分的相位差"里冒出来，被误当成底盘转速 ——
              *      所以必须慢到只跟得上手转底盘那种 1~2Hz 的运动。
              * 估计值放 g_yaw_base_rate（rad/s），日志里的 wb= 打印的就是它。*/
-            if ((g_yaw_fb.seen != 0u) && ((now - g_yaw_pos_ms) >= 1u))
+            if (!enc_fresh(&g_yaw_fb, now, YAW_BASE_FF_FB_TIMEOUT_MS))
+            {
+                g_mot_rate_f = 0.0f;
+                g_yaw_base_rate = 0.0f;
+            }
+            else if ((now - g_yaw_pos_ms) >= 1u)
             {
                 if (g_yaw_pos_ms == 0u)
                 {
@@ -2322,8 +2003,15 @@ static void yuntai_control(uint32_t now)
                     g_yaw_pos_last = g_yaw_fb.cont;
                 }
                 g_yaw_pos_ms = now;
+                g_yaw_base_rate = clampf(
+                    gyro_c[2] - g_mot_rate_f,
+                    -YAW_BASE_RATE_LIMIT_RADS, YAW_BASE_RATE_LIMIT_RADS);
+                /* 静止时陀螺/位置差分的残差不应变成周期性电流脉冲。 */
+                if (fabsf(g_yaw_base_rate) < 0.03f)  /* ≈1.7°/s */
+                {
+                    g_yaw_base_rate = 0.0f;
+                }
             }
-            g_yaw_base_rate = gyro_c[2] - g_mot_rate_f;
         }
 
         /* ---- 静摩擦补偿：小指令也要推得动（见 YAW_STICTION_RPM 说明）---- */
@@ -2355,18 +2043,6 @@ static void yuntai_control(uint32_t now)
         }
     }
     g_yaw_cmd_rpm = clampf(yaw_rpm, -g_yaw_out_rpm, g_yaw_out_rpm);
-    /* 饱和标志（给视觉外环 anti-windup 用）：|指令| 到限幅 96% 就算"满舵"。
-     * vis_outer_step 在当前节拍之前跑，所以它用的是上一拍的标志（5ms 旧，够用）。*/
-    g_yaw_sat_dir = 0.0f;
-    if (g_yaw_cmd_rpm >= (0.96f * g_yaw_out_rpm))
-    {
-        g_yaw_sat_dir = 1.0f;
-    }
-    else if (g_yaw_cmd_rpm <= (-0.96f * g_yaw_out_rpm))
-    {
-        g_yaw_sat_dir = -1.0f;
-    }
-
     /* ---- 偏航"指令不跟"监视（2026-10-12 新增，治 38 号日志那种"卡住不响"）----
      * 38 号日志实测：指令 -16 → -33rpm 连续 2~3 秒，电机自报转速 ≈0、位置一动
      * 不动；随后突然甩成 ±330°/s 的大摆。不管根因在驱动器的哪种保护上，这种
@@ -2576,7 +2252,7 @@ static void yuntai_control(uint32_t now)
          *     KPc (0x15, A/rad)   位置刚度
          *     KDc (0x11, A/(rad/s)) 速度反馈（= 速度模式那条前馈的等价物）
          *     KIc (0x16, A/(rad·s)) 积分（消静差）
-         * 视觉目标速度前馈仍走 off_rate（AIM 时目标在动，就按 KDc 前馈跟上）。
+         * 视觉目标角变化率前馈仍走 off_rate（AIM 时目标在动，就按 KDc 跟上）。
          * 摩擦那份非线性仍由"带迟滞的脱困补偿"负责（参考代码没有滑环，不需要它）。*/
         float ilim_ma;
         /* ---- 软接入（2026-10-12）----
@@ -2615,12 +2291,15 @@ static void yuntai_control(uint32_t now)
          * 而这一步需要先顶开静摩擦。所以按 base 转速方向给一段**摩擦前馈电流**
          * （平滑饱和、不是开关）——"转底盘"还没攒出角度误差时电机就已经在出力，
          * 这一项不走反馈环，所以不会自激。*/
-        if (g_yaw_base_ff != 0.0f)
+        /* 只在 AIM 且视觉有效时启用底盘前馈。
+         * 自稳模式没有视觉目标，ybase 估计中的云台自运动会被误当成
+         * 底盘转动，直接注入电流会产生没有目标的脉冲。 */
+        if ((g_yaw_base_ff != 0.0f) &&
+            (mode == GP_MODE_AIM) && (cmd->aim_valid != 0u))
         {
-            float e = g_yaw_base_rate / 0.3f;   /* 0.3rad/s（17°/s）饱和 */
-            if (e >  1.0f) e =  1.0f;
-            if (e < -1.0f) e = -1.0f;
-            g_rate_iq_ma -= g_yaw_base_ff * 1000.0f * e;   /* A->mA */
+            float e = g_yaw_base_rate / 0.3f;
+            e = clampf(e, -1.0f, 1.0f);
+            g_rate_iq_ma -= g_yaw_base_ff * 1000.0f * e;
             g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
         }
 
@@ -2727,9 +2406,13 @@ static void yuntai_control(uint32_t now)
     /* ======================================================================
      * 俯仰轴
      * ==================================================================== */
+    yuntai_mark_stage(34u);
     if (mode == GP_MODE_ESTOP)
     {
         PID_Reset(&g_pitch_pid);
+        g_pitch_tq_i = 0.0f;
+        g_pitch_iq_ma = 0.0f;
+        g_pitch_iq_filt = 0.0f;
         pitch_rpm = 0.0f;
     }
     else if (!pitch_fb_ok)
@@ -2739,7 +2422,16 @@ static void yuntai_control(uint32_t now)
          * 表现就是"俯仰只对快动有响应、慢慢倾斜没反应" —— 遇到这种
          * 现象先怀疑编码器反馈断了，而不是 PID 没调好。 */
         PID_Reset(&g_pitch_pid);
+        g_pitch_tq_i = 0.0f;
         pitch_rpm = g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        if (g_pitch_torque != 0u)
+        {
+            g_pitch_iq_ma = clampf(
+                g_prate_kp * pitch_rpm,
+                -g_pitch_ilim_a * 1000.0f,
+                g_pitch_ilim_a * 1000.0f);
+            g_pitch_iq_filt = g_pitch_iq_ma;
+        }
     }
     else if (mode == GP_MODE_UNWIND)
     {
@@ -2747,78 +2439,59 @@ static void yuntai_control(uint32_t now)
          * 注意绝对不能写成"转到编码器 0" —— 编码器零点是任意值，
          * 那样会让俯仰猛地转过去（可能好几十度）。 */
         float err = g_pitch_motor_lock - g_pitch_fb.cont;
+        g_pitch_tq_i = 0.0f;
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
         pitch_rpm = g_pitch_pid.out + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        if (g_pitch_torque != 0u)
+        {
+            g_pitch_iq_ma = clampf(
+                g_prate_kp * pitch_rpm,
+                -g_pitch_ilim_a * 1000.0f,
+                g_pitch_ilim_a * 1000.0f);
+            g_pitch_iq_filt = g_pitch_iq_ma;
+        }
     }
     else
     {
-        float off_deg = (mode == GP_MODE_AIM) ? g_vis_pitch_off : 0.0f;
-        float plat_comp = 0.0f;
-        /* 平台俯仰补偿：底座倾了多少，俯仰目标就反向挪多少。
-         * 符号和前馈相反（sign_c = -sign_ff），理由见 PITCH_PLAT_COMP 注释。
-         * 这里对补偿量做变化率限幅（60°/s）：即使符号判错、或者 IMU 被
-         * 车的加减速带偏了一下，也只会"慢慢歪"而不会猛地一甩。 */
+        float platform_deg = 0.0f;
+        float visual_deg = 0.0f;
+
+        /* 电机编码器目标 = 锁定编码器角 - IMU 平台俯仰变化。
+         * 符号可由 0x0A 在线取反；这里不再给 IMU 目标额外串滤波或斜坡。 */
         if (g_pitch_plat_sign != 0.0f && g_imu_ok)
         {
-            float want = -g_plat_dtheta * rad2deg * g_pitch_plat_sign;
-            float dmax = PLAT_COMP_RATE_DPS * dt;
-            want = clampf(want, -PITCH_TRAVEL_LIMIT_DEG, PITCH_TRAVEL_LIMIT_DEG);
-            g_plat_comp = clampf(want, g_plat_comp - dmax, g_plat_comp + dmax);
-            plat_comp = g_plat_comp;
+            platform_deg = clampf(g_plat_dtheta * rad2deg * g_pitch_plat_sign,
+                                  -PITCH_TRAVEL_LIMIT_DEG,
+                                  PITCH_TRAVEL_LIMIT_DEG);
+            g_plat_comp = platform_deg;
         }
         else if (g_pitch_plat_sign == 0.0f)
         {
-            g_plat_comp = 0.0f;      /* 关掉时归零，重新打开时从 0 平滑起步 */
+            g_plat_comp = 0.0f;
         }
-        else
+        if (mode == GP_MODE_AIM)
         {
-            plat_comp = g_plat_comp; /* IMU 异常：冻结在最后一次补偿值 */
+            visual_deg = g_vis_pitch_angle_deg;
         }
-        float search_off = (g_auto_search_active != 0u)
-                           ? (AUTO_SEARCH_PITCH_SIGN *
-                              g_auto_search_pitch_offset_deg)
-                           : 0.0f;
-        float base_pitch = (g_auto_search_active != 0u)
-                           ? g_pitch_search_base
-                           : g_pitch_motor_lock;
-        float tgt = base_pitch + off_deg + plat_comp + search_off;
+        float tgt = g_pitch_motor_lock + platform_deg + visual_deg;
         /* 行程软限位：别撞机构、别把线扯断 */
         tgt = clampf(tgt, g_pitch_motor_lock - PITCH_TRAVEL_LIMIT_DEG,
                           g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
-        /* ---- 目标角速率限幅（防"大跳变 -> 输出打满 -> 来回打摆"）----
-         * 实测（扫描时）：目标一步跳 35° -> 位置环误差瞬间 35° -> P 项算出
-         * 525rpm -> 被限到 120rpm 一路冲过去 -> 反向再打满 …… 云台就
-         * "大幅前后摆动"（日志 p=172↔280、o=±120 打满）。
-         * 改成斜坡（150°/s）之后误差始终只有 1~2°，环路一直工作在线性区：
-         * 既不打摆，响应也够快（视觉环需要的偏置变化只有几度/秒）。 */
-        {
-            float dmax_t = ((g_auto_search_active != 0u)
-                            ? AUTO_SEARCH_PITCH_SLEW_DPS
-                            : PITCH_TGT_RATE_DPS) * dt;
-            if (tgt > g_pitch_tgt_deg + dmax_t)
-            {
-                tgt = g_pitch_tgt_deg + dmax_t;
-            }
-            else if (tgt < g_pitch_tgt_deg - dmax_t)
-            {
-                tgt = g_pitch_tgt_deg - dmax_t;
-            }
-        }
         g_pitch_tgt_deg = tgt;
 
-        /* ---- 力矩模式（俯仰）：IMU 变化"改目标" + **编码器闭环**（2026-10-14）----
-         * 结构（用户定死）：目标值 = 编码器锁定角 + 视觉偏置 + 平台补偿（IMU 变化），
-         * 反馈 = **电机编码器** —— IMU 在俯仰轴下方、看不到俯仰臂，只能是"改目标"
-         * 的那一路，绝不能当反馈。
-         * 内环换成我们自己的 1kHz 速率环（转速反馈 = 驱动器自报的编码器转速，
-         * 俯仰这一路它报得很准，±0.01rpm），替代驱动器那条 50~100ms 的慢速度环。*/
+        /* 位置环跟踪统一目标角，再叠加陀螺前馈进入 1kHz 速率环。
+         * STAB 或无有效目标时 visual_deg=0，只剩 IMU 自稳角和前馈。 */
         float err = tgt - g_pitch_fb.cont;
+        PID_Update(&g_pitch_pid, err, 0.0f, dt);
+        pitch_rpm = g_pitch_pid.out
+                  + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        pitch_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
+
         if (g_pitch_torque != 0u)
         {
             float ilim_ma = g_pitch_ilim_a * 1000.0f;
             float we;
-            PID_Update(&g_pitch_pid, err, 0.0f, dt);      /* 沿用 rpm/deg 的位置环 */
-            we = g_pitch_pid.out - g_pitch_fb.spd;        /* 速率环：编码器转速反馈 */
+            we = pitch_rpm - g_pitch_fb.spd;              /* 速率环：编码器转速反馈 */
             g_pitch_tq_i += g_prate_ki * we * dt;
             g_pitch_tq_i = clampf(g_pitch_tq_i, -ilim_ma, ilim_ma);
             g_pitch_iq_ma = clampf(g_prate_kp * we + g_pitch_tq_i,
@@ -2829,42 +2502,63 @@ static void yuntai_control(uint32_t now)
             {
                 g_pitch_iq_ma = 0.0f;
                 g_pitch_tq_i  = 0.0f;
+                g_pitch_iq_filt = 0.0f;
                 g_fault |= FAULT_PITCH_RUNAWAY;
             }
-            jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                               (int16_t)(g_pitch_iq_ma * 0.004f));
-            pitch_rpm = g_pitch_pid.out;                  /* 仅供日志 */
-        }
-        else
-        {
-        PID_Update(&g_pitch_pid, err, 0.0f, dt);
-        pitch_rpm = g_pitch_pid.out + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
-
-        /* ---- 失控保护 ----
-         * 位置环方向反了、或者机构卡死时，误差会一直很大。
-         * 这时继续输出就是"朝一个方向狂奔"，必须立刻降级成纯前馈并报故障。 */
-        if (fabsf(err) > PITCH_RUNAWAY_DEG)
-        {
-            g_runaway_ms += g_ctrl_period_ms;
-            if (g_runaway_ms > PITCH_RUNAWAY_MS)
+            else
             {
-                g_fault |= FAULT_PITCH_RUNAWAY;
-                PID_Reset(&g_pitch_pid);
-                pitch_rpm = g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+                g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
+                g_pitch_iq_filt += 0.5f *
+                    (g_pitch_iq_ma - g_pitch_iq_filt);
+                g_pitch_iq_ma = g_pitch_iq_filt;
             }
         }
         else
         {
-            g_runaway_ms = 0u;
-            g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
+            /* ---- 失控保护 ---- */
+            if (fabsf(err) > PITCH_RUNAWAY_DEG)
+            {
+                g_runaway_ms += g_ctrl_period_ms;
+                if (g_runaway_ms > PITCH_RUNAWAY_MS)
+                {
+                    g_fault |= FAULT_PITCH_RUNAWAY;
+                    PID_Reset(&g_pitch_pid);
+                    pitch_rpm = g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+                }
+            }
+            else
+            {
+                g_runaway_ms = 0u;
+                g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
+            }
         }
-        }   /* ← else：速度模式（位置环）分支结束；力矩模式在上面那支里已发完力矩 */
     }
     g_pitch_cmd_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
     g_pitch_pos_deg = g_pitch_fb.cont;
-    if (g_pitch_torque == 0u)
+    if (g_pitch_torque != 0u)
     {
+        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                           (int16_t)(g_pitch_iq_ma * 0.004f));
+    }
+    else
+    {
+        g_pitch_tq_i = 0.0f;
+        g_pitch_iq_filt = 0.0f;
         yuntai_set_pitch(g_pitch_cmd_rpm);
+    }
+
+    /* 保存最后一次力矩，IWDG 复位后用于短暂保持。 */
+    if ((g_yaw_torque != 0u) && (g_pitch_torque != 0u))
+    {
+        float yaw_tq = g_rate_iq_ma * 0.004f * g_torque_sign;
+        float pitch_tq = g_pitch_iq_ma * 0.004f;
+        g_retained.yaw_torque_x100 =
+            (int16_t)clampf(yaw_tq, -30000.0f, 30000.0f);
+        g_retained.pitch_torque_x100 =
+            (int16_t)clampf(pitch_tq, -30000.0f, 30000.0f);
+        g_retained.sequence++;
+        g_retained.magic = YUNTAI_RETAINED_MAGIC;
+        __DSB();
     }
 
     /* ---- 反馈丢失告警（每秒最多一条，不刷屏） ---- */
@@ -2881,6 +2575,137 @@ static void yuntai_control(uint32_t now)
             g_fault &= (uint8_t)~FAULT_PITCH_FB_LOST;
         }
     }
+}
+
+static void uart10_append_float(char *buf, size_t cap, size_t *pos,
+                                float value, uint8_t decimals)
+{
+    char tmp[16];
+    int n;
+
+    fmt_f(tmp, sizeof(tmp), value, decimals);
+    n = snprintf(buf + *pos, cap - *pos, ",%s", tmp);
+    if (n > 0)
+    {
+        *pos += (size_t)n;
+        if (*pos >= cap)
+        {
+            *pos = cap - 1u;
+        }
+    }
+}
+
+/* USART10 -> 蓝牙：20Hz 精简调参 CSV。
+ * 保留原始像素坐标、视觉误差/PID、姿态和电机响应；复位/故障只在开机单独一行。 */
+static void yuntai_uart10_debug(uint32_t now)
+{
+    const GimbalCmd_t *cmd = gimbal_link_cmd();
+    char line[240];
+    size_t pos = 0u;
+    uint32_t vis_age;
+    float yaw_rel_deg;
+    int n;
+
+    if (g_uart10_boot_logged == 0u)
+    {
+        n = snprintf(line, sizeof(line),
+                     "BOOT,rst=%lu,stage=%lu,stms=%lu,flt=%lu,"
+                     "cfsr=%08lX,hfsr=%08lX\r\n",
+                     (unsigned long)g_boot_reset_reason,
+                     (unsigned long)g_boot_stage,
+                     (unsigned long)g_boot_last_ms,
+                     (unsigned long)g_boot_fault_type,
+                     (unsigned long)g_boot_cfsr,
+                     (unsigned long)g_boot_hfsr);
+        if ((n > 0) && debug_uart10_send(line))
+        {
+            g_uart10_boot_logged = 1u;
+        }
+        return;
+    }
+
+    if ((now - g_last_uart10_log_ms) < 50u)
+    {
+        return;
+    }
+    g_last_uart10_log_ms = now;
+
+    if (cmd->mode != g_vis_fps_mode)
+    {
+        g_vis_fps_mode = cmd->mode;
+        g_vis_fps_win_ms = now;
+        g_vis_fps_frames = 0u;
+        g_vis_fps_seq = cmd->vision_seq;
+        g_vis_fps = 0.0f;
+    }
+    else if (g_vis_fps_win_ms == 0u)
+    {
+        g_vis_fps_win_ms = now;
+        g_vis_fps_seq = cmd->vision_seq;
+    }
+    else
+    {
+        g_vis_fps_frames +=
+            (uint8_t)(cmd->vision_seq - g_vis_fps_seq);
+        g_vis_fps_seq = cmd->vision_seq;
+        if ((now - g_vis_fps_win_ms) >= 1000u)
+        {
+            g_vis_fps = (float)g_vis_fps_frames * 1000.0f /
+                        (float)(now - g_vis_fps_win_ms);
+            g_vis_fps_win_ms = now;
+            g_vis_fps_frames = 0u;
+        }
+    }
+
+    vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms) : 9999u;
+    if (vis_age > 9999u)
+    {
+        vis_age = 9999u;
+    }
+    yaw_rel_deg = angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * 57.29578f;
+
+    n = snprintf(line, sizeof(line),
+                 "%lu,%u,%u,%u,%lu,%u,%u,%u,%u,%u",
+                 (unsigned long)now, (unsigned)cmd->mode,
+                 (unsigned)cmd->aim_valid,
+                 (unsigned)(cmd->vis_direct_angle ? 1u :
+                            (cmd->vis_direct_error ? 2u : 0u)),
+                 (unsigned long)vis_age,
+                 (unsigned)cmd->vision_seq, (unsigned)cmd->px_ut,
+                 (unsigned)cmd->px_vt, (unsigned)cmd->px_us,
+                 (unsigned)cmd->px_vs);
+    if (n <= 0)
+    {
+        return;
+    }
+    pos = (size_t)n;
+
+    uart10_append_float(line, sizeof(line), &pos, cmd->vis_distance_m, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_yaw_error_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_pitch_error_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_yaw_rate_dps, 1);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_pitch_rate_dps, 1);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_yaw_angle_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_pitch_angle_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_vis_pid_yaw.integral_angle_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_vis_pid_pitch.integral_angle_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, yaw_rel_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, gyro_c[2] * 57.29578f, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_yaw_cmd_rpm, 1);
+    uart10_append_float(line, sizeof(line), &pos, g_rate_iq_ma, 0);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_yaw_base_rate * 57.29578f, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_pitch_tgt_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos, g_pitch_cmd_rpm, 1);
+    uart10_append_float(line, sizeof(line), &pos, g_pitch_iq_ma, 0);
+    uart10_append_float(line, sizeof(line), &pos, g_vis_fps, 1);
+    snprintf(line + pos, sizeof(line) - pos,
+             ",%lu\r\n", (unsigned long)g_fault);
+    (void)debug_uart10_send(line);
 }
 
 /* 慢速调试文本：现场调参主要看这一条 */
@@ -2981,10 +2806,13 @@ static void yuntai_debug(uint32_t now)
          * 执行"就看这一对：Yc 是我们要的、ys 是电机实际在转的，两个差很远
          * （比如 Yc=-43 而 ys≈0）就是"驱动器没跟指令"，不要再往 PID 上调。 */
         fmt_f(b3, sizeof(b3), g_yaw_fb.seen ? g_yaw_fb.spd : 0.0f, 1);
-        /* 2026-10-11 新架构：这两个偏置由 H723 视觉外环现算（不再来自 K230） */
-        fmt_f(b4, sizeof(b4), g_vis_yaw_off, 1);
-        fmt_f(b5, sizeof(b5), g_vis_pitch_off, 1);
-        fmt_f(b6, sizeof(b6), g_plat_comp, 1);
+        fmt_f(b4, sizeof(b4), g_vis_yaw_angle_deg, 1);
+        fmt_f(b5, sizeof(b5), g_vis_pitch_angle_deg, 1);
+        fmt_f(b6, sizeof(b6),
+              angle_diff_rad(imuAngle[1], g_pitch_plat_lock) * 57.29578f +
+                  (g_pitch_fb.seen ? (g_pitch_fb.cont - g_pitch_motor_lock)
+                                   : 0.0f),
+              1);
         /* 偏航电机角也打出来：现场判断"还在不在飘"就看这个数有没有匀速爬
          * （实测飘的时候它以 0.245°/s 匀速增长，肉眼看不出来但日志里很明显） */
         fmt_f(b7, sizeof(b7), g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 1);
@@ -3006,18 +2834,14 @@ static void yuntai_debug(uint32_t now)
         }
         else
         {
-            char e0[12], e1[12];
-            char k0[12];
+            char w0[12], w1[12];
             uint32_t vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms)
                                                   : 9999u;
-            fmt_f(e0, sizeof(e0), g_vis_eu, 0);
-            fmt_f(e1, sizeof(e1), g_vis_ev, 0);
-            /* k = 本帧实际用的像素/度：K230 换了分辨率时这里会跟着变
-             * （不变 = 那边没带上 K，还在用默认 7.8）。 */
-            fmt_f(k0, sizeof(k0), vis_k_px_deg(cmd), 2);
+            fmt_f(w0, sizeof(w0), g_vis_yaw_rate_dps, 0);
+            fmt_f(w1, sizeof(w1), g_vis_pitch_rate_dps, 0);
             snprintf(buf, sizeof(buf),
-                     "[VIS] off=%s %s err_deg=%s,%s k=%s age=%u",
-                     b4, b5, e0, e1, k0, (unsigned)vis_age);
+                     "[VIS] w=%s,%s a=%s,%s ep=%s age=%u",
+                     w0, w1, b4, b5, b6, (unsigned)vis_age);
         }
     }
     gimbal_link_log(buf);
@@ -3030,6 +2854,86 @@ static void yuntai_debug(uint32_t now)
 void yuntai_init(void)
 {
     can_bsp_init();
+    {
+        uint32_t reset_flags = RCC->RSR & ~RCC_RSR_RMVF;
+        if ((reset_flags & RCC_RSR_IWDG1RSTF) != 0u)
+        {
+            g_boot_reset_reason = 1u;       /* IWDG */
+        }
+        else if ((reset_flags & RCC_RSR_SFTRSTF) != 0u)
+        {
+            g_boot_reset_reason = 2u;       /* software */
+        }
+        else if ((reset_flags & RCC_RSR_BORRSTF) != 0u)
+        {
+            g_boot_reset_reason = 3u;       /* brown-out */
+        }
+        else if ((reset_flags & RCC_RSR_PORRSTF) != 0u)
+        {
+            g_boot_reset_reason = 4u;       /* power-on */
+        }
+        else if ((reset_flags & RCC_RSR_PINRSTF) != 0u)
+        {
+            g_boot_reset_reason = 5u;       /* reset pin */
+        }
+        else
+        {
+            g_boot_reset_reason = 9u;       /* unknown/none */
+        }
+        g_fast_recovery =
+            (g_boot_reset_reason == 1u) ? 1u : 0u;
+    }
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+    if (g_fast_recovery != 0u)
+    {
+        g_last_hold_ms = HAL_GetTick() - 50u;
+        if (g_retained.magic == YUNTAI_RETAINED_MAGIC)
+        {
+            g_boot_stage = g_retained.last_stage;
+            g_boot_last_ms = g_retained.last_ms;
+            g_boot_fault_type = g_retained.fault_type;
+            g_boot_cfsr = g_retained.cfsr;
+            g_boot_hfsr = g_retained.hfsr;
+        }
+    }
+
+    /* 看门狗复位时优先恢复复位前最后一次力矩，让俯仰在启动窗口内
+     * 继续顶住重力；没有有效保存值时再使用零速制动。 */
+    if ((g_fast_recovery != 0u) &&
+        (g_retained.magic == YUNTAI_RETAINED_MAGIC))
+    {
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_TORQUE);
+        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_TORQUE);
+        jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                           g_retained.yaw_torque_x100);
+        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                           g_retained.pitch_torque_x100);
+    }
+    else
+    {
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, g_speed_mode);
+        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, g_speed_mode);
+        jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        jc_set_speed_rpm_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, 0);
+        jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, 0);
+        jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, 0);
+        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, 0);
+    }
+    if (g_fast_recovery == 0u)
+    {
+        /* A real power cycle invalidates retained fault diagnostics. */
+        g_retained.fault_type = 0u;
+        g_retained.cfsr = 0u;
+        g_retained.hfsr = 0u;
+        g_boot_stage = 0u;
+        g_boot_last_ms = 0u;
+        g_boot_fault_type = 0u;
+        g_boot_cfsr = 0u;
+        g_boot_hfsr = 0u;
+    }
     /* ⚠ 告诉 AHRS"我们多久调一次它"：必须等于 1000/IMU_PERIOD_MS。
      * 之前这里写死 1000Hz，而实际只在 IMU_PERIOD_MS=2ms（500Hz）调用，
      * 于是四元数积分步长 halfT 只有真实的一半 —— 姿态角"走一半"。
@@ -3084,11 +2988,12 @@ void yuntai_control_loop(void)
 {
     uint32_t now = HAL_GetTick();
 
+    yuntai_mark_stage(10u);
     switch (g_state)
     {
     /* ---- 1. 初始化 BMI088 ---- */
     case YUNTAI_STATE_BMI088_INIT:
-        if ((now - g_state_ms) >= BMI_RETRY_MS)
+        if ((now - g_state_ms) >= (g_fast_recovery ? 1u : BMI_RETRY_MS))
         {
             uint8_t result;
             char buf[40];
@@ -3128,9 +3033,39 @@ void yuntai_control_loop(void)
          * 这是"上电后云台朝一个方向慢慢转"的根因修复，且不额外花时间。
          * ⚠ 这里绝不能加"必须静止才计数/否则清零重来"之类条件 ——
          *   那种写法会卡死启动流程（见文件顶部铁律）。 */
+        /* 看门狗复位时驱动器仍上电。持续写零速，避免第一次模式命令丢失后
+         * 俯仰在启动窗口内自由下落。 */
+        if ((g_fast_recovery != 0u) &&
+            ((now - g_last_hold_ms) >= 50u))
+        {
+            g_last_hold_ms = now;
+            if (g_retained.magic == YUNTAI_RETAINED_MAGIC)
+            {
+                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                    JC_MODE_TORQUE);
+                jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                                    JC_MODE_TORQUE);
+                jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+                jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+                jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                   g_retained.yaw_torque_x100);
+                jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                                   g_retained.pitch_torque_x100);
+            }
+            else
+            {
+                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, g_speed_mode);
+                jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, g_speed_mode);
+                jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+                jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+                yuntai_set_yaw(0.0f);
+                yuntai_set_pitch(0.0f);
+            }
+        }
+
         g_bias_cal = 1u;        /* 第一次标定（电机还自由，只作粗值，LOCK 里会重测） */
         yuntai_imu_update(now); /* 里面会按 g_bias_cal 采样零偏（300~500Hz） */
-        if ((now - g_state_ms) > MOTOR_BOOT_DELAY_MS)
+        if ((now - g_state_ms) > (g_fast_recovery ? 120u : MOTOR_BOOT_DELAY_MS))
         {
             gyro_bias_finalize();
             gimbal_link_log("[MOTOR] boot delay done");
@@ -3157,7 +3092,7 @@ void yuntai_control_loop(void)
             jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
             gimbal_link_log("[MOTOR] enter closed loop");
         }
-        if ((now - g_state_ms) > CLOSED_LOOP_DELAY_MS)
+        if ((now - g_state_ms) > (g_fast_recovery ? 80u : CLOSED_LOOP_DELAY_MS))
         {
             g_state    = YUNTAI_STATE_SET_MODE;
             g_state_ms = now;
@@ -3196,7 +3131,7 @@ void yuntai_control_loop(void)
                 gimbal_link_log(sb);
             }
         }
-        if ((now - g_state_ms) > SET_MODE_DELAY_MS)
+        if ((now - g_state_ms) > (g_fast_recovery ? 80u : SET_MODE_DELAY_MS))
         {
             g_state    = YUNTAI_STATE_LOCK;
             g_state_ms = now;
@@ -3221,7 +3156,8 @@ void yuntai_control_loop(void)
          * 速度模式下给 0 指令 = 驱动器把速度环闭到 0，轴是被"按住"的，
          * 线缆扭力顶不动它 —— 这时测出来的才是真正的零偏。
          * 上电头 2 秒电机还自由，那次标定会被平台自身的缓慢转动污染。 */
-        if (g_bias_cal && (now - g_state_ms) > LOCK_BIAS_CAL_MS)
+        if (g_bias_cal &&
+            ((now - g_state_ms) > (g_fast_recovery ? 120u : LOCK_BIAS_CAL_MS)))
         {
             gyro_bias_finalize();
             g_bias_cal = 0u;
@@ -3257,7 +3193,7 @@ void yuntai_control_loop(void)
          * [REF] pitch_motor=0.00 + fault=1），之后俯仰环永远按 0 干活、前馈开路乱跑。
          * 改成：**等两个轴的编码器都上报过**再锁参考；任一轴没上报就停在这里
          * （云台保持不使能 = 安全），并把原因打出来。9.26 版没有这道判断。 */
-        if (((now - g_state_ms) > LOCK_DELAY_MS) &&
+        if (((now - g_state_ms) > (g_fast_recovery ? 260u : LOCK_DELAY_MS)) &&
             ((g_pitch_fb.seen == 0u) || (g_yaw_fb.seen == 0u)))
         {
             if (g_lock_wait_logged == 0u)
@@ -3266,7 +3202,7 @@ void yuntai_control_loop(void)
                 gimbal_link_log("[WAIT] 编码器未上报 -> 暂不锁定参考(云台保持不使能)");
             }
         }
-        if (((now - g_state_ms) > LOCK_DELAY_MS) &&
+        if (((now - g_state_ms) > (g_fast_recovery ? 260u : LOCK_DELAY_MS)) &&
             (g_pitch_fb.seen != 0u) && (g_yaw_fb.seen != 0u))
         {
             /* 注意用 g_* 当前值而不是宏：上位机可能在启动阶段就下发了新参数 */
@@ -3277,7 +3213,6 @@ void yuntai_control_loop(void)
             g_pitch_pid.integral_limit = g_pitch_ilim;
             g_pitch_pid.dead_zone      = PITCH_DEADZONE_DEG;
             yuntai_lock_reference();
-            yuntai_startup_search_start();
             g_state    = YUNTAI_STATE_RUNNING;
             g_state_ms = now;
             g_last_ctrl_ms = now;
@@ -3299,12 +3234,17 @@ void yuntai_control_loop(void)
 
     /* ---- 6. 稳定 + 瞄准 ---- */
     case YUNTAI_STATE_RUNNING:
+        yuntai_mark_stage(11u);
         yuntai_imu_update(now);
         if ((now - g_last_ctrl_ms) >= g_ctrl_period_ms)
         {
+            yuntai_mark_stage(13u);
             g_last_ctrl_ms = now;
             yuntai_control(now);
         }
+        yuntai_mark_stage(35u);
+        yuntai_uart10_debug(now);
+        yuntai_mark_stage(36u);
         yuntai_debug(now);
         break;
 
@@ -3317,7 +3257,9 @@ void yuntai_control_loop(void)
     /* 遥测与链路必须在所有状态下都刷新：
      * 上位机靠 GIMBAL_STATE 判断"云台起来没有"，
      * 如果只在 RUNNING 里发，上位机会永远停在等启动。 */
+    yuntai_mark_stage(14u);
     yuntai_update_telem(now);
+    yuntai_mark_stage(15u);
     gimbal_link_poll(now);
 }
 
@@ -3353,7 +3295,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         break;
 
     case GP_PARAM_YAW_FF_GAIN:
-        g_yaw_ff_gain = clampf(v, 0.0f, 200.0f);
+        g_yaw_vis_gain = clampf(v, 0.0f, 3.0f);
         break;
 
     case GP_PARAM_YAW_STICTION_RPM:
@@ -3414,8 +3356,12 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
 
     case GP_PARAM_PITCH_PLAT_SIGN:
         /* 平台俯仰补偿：0 = 关，±1 = 开并定方向。
-         * 切换时把估计值和补偿量一起归零，避免"换符号瞬间目标跳几十度"。 */
+         * IMU 目标与前馈必须同号，否则目标往前推、前馈反向拖。 */
         g_pitch_plat_sign = (v == 0.0f) ? 0.0f : s;
+        if (v != 0.0f)
+        {
+            g_pitch_ff_sign = s;
+        }
         g_plat_comp       = 0.0f;
         g_plat_dtheta     = 0.0f;
         PID_Reset(&g_pitch_pid);
@@ -3424,7 +3370,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
     case GP_PARAM_VIS_K:
         /* 视觉外环的 K（像素/度）。正常不用发：K230 每帧的 AIM 里已经带着 K。
          * 这里只在排查"是不是 K 用错了"时手动覆盖：
-         *   发 0~3.99  = 取消覆盖，回到"AIM 帧里的 K / 默认 7.8"；
+     *   发 0~3.99  = 取消覆盖，回到"AIM 帧里的 K / 默认 7.142857"；
          *   发 4.0~16  = 强制用这个值。 */
         g_vis_k_override = clampf(v, 0.0f, VIS_K_MAX);
         if (g_vis_k_override < VIS_K_MIN)
@@ -3434,11 +3380,31 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         break;
 
     case GP_PARAM_VIS_KP_YAW:
-        g_vis_kp_yaw = clampf(v, 0.5f, 12.0f);
+        g_vis_kp_yaw = clampf(v, 0.2f, 20.0f);
+        break;
+
+    case GP_PARAM_VIS_KI_YAW:
+        g_vis_ki_yaw = clampf(v, 0.0f, 10.0f);
+        vis_pid_reset(&g_vis_pid_yaw);
+        break;
+
+    case GP_PARAM_VIS_KD_YAW:
+        g_vis_kd_yaw = clampf(v, 0.0f, 3.0f);
+        vis_pid_reset(&g_vis_pid_yaw);
         break;
 
     case GP_PARAM_VIS_KP_PITCH:
-        g_vis_kp_pitch = clampf(v, 0.5f, 12.0f);
+        g_vis_kp_pitch = clampf(v, 0.2f, 20.0f);
+        break;
+
+    case GP_PARAM_VIS_KI_PITCH:
+        g_vis_ki_pitch = clampf(v, 0.0f, 10.0f);
+        vis_pid_reset(&g_vis_pid_pitch);
+        break;
+
+    case GP_PARAM_VIS_KD_PITCH:
+        g_vis_kd_pitch = clampf(v, 0.0f, 3.0f);
+        vis_pid_reset(&g_vis_pid_pitch);
         break;
 
     case GP_PARAM_TQ_I_LIM:
@@ -3667,7 +3633,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         snprintf(buf, sizeof(buf), "[PARAM] pitKd %s iLim %s", n1, n2);
         gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_pitch_out_rpm, 0);
-        fmt_f(n2, sizeof(n2), g_yaw_ff_gain, 1);
+        fmt_f(n2, sizeof(n2), g_yaw_vis_gain, 1);
         snprintf(buf, sizeof(buf), "[PARAM] pitOut %s yawFFg %s", n1, n2);
         gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_pitch_plat_sign, 1);
@@ -3678,7 +3644,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         fmt_f(n2, sizeof(n2), g_yaw_ilim, 2);
         snprintf(buf, sizeof(buf), "[PARAM] yawStiction %s yawILim %s", n1, n2);
         gimbal_link_log_force(buf);
-        /* K：0 = 没覆盖（用 AIM 帧带的 K，没有就是默认 7.8）。
+        /* K：0 = 没覆盖（用 AIM 帧带的 K，没有就是默认 7.142857）。
          * 每秒的 [VIS] 行里 k= 是"本帧实际用的值"，两个对照着看。 */
         fmt_f(n1, sizeof(n1), g_vis_k_override, 2);
         snprintf(buf, sizeof(buf), "[PARAM] visK override %s (0=auto)",
@@ -3688,8 +3654,16 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         fmt_f(n2, sizeof(n2), g_vis_kp_pitch, 1);
         snprintf(buf, sizeof(buf), "[PARAM] visKp y=%s p=%s", n1, n2);
         gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_vis_ki_yaw, 2);
+        fmt_f(n2, sizeof(n2), g_vis_ki_pitch, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] visKi y=%s p=%s", n1, n2);
+        gimbal_link_log_force(buf);
+        fmt_f(n1, sizeof(n1), g_vis_kd_yaw, 2);
+        fmt_f(n2, sizeof(n2), g_vis_kd_pitch, 2);
+        snprintf(buf, sizeof(buf), "[PARAM] visKd y=%s p=%s", n1, n2);
+        gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_yaw_out_rpm, 0);
-        fmt_f(n2, sizeof(n2), g_yaw_ff_gain, 1);
+        fmt_f(n2, sizeof(n2), g_yaw_vis_gain, 1);
         snprintf(buf, sizeof(buf), "[PARAM] yawOut %s yawFFg %s", n1, n2);
         gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_yaw_rate_damp, 0);

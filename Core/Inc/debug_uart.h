@@ -19,6 +19,9 @@
 #define DEBUG_RAW_UART   0
 
 void debug_uart_init(void);
+void debug_uart10_init(void);
+uint8_t debug_uart10_send(const char *msg);
+void debug_uart10_tx_complete(void);
 void debug_print(const char *msg);
 void debug_println(const char *msg);
 void debug_print_imu(float yaw, float pitch, float roll, float gx, float gy, float gz, float ax, float ay, float az);
