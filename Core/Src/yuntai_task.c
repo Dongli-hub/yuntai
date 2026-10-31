@@ -783,7 +783,7 @@ static uint32_t g_torque_on_ms  = 0u;      /* 本次进入力矩模式的时刻 
  *     需要强速度反馈才能顶住底盘拖动 —— 这正是一直想要的"速度前馈"）
  *   · KIc=8A/(rad·s)（消静差；有脱困补偿兜底，不用更大）*/
 static float   g_tq_kp    = 6000.0f;   /* mA/rad（=6 A/rad；0x15）*/
-static float   g_tq_kd    = 2000.0f;   /* mA/(rad/s)（=2.0 A/(rad/s)；0x11）
+static float   g_tq_kd    = 2500.0f;   /* mA/(rad/s)（=2.5 A/(rad/s)；0x11）
                                         * ⚠ 这条是"速度前馈"的等价物：速度模式当年的
                                         * 前馈 66.85rpm/(rad/s) 之所以能顶住底盘，是因为
                                         * 它脚下的驱动器速度环会给出"要多少电流给多少"；
@@ -1273,11 +1273,11 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * 因此俯仰 Kp/Kd 比参考值更保守。 */
 #define VIS_KP_YAW          11.0f
 #define VIS_KI_YAW          0.0f
-#define VIS_KD_YAW          0.5f
+#define VIS_KD_YAW          0.6f
 #define VIS_YAW_NEAR_DISTANCE_M    0.70f
 #define VIS_YAW_FAR_DISTANCE_M     1.00f
 #define VIS_YAW_FAR_KP_SCALE       (8.0f / 11.0f)
-#define VIS_YAW_FAR_KD_SCALE       0.60f
+#define VIS_YAW_FAR_KD_SCALE       (4.0f / 6.0f)
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
