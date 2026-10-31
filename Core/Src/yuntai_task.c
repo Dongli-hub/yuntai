@@ -1278,10 +1278,6 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_YAW_FAR_DISTANCE_M     1.00f
 #define VIS_YAW_FAR_KP_SCALE       0.80f
 #define VIS_YAW_FAR_KD_SCALE       1.00f
-#define VIS_YAW_BOOST_START_DEG    0.50f
-#define VIS_YAW_BOOST_FULL_DEG     2.00f
-#define VIS_YAW_BOOST_KP           5.00f
-#define VIS_YAW_BOOST_KD           0.20f
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
@@ -1362,22 +1358,6 @@ static void vis_yaw_gain_scales(float distance_m,
             (VIS_YAW_FAR_DISTANCE_M - VIS_YAW_NEAR_DISTANCE_M);
     *kp_scale = 1.0f + blend * (VIS_YAW_FAR_KP_SCALE - 1.0f);
     *kd_scale = 1.0f + blend * (VIS_YAW_FAR_KD_SCALE - 1.0f);
-}
-
-static float vis_yaw_error_boost(float error_deg)
-{
-    float magnitude = fabsf(error_deg);
-
-    if (magnitude <= VIS_YAW_BOOST_START_DEG)
-    {
-        return 0.0f;
-    }
-    if (magnitude >= VIS_YAW_BOOST_FULL_DEG)
-    {
-        return 1.0f;
-    }
-    return (magnitude - VIS_YAW_BOOST_START_DEG) /
-           (VIS_YAW_BOOST_FULL_DEG - VIS_YAW_BOOST_START_DEG);
 }
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
@@ -1587,21 +1567,13 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         {
             float yaw_kp_scale;
             float yaw_kd_scale;
-            float yaw_error_boost;
             float yaw_kp;
             float yaw_kd;
             float yaw_rate;
             vis_yaw_gain_scales(cmd->vis_distance_m,
                                 &yaw_kp_scale, &yaw_kd_scale);
-            yaw_error_boost = vis_yaw_error_boost(yaw_deg);
-            yaw_kp = clampf(
-                g_vis_kp_yaw * yaw_kp_scale +
-                yaw_error_boost * VIS_YAW_BOOST_KP,
-                0.2f,
-                20.0f
-            );
-            yaw_kd = g_vis_kd_yaw * yaw_kd_scale +
-                     yaw_error_boost * VIS_YAW_BOOST_KD;
+            yaw_kp = g_vis_kp_yaw * yaw_kp_scale;
+            yaw_kd = g_vis_kd_yaw * yaw_kd_scale;
             yaw_rate = g_yaw_vis_gain *
                 vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
                              yaw_kp, g_vis_ki_yaw,
