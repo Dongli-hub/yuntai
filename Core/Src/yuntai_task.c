@@ -1288,7 +1288,6 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_D_RATE_ALPHA       0.5f  /* 误差变化率一阶滤波系数 */
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
 #define VIS_FREEZE_MS       150u
@@ -1310,7 +1309,6 @@ typedef struct
 {
     float integral_angle_deg;
     float prev_error_deg;
-    float filtered_rate_deg_s;
     uint8_t have_prev;
 } VisPidState_t;
 
@@ -1385,7 +1383,6 @@ static void vis_pid_reset(VisPidState_t *pid)
 {
     pid->integral_angle_deg = 0.0f;
     pid->prev_error_deg = 0.0f;
-    pid->filtered_rate_deg_s = 0.0f;
     pid->have_prev = 0u;
 }
 
@@ -1406,10 +1403,7 @@ static float vis_pid_step(VisPidState_t *pid, float error_deg, float dt,
     p = kp * error_deg;
     if (pid->have_prev != 0u)
     {
-        float raw_rate = (error_deg - pid->prev_error_deg) / dt;
-        pid->filtered_rate_deg_s += VIS_D_RATE_ALPHA *
-            (raw_rate - pid->filtered_rate_deg_s);
-        d = clampf(kd * pid->filtered_rate_deg_s,
+        d = clampf(kd * ((error_deg - pid->prev_error_deg) / dt),
                    -VIS_D_LIMIT_ANGLE_DEG, VIS_D_LIMIT_ANGLE_DEG);
     }
     next_i = clampf(pid->integral_angle_deg + (ki * error_deg * dt),
