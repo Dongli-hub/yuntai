@@ -94,6 +94,8 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
 #define GL_TEXT_BUF_SIZE     128u
+#define GL_RX_DRAIN_MAX      256u    /* 单次最多直接从 UART 取出的字节数 */
+#define GL_RX_PARSE_MAX      256u    /* 单次最多解析的环形缓冲字节数 */
 
 /* K230 sends 0.14 deg/px at 640x480 (480x360 was 0.186667 deg/px).
  * H723's proven calibration is 7.8 px/deg = 0.128205 deg/px. */
@@ -807,6 +809,9 @@ void gimbal_link_rx_isr(void)
 
 void gimbal_link_poll(uint32_t now_ms)
 {
+    uint16_t drain_count = 0u;
+    uint16_t parse_count = 0u;
+
     /* ---- 0. 轮询兜底（关键加固）----
      * 正常情况下收字节靠 RXNE 中断；但现场排障发现 UART10 的接收
      * 一个字节都进不来（发送却是好的）。为了排除"中断没进来"这一类
@@ -816,20 +821,25 @@ void gimbal_link_poll(uint32_t now_ms)
      *   · 再打开中断，恢复正常的中断接收
      * 这样即使 NVIC/优先级那边有问题，接收也照样能工作。 */
     __HAL_UART_DISABLE_IT(&GL_RX_HUART, UART_IT_RXNE);
-    while (__HAL_UART_GET_FLAG(&GL_RX_HUART, UART_FLAG_RXNE) != 0u)
+    while (
+        __HAL_UART_GET_FLAG(&GL_RX_HUART, UART_FLAG_RXNE) != 0u
+        && drain_count < GL_RX_DRAIN_MAX
+    )
     {
         gl_rx_push((uint8_t)(GL_RX_HUART.Instance->RDR & 0xFFu));
+        drain_count++;
     }
-    if (__HAL_UART_GET_FLAG(&GL_RX_HUART, UART_FLAG_ORE) != 0u)
-    {
-        __HAL_UART_CLEAR_FLAG(&GL_RX_HUART, UART_CLEAR_OREF);
-    }
+    __HAL_UART_CLEAR_FLAG(&GL_RX_HUART, UART_CLEAR_OREF |
+                                      UART_CLEAR_FEF |
+                                      UART_CLEAR_NEF |
+                                      UART_CLEAR_PEF);
     __HAL_UART_ENABLE_IT(&GL_RX_HUART, UART_IT_RXNE);
 
     /* ---- 1. 把接收缓冲里的字节喂给解析器 ---- */
-    while (s_rx_tail != s_rx_head)
+    while (s_rx_tail != s_rx_head && parse_count < GL_RX_PARSE_MAX)
     {
         uint8_t b = s_rx_buf[s_rx_tail];
+        parse_count++;
         s_rx_tail++;
         if (s_rx_tail >= GL_RX_BUF_SIZE)
         {
