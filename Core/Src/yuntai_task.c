@@ -1293,10 +1293,10 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_FREEZE_MS       150u
 #define VIS_ERROR_YAW_LIMIT_DEG   30.0f
 #define VIS_ERROR_PITCH_LIMIT_DEG 20.0f
-/* Pixel centroids move in discrete steps.  0.35 deg yaw (~2.7 px) and
+/* Pixel centroids move in discrete steps.  0.20 deg yaw (~1.4 px) and
  * 0.20 deg pitch (~1.6 px) are the quiet band where a centroid jump must
  * not keep winding the visual target angle. */
-#define VIS_DEADBAND_YAW_DEG       0.35f
+#define VIS_DEADBAND_YAW_DEG       0.20f
 #define VIS_DEADBAND_PITCH_DEG     0.20f
 #define VIS_JUMP_YAW_DEG           5.0f
 #define VIS_JUMP_PITCH_DEG         2.0f
