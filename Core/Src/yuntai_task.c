@@ -1271,9 +1271,12 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * 偏置角在上一帧基础上持续积分，最终目标角 = IMU锁定角 + 偏置角。
  * 俯仰检测存在离散跳变，Kd 过大时会把像素抖动放大成高频目标角摆动，
  * 因此俯仰 Kp/Kd 比参考值更保守。 */
-#define VIS_KP_YAW          8.0f
+#define VIS_KP_YAW          10.0f
 #define VIS_KI_YAW          0.0f
-#define VIS_KD_YAW          0.4f
+#define VIS_KD_YAW          0.5f
+#define VIS_YAW_NEAR_DISTANCE_M    0.70f
+#define VIS_YAW_FAR_DISTANCE_M     1.00f
+#define VIS_YAW_FAR_GAIN_SCALE     0.80f
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
@@ -1331,6 +1334,24 @@ static float   g_vis_ki_pitch = VIS_KI_PITCH;
 static float   g_vis_kd_pitch = VIS_KD_PITCH;
 static float   g_vis_limyaw_deg = VIS_LIMIT_YAW_DEG;
 static float   g_yaw_out_rpm = YAW_OUT_RPM;
+
+static float vis_yaw_gain_scale(float distance_m)
+{
+    float blend;
+
+    if (distance_m <= VIS_YAW_NEAR_DISTANCE_M)
+    {
+        return 1.0f;
+    }
+    if (distance_m >= VIS_YAW_FAR_DISTANCE_M)
+    {
+        return VIS_YAW_FAR_GAIN_SCALE;
+    }
+
+    blend = (distance_m - VIS_YAW_NEAR_DISTANCE_M) /
+            (VIS_YAW_FAR_DISTANCE_M - VIS_YAW_NEAR_DISTANCE_M);
+    return 1.0f + blend * (VIS_YAW_FAR_GAIN_SCALE - 1.0f);
+}
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
@@ -1537,10 +1558,13 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
          * 没有新视觉帧时偏置角保持，不清零。 */
         {
+            float yaw_gain_scale = vis_yaw_gain_scale(cmd->vis_distance_m);
+            float yaw_kp = g_vis_kp_yaw * yaw_gain_scale;
+            float yaw_kd = g_vis_kd_yaw * yaw_gain_scale;
             float yaw_rate = g_yaw_vis_gain *
                 vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
-                             g_vis_kp_yaw, g_vis_ki_yaw,
-                             g_vis_kd_yaw, VIS_RATE_YAW_DPS);
+                             yaw_kp, g_vis_ki_yaw,
+                             yaw_kd, VIS_RATE_YAW_DPS);
             float pitch_rate = vis_pid_step(&g_vis_pid_pitch, pitch_deg,
                                              frame_dt, g_vis_kp_pitch,
                                              g_vis_ki_pitch, g_vis_kd_pitch,
