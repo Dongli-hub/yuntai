@@ -712,7 +712,7 @@ static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x1
 /* 2026-10-27: small chassis feedforward for the near->far start transient.
  * Keep it conservative because the base estimate still contains some
  * platform self-motion. */
-static float g_yaw_base_ff    = 0.5f;
+static float g_yaw_base_ff    = 0.4f;
 static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
 static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
 static float   g_yaw_pos_last;                   /* 上一帧电机位置（deg） */
