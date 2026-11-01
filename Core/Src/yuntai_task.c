@@ -1276,8 +1276,8 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_KD_YAW          0.55f
 #define VIS_YAW_NEAR_DISTANCE_M    0.70f
 #define VIS_YAW_FAR_DISTANCE_M     1.30f
-#define VIS_YAW_FAR_KP_SCALE       (8.5f / 11.0f)
-#define VIS_YAW_FAR_KD_SCALE       (0.45f / 0.55f)
+#define VIS_YAW_FAR_KP_SCALE       (9.5f / 11.0f)
+#define VIS_YAW_FAR_KD_SCALE       (0.6f / 0.55f)
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
