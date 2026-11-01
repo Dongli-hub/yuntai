@@ -381,7 +381,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[5] = {0, 0, 0, 0, 0};
+    int32_t aux[7] = {0, 0, 0, 0, 0, 0, 0};
     uint8_t aux_n = 0u;
     uint8_t aux_i;
     uint8_t lost;
@@ -398,9 +398,9 @@ static void gl_handle_text_line(uint32_t now_ms)
     {
         return;
     }
-    /* K230 新版在第 3~7 列附带靶心/激光像素和距离，仅用于诊断；
-     * 老版只有前两列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 5u; aux_i++)
+    /* K230 在第3~9列附带靶心/激光像素、距离和靶心像素速度。
+     * 老版缺少后两列时仍按原协议工作。 */
+    for (aux_i = 0u; aux_i < 7u; aux_i++)
     {
         if (*p != ',')
         {
@@ -493,6 +493,26 @@ static void gl_handle_text_line(uint32_t now_ms)
         s_cmd.px_vs = 0u;
     }
     s_cmd.vis_distance_m = (aux_n >= 5u) ? (aux[4] / 100.0f) : 0.0f;
+    if ((!lost) && (aux_n >= 7u))
+    {
+        s_cmd.target_vx_px_s = (float)aux[5] / 100.0f;
+        s_cmd.target_vy_px_s = (float)aux[6] / 100.0f;
+        if (s_cmd.target_vx_px_s > 5000.0f)
+            s_cmd.target_vx_px_s = 5000.0f;
+        if (s_cmd.target_vx_px_s < -5000.0f)
+            s_cmd.target_vx_px_s = -5000.0f;
+        if (s_cmd.target_vy_px_s > 5000.0f)
+            s_cmd.target_vy_px_s = 5000.0f;
+        if (s_cmd.target_vy_px_s < -5000.0f)
+            s_cmd.target_vy_px_s = -5000.0f;
+        s_cmd.target_velocity_valid = 1u;
+    }
+    else
+    {
+        s_cmd.target_vx_px_s = 0.0f;
+        s_cmd.target_vy_px_s = 0.0f;
+        s_cmd.target_velocity_valid = 0u;
+    }
     s_last_aim_ms = now_ms;
     if ((!lost) && (!was_aim))
     {

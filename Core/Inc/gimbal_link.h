@@ -45,6 +45,9 @@ typedef struct
     float   vis_yaw_deg;       /* ASCII 原版视觉协议：偏航角误差 */
     float   vis_pitch_deg;     /* ASCII 原版视觉协议：俯仰角误差 */
     float   vis_distance_m;    /* ASCII 诊断字段：目标距离（米） */
+    float   target_vx_px_s;    /* K230平滑后的靶心横向像素速度 */
+    float   target_vy_px_s;    /* K230平滑后的靶心纵向像素速度 */
+    uint8_t target_velocity_valid; /* 本帧是否携带目标像素速度 */
     uint8_t vis_direct_angle;  /* 1 = 直接使用上面的角度误差 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
