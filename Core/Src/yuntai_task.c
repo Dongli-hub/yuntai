@@ -1289,7 +1289,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
 #define VIS_TARGET_RATE_FF_ALPHA    0.25f
-#define VIS_TARGET_RATE_FF_GAIN     0.50f
+#define VIS_TARGET_RATE_FF_GAIN     0.80f
 #define VIS_TARGET_RATE_FF_LIMIT_DPS 150.0f
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
