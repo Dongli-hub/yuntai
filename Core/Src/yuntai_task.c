@@ -1273,11 +1273,11 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * 因此俯仰 Kp/Kd 比参考值更保守。 */
 #define VIS_KP_YAW          10.0f
 #define VIS_KI_YAW          0.0f
-#define VIS_KD_YAW          0.4f
+#define VIS_KD_YAW          0.5f
 #define VIS_YAW_NEAR_DISTANCE_M    0.70f
-#define VIS_YAW_FAR_DISTANCE_M     1.40f
-#define VIS_YAW_FAR_KP_SCALE       0.80f
-#define VIS_YAW_FAR_KD_SCALE       1.00f
+#define VIS_YAW_FAR_DISTANCE_M     1.30f
+#define VIS_YAW_FAR_KP_SCALE       (8.5f / 10.0f)
+#define VIS_YAW_FAR_KD_SCALE       (0.45f / 0.5f)
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
