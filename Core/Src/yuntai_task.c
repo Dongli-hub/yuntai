@@ -1271,13 +1271,13 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * 偏置角在上一帧基础上持续积分，最终目标角 = IMU锁定角 + 偏置角。
  * 俯仰检测存在离散跳变，Kd 过大时会把像素抖动放大成高频目标角摆动，
  * 因此俯仰 Kp/Kd 比参考值更保守。 */
-#define VIS_KP_YAW          11.0f
+#define VIS_KP_YAW          12.0f
 #define VIS_KI_YAW          0.0f
-#define VIS_KD_YAW          0.55f
+#define VIS_KD_YAW          1.05f
 #define VIS_YAW_NEAR_DISTANCE_M    0.70f
 #define VIS_YAW_FAR_DISTANCE_M     1.30f
-#define VIS_YAW_FAR_KP_SCALE       (9.5f / 11.0f)
-#define VIS_YAW_FAR_KD_SCALE       (0.6f / 0.55f)
+#define VIS_YAW_FAR_KP_SCALE       (10.5f / 12.0f)
+#define VIS_YAW_FAR_KD_SCALE       (1.10f / 1.05f)
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
@@ -1288,8 +1288,8 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_TARGET_RATE_FF_ALPHA    0.25f
-#define VIS_TARGET_RATE_FF_GAIN     1.20f
+#define VIS_TARGET_RATE_FF_ALPHA    0.35f
+#define VIS_TARGET_RATE_FF_GAIN     0.60f
 #define VIS_TARGET_RATE_FF_LIMIT_DPS 150.0f
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
