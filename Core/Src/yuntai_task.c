@@ -1288,9 +1288,6 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_TARGET_RATE_FF_ALPHA    0.25f
-#define VIS_TARGET_RATE_FF_GAIN     0.50f
-#define VIS_TARGET_RATE_FF_LIMIT_DPS 150.0f
 #define VIS_LATENCY_COMP_GAIN       0.50f
 #define VIS_LATENCY_MAX_MS          80.0f
 #define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
@@ -1326,7 +1323,6 @@ static float   g_vis_pitch_rate_dps;
 static float   g_vis_yaw_error_deg;
 static float   g_vis_pitch_error_deg;
 static float   g_vis_yaw_applied_rate_dps;        /* 内环角速度前馈 */
-static float   g_vis_target_rate_yaw_dps;         /* 独立目标角速度前馈 */
 static float   g_vis_latency_ms;
 static float   g_vis_yaw_angle_deg;               /* 累计视觉偏置角 */
 static float   g_vis_pitch_angle_deg;
@@ -1443,7 +1439,6 @@ static void vis_outer_reset(void)
     g_vis_yaw_error_deg = 0.0f;
     g_vis_pitch_error_deg = 0.0f;
     g_vis_yaw_applied_rate_dps = 0.0f;
-    g_vis_target_rate_yaw_dps = 0.0f;
     g_vis_latency_ms = 0.0f;
     g_vis_yaw_angle_deg = 0.0f;
     g_vis_pitch_angle_deg = 0.0f;
@@ -1562,27 +1557,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         g_vis_yaw_error_deg = yaw_deg;
         g_vis_pitch_error_deg = pitch_deg;
 
-        /* K230 的靶心像素速度描述的是图像系运动；加回平台陀螺后
-         * 近似得到目标在 hold 坐标系中的角速度。该量只作为前馈，
-         * 不替代视觉 P/D。 */
-        if (cmd->target_velocity_valid != 0u)
-        {
-            float image_rate_dps = cmd->target_vx_px_s / k;
-            float target_rate_dps = VIS_SIGN_YAW *
-                (image_rate_dps + gyro_c[2] * 57.29578f);
-            target_rate_dps = clampf(
-                target_rate_dps,
-                -VIS_TARGET_RATE_FF_LIMIT_DPS,
-                VIS_TARGET_RATE_FF_LIMIT_DPS
-            );
-            g_vis_target_rate_yaw_dps += VIS_TARGET_RATE_FF_ALPHA *
-                (target_rate_dps - g_vis_target_rate_yaw_dps);
-        }
-        else
-        {
-            g_vis_target_rate_yaw_dps = 0.0f;
-        }
-
         /* 单帧大跳保护：先挂起一帧；下一帧仍在候选附近才接受，
          * 回到原位置则撤销。正常的小变化和平滑跟踪不经过任何滤波。 */
         if ((g_vis_pid_yaw.have_prev != 0u) &&
@@ -1646,8 +1620,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                 vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
                              yaw_kp, g_vis_ki_yaw,
                              yaw_kd, VIS_RATE_YAW_DPS);
-            yaw_rate += VIS_TARGET_RATE_FF_GAIN *
-                g_vis_target_rate_yaw_dps;
             yaw_rate = clampf(
                 yaw_rate, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS
             );
