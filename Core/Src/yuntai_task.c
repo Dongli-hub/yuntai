@@ -1291,6 +1291,10 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TARGET_RATE_FF_ALPHA    0.25f
 #define VIS_TARGET_RATE_FF_GAIN     0.50f
 #define VIS_TARGET_RATE_FF_LIMIT_DPS 150.0f
+#define VIS_LATENCY_COMP_GAIN       0.50f
+#define VIS_LATENCY_MAX_MS          80.0f
+#define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
+#define VIS_LATENCY_PITCH_LIMIT_DEG  8.0f
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
 #define VIS_FREEZE_MS       150u
@@ -1323,6 +1327,7 @@ static float   g_vis_yaw_error_deg;
 static float   g_vis_pitch_error_deg;
 static float   g_vis_yaw_applied_rate_dps;        /* 内环角速度前馈 */
 static float   g_vis_target_rate_yaw_dps;         /* 独立目标角速度前馈 */
+static float   g_vis_latency_ms;
 static float   g_vis_yaw_angle_deg;               /* 累计视觉偏置角 */
 static float   g_vis_pitch_angle_deg;
 static float   g_vis_jump_yaw_deg;
@@ -1439,6 +1444,7 @@ static void vis_outer_reset(void)
     g_vis_pitch_error_deg = 0.0f;
     g_vis_yaw_applied_rate_dps = 0.0f;
     g_vis_target_rate_yaw_dps = 0.0f;
+    g_vis_latency_ms = 0.0f;
     g_vis_yaw_angle_deg = 0.0f;
     g_vis_pitch_angle_deg = 0.0f;
     g_vis_jump_yaw_deg = 0.0f;
@@ -1468,6 +1474,17 @@ static void vis_read_error_deg(const GimbalCmd_t *cmd, float k,
     }
 }
 
+static float vis_total_age_ms(const GimbalCmd_t *cmd, uint32_t now)
+{
+    float age_ms = (float)cmd->vis_proc_age_ms;
+
+    if (cmd->px_ms != 0u)
+    {
+        age_ms += (float)(now - cmd->px_ms);
+    }
+    return clampf(age_ms, 0.0f, 9999.0f);
+}
+
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                            uint32_t now)
 {
@@ -1476,15 +1493,18 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         g_vis_yaw_rate_dps = 0.0f;
         g_vis_pitch_rate_dps = 0.0f;
         g_vis_yaw_applied_rate_dps = 0.0f;
+        g_vis_latency_ms = 0.0f;
         g_vis_jump_pending = 0u;
         return;
     }
 
-    if ((cmd->aim_valid == 0u) || ((now - cmd->px_ms) > VIS_FREEZE_MS))
+    if ((cmd->aim_valid == 0u) ||
+        (vis_total_age_ms(cmd, now) > (float)VIS_FREEZE_MS))
     {
         g_vis_yaw_rate_dps = 0.0f;
         g_vis_pitch_rate_dps = 0.0f;
         g_vis_yaw_applied_rate_dps = 0.0f;
+        g_vis_latency_ms = 0.0f;
         g_vis_jump_pending = 0u;
         return;
     }
@@ -1495,6 +1515,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float yaw_deg;
         float pitch_deg;
         const float k = vis_k_px_deg(cmd);
+        float latency_s;
 
         if ((g_vis_applied_ms != 0u) && (cmd->px_ms > g_vis_applied_ms))
         {
@@ -1503,6 +1524,27 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         g_vis_last_ms = cmd->px_ms;
 
         vis_read_error_deg(cmd, k, &yaw_deg, &pitch_deg);
+        g_vis_latency_ms = vis_total_age_ms(cmd, now);
+        g_vis_latency_ms = clampf(
+            g_vis_latency_ms, 0.0f, VIS_LATENCY_MAX_MS
+        );
+        latency_s = g_vis_latency_ms * 0.001f;
+        if (cmd->target_velocity_valid != 0u)
+        {
+            /* 把拍摄时刻的像素误差按目标图像速度投影到当前时刻。 */
+            yaw_deg += clampf(
+                (cmd->target_vx_px_s / k) * latency_s *
+                    VIS_LATENCY_COMP_GAIN,
+                -VIS_LATENCY_YAW_LIMIT_DEG,
+                VIS_LATENCY_YAW_LIMIT_DEG
+            );
+            pitch_deg += clampf(
+                (cmd->target_vy_px_s / k) * latency_s *
+                    VIS_LATENCY_COMP_GAIN,
+                -VIS_LATENCY_PITCH_LIMIT_DEG,
+                VIS_LATENCY_PITCH_LIMIT_DEG
+            );
+        }
         yaw_deg = clampf(VIS_SIGN_YAW * yaw_deg,
                          -VIS_ERROR_YAW_LIMIT_DEG,
                          VIS_ERROR_YAW_LIMIT_DEG);
@@ -2725,11 +2767,7 @@ static void yuntai_uart10_debug(uint32_t now)
         }
     }
 
-    vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms) : 9999u;
-    if (vis_age > 9999u)
-    {
-        vis_age = 9999u;
-    }
+    vis_age = (uint32_t)vis_total_age_ms(cmd, now);
     yaw_rel_deg = angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * 57.29578f;
 
     n = snprintf(line, sizeof(line),
@@ -2903,8 +2941,7 @@ static void yuntai_debug(uint32_t now)
         else
         {
             char w0[12], w1[12];
-            uint32_t vis_age = (cmd->px_ms != 0u) ? (now - cmd->px_ms)
-                                                  : 9999u;
+            uint32_t vis_age = (uint32_t)vis_total_age_ms(cmd, now);
             fmt_f(w0, sizeof(w0), g_vis_yaw_rate_dps, 0);
             fmt_f(w1, sizeof(w1), g_vis_pitch_rate_dps, 0);
             snprintf(buf, sizeof(buf),

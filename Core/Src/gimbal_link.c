@@ -381,7 +381,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[7] = {0, 0, 0, 0, 0, 0, 0};
+    int32_t aux[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t aux_n = 0u;
     uint8_t aux_i;
     uint8_t lost;
@@ -398,9 +398,9 @@ static void gl_handle_text_line(uint32_t now_ms)
     {
         return;
     }
-    /* K230 在第3~9列附带靶心/激光像素、距离和靶心像素速度。
-     * 老版缺少后两列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 7u; aux_i++)
+    /* K230 在第3~10列附带靶心/激光像素、距离、靶心像素速度
+     * 和图像处理年龄。老版缺少后续列时仍按原协议工作。 */
+    for (aux_i = 0u; aux_i < 8u; aux_i++)
     {
         if (*p != ',')
         {
@@ -416,6 +416,12 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
 
     lost = (uint8_t)((yaw_x100 == 40400) && (pitch_x100 == 40400));
+    s_cmd.vis_proc_age_ms = 0u;
+    if ((!lost) && (aux_n >= 8u) && (aux[7] >= 0) && (aux[7] <= 100))
+    {
+        /* 第10列单位为秒×100，因此乘10得到毫秒。 */
+        s_cmd.vis_proc_age_ms = (uint16_t)(aux[7] * 10);
+    }
     if (!lost)
     {
         /* ASCII 链路偶发丢字节时，小数点缺失会把 1.83 变成 183。
@@ -596,6 +602,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_direct_error = 0u;
             s_cmd.vis_direct_angle = 0u;
             s_cmd.px_ms      = now_ms;
+            s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
             s_cmd.boost      = (uint8_t)((s_cmd.flags & GP_AIM_BOOST) ? 1u : 0u);
             s_cmd.drawing    = (uint8_t)((s_cmd.flags & GP_AIM_DRAWING) ? 1u : 0u);
@@ -635,6 +642,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.drawing   = 0u;
             s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
             s_cmd.px_ms     = now_ms;
+            s_cmd.vis_proc_age_ms = 0u;
             s_cmd.rx_count++;
             s_last_aim_ms   = now_ms;
             if (!s_alive)
