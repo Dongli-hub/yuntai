@@ -99,14 +99,15 @@ static int32_t gl_parse_x100(const char **cursor, uint8_t *ok)
 static void gl_handle_text_line(uint32_t now_ms)
 {
     const char *p = s_text_line;
-    int32_t values[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t values[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t value_count = 0u;
     uint8_t offset;
+    uint8_t velocity_offset;
     uint8_t ok;
     uint8_t lost;
     uint8_t was_aim;
 
-    while (value_count < 9u)
+    while (value_count < 10u)
     {
         values[value_count] = gl_parse_x100(&p, &ok);
         if (!ok)
@@ -127,16 +128,23 @@ static void gl_handle_text_line(uint32_t now_ms)
 
     /*
      * 新 K230：7 列原始像素。
-     * 旧 K230：2 列角度 + 7 列原始像素。
+     * 旧 K230：2 列角度 + 8 列原始像素（其中包含已废弃的距离字段）。
      * 两版都在这一个解析器里转换为统一的控制量，避免分板烧录时断链。
      */
     if (value_count == 7u)
     {
         offset = 0u;
+        velocity_offset = 4u;
     }
     else if (value_count == 9u)
     {
         offset = 2u;
+        velocity_offset = 4u;
+    }
+    else if (value_count == 10u)
+    {
+        offset = 2u;
+        velocity_offset = 5u;
     }
     else
     {
@@ -199,9 +207,11 @@ static void gl_handle_text_line(uint32_t now_ms)
             -((float)dy_x100 / 100.0f) * K230_ANGLE_PER_PX;
 
         s_cmd.target_yaw_rate_dps =
-            ((float)values[offset + 4u] / 100.0f) * K230_ANGLE_PER_PX;
+            ((float)values[offset + velocity_offset] / 100.0f) *
+            K230_ANGLE_PER_PX;
         s_cmd.target_pitch_rate_dps =
-            ((float)values[offset + 5u] / 100.0f) * K230_ANGLE_PER_PX;
+            ((float)values[offset + velocity_offset + 1u] / 100.0f) *
+            K230_ANGLE_PER_PX;
         s_cmd.target_yaw_rate_dps = (s_cmd.target_yaw_rate_dps > 640.0f) ?
                                     640.0f : s_cmd.target_yaw_rate_dps;
         s_cmd.target_yaw_rate_dps = (s_cmd.target_yaw_rate_dps < -640.0f) ?
@@ -215,9 +225,9 @@ static void gl_handle_text_line(uint32_t now_ms)
         s_cmd.target_velocity_valid = 1u;
         s_cmd.vis_proc_age_ms =
             (uint16_t)(
-                ((values[offset + 6u] >= 0) &&
-                 (values[offset + 6u] <= 1000)) ?
-                (values[offset + 6u] * 10) : 0
+                ((values[value_count - 1u] >= 0) &&
+                 (values[value_count - 1u] <= 1000)) ?
+                (values[value_count - 1u] * 10) : 0
             );
     }
 
