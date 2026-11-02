@@ -874,10 +874,6 @@ static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32
                                             * 8A=0.32Nm 仍是脉冲性质；嫌热 (0x17, 600)。*/
 static float   g_rate_i       = 0.0f;      /* 速率环积分器（mA）*/
 static float   g_rate_iq_ma   = 0.0f;      /* 最近一次输出的电流（mA，给日志看）*/
-static int16_t g_yaw_torque_x100_last;
-static int16_t g_pitch_torque_x100_last;
-static uint8_t g_yaw_torque_x100_valid;
-static uint8_t g_pitch_torque_x100_valid;
 static float g_pitch_kp       = PITCH_KP;
 static float g_pitch_ki       = PITCH_KI;
 static float g_pitch_kd       = PITCH_KD;
@@ -888,34 +884,6 @@ static float g_pitch_plat_sign = PITCH_PLAT_SIGN;   /* 默认开（老固件行�
 #else
 static float g_pitch_plat_sign = 0.0f;             /* 编译期全局关掉 */
 #endif
-
-static void yuntai_torque_cache_reset(void)
-{
-    g_yaw_torque_x100_valid = 0u;
-    g_pitch_torque_x100_valid = 0u;
-}
-
-static void yuntai_set_yaw_torque_cached(int16_t command_x100)
-{
-    if ((g_yaw_torque_x100_valid == 0u) ||
-        (command_x100 != g_yaw_torque_x100_last))
-    {
-        jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, command_x100);
-        g_yaw_torque_x100_last = command_x100;
-        g_yaw_torque_x100_valid = 1u;
-    }
-}
-
-static void yuntai_set_pitch_torque_cached(int16_t command_x100)
-{
-    if ((g_pitch_torque_x100_valid == 0u) ||
-        (command_x100 != g_pitch_torque_x100_last))
-    {
-        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, command_x100);
-        g_pitch_torque_x100_last = command_x100;
-        g_pitch_torque_x100_valid = 1u;
-    }
-}
 
 /* ==========================================================================
  * 三、小工具
@@ -1109,7 +1077,6 @@ static void yuntai_read_feedback(uint32_t now)
                     if (g_yaw_mode_recoveries < 3u)
                     {
                         g_yaw_mode_recoveries++;
-                        g_yaw_torque_x100_valid = 0u;
                         jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
                                             expect);
                         jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
@@ -1183,7 +1150,6 @@ static void yuntai_read_feedback(uint32_t now)
                     if (g_pitch_mode_recoveries < 3u)
                     {
                         g_pitch_mode_recoveries++;
-                        g_pitch_torque_x100_valid = 0u;
                         jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
                                             expect_p);
                         jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
@@ -2350,8 +2316,8 @@ static void yuntai_control(uint32_t now)
             ((now - g_last_torque_wr_ms) >= g_torque_wr_ms))
         {
             g_last_torque_wr_ms = now;
-            yuntai_set_yaw_torque_cached(
-                (int16_t)(g_rate_iq_ma * 0.004f * g_torque_sign));
+            jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                               (int16_t)(g_rate_iq_ma * 0.004f * g_torque_sign));
         }
     }
     else
@@ -2480,8 +2446,8 @@ static void yuntai_control(uint32_t now)
     g_pitch_pos_deg = g_pitch_fb.cont;
     if (g_pitch_torque != 0u)
     {
-        yuntai_set_pitch_torque_cached(
-            (int16_t)(g_pitch_iq_ma * 0.004f));
+        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
+                           (int16_t)(g_pitch_iq_ma * 0.004f));
     }
     else
     {
@@ -2791,7 +2757,6 @@ static void yuntai_debug(uint32_t now)
 void yuntai_init(void)
 {
     can_bsp_init();
-    yuntai_torque_cache_reset();
     {
         uint32_t reset_flags = RCC->RSR & ~RCC_RSR_RMVF;
         if ((reset_flags & RCC_RSR_IWDG1RSTF) != 0u)
@@ -3403,7 +3368,6 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         g_yaw_torque = (v >= 0.5f) ? 1u : 0u;
         g_rate_i = 0.0f;
         g_rate_iq_ma = 0.0f;
-        yuntai_torque_cache_reset();
         jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
                             (g_yaw_torque != 0u) ? JC_MODE_TORQUE
                                                  : g_speed_mode);
