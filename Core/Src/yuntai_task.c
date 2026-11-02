@@ -1279,7 +1279,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_LATENCY_COMP_GAIN       0.70f
+#define VIS_LATENCY_COMP_GAIN       0.80f
 #define VIS_LATENCY_MAX_MS          90.0f
 #define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
 #define VIS_LATENCY_PITCH_LIMIT_DEG  8.0f
