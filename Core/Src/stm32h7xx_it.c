@@ -260,75 +260,16 @@ void FDCAN2_IT1_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
-/**
-  * @brief This function handles USART1 global interrupt.
-  *
-  * ⚠⚠ 这里有一个必须记住的坑（实测踩过，现象是"云台上电后两个电机完全没反应"）：
-  *
-  *   HAL_UART_Transmit_IT() 内部会打开 TXE 中断（CR1 |= TXEIE）。
-  *   而 USART 发送寄存器空闲时 TXE **一直是置位**的，
-  *   所以打开 TXEIE 会**立刻**触发中断；只有写一次 TDR 才能清掉 TXE。
-  *
-  *   如果本函数只处理接收、不把中断交给 HAL_UART_IRQHandler，
-  *   就没有任何人去写 TDR -> TXE 永远是 1 -> 中断被无限重复触发
-  *   -> 主循环被彻底饿死 -> 状态机永远走不到 RUNNING
-  *   -> 两个电机从头到尾收不到任何速度指令（表现就是"完全没反应"）。
-  *
-  *   所以顺序必须是：先自己收字节，再把中断交给 HAL 去发字节。
-  *
-  * 放在这里（而不是在 CubeMX 里勾 NVIC）的原因：
-  * 这样 .ioc 不用改，重新生成代码也不会丢。
-  *
-  * ⚠ 如果以后在 CubeMX 里给 USART1 勾了 NVIC，
-  *   CubeMX 会再生成一个同名的 USART1_IRQHandler，链接会报重定义。
-  *   到时候把下面这段删掉、改用 CubeMX 生成的即可。
-  */
+/** @brief K230 ASCII 视觉数据接收。 */
 void USART1_IRQHandler(void)
 {
-  /* 1) 接收：直接读 RDR 存进环形缓冲（短、快、不解析）
-   *    ⚠ 只有 USART1 是"当前接收串口"时才收，否则会把别的串口的
-   *      寄存器当成本串口的读（拆分模式 TX/RX 用不同串口）。 */
-  if (gimbal_link_is_rx_uart(&huart1) != 0u)
-  {
-    gimbal_link_rx_isr();
-  }
-  /* 2) 发送与错误：必须交给 HAL，否则 TXE 中断会被永久重复触发 */
+  gimbal_link_rx_isr();
   HAL_UART_IRQHandler(&huart1);
 }
 
-/**
-  * @brief This function handles UART7 global interrupt.
-  *
-  * 2026-10-06：K230 链路从 USART1 换到 UART7（K230 IO9/IO10 接的就是 UART7）。
-  * 道理和上面 USART1 那段完全一样：
-  *   gimbal_link_rx_isr() 先用 RDR 清掉 RXNE，再把中断交给 HAL 处理发送。
-  *
-  * 注意：gimbal_link.c 里只 enable 了 UART7 的 RXNE 中断，
-  * TXE 中断是 HAL_UART_Transmit_IT() 自己开的，所以这里必须调用
-  * HAL_UART_IRQHandler()，否则 TXE 会无限重复触发把主循环饿死。
-  */
-void UART7_IRQHandler(void)
-{
-  if (gimbal_link_is_rx_uart(&huart7) != 0u)
-  {
-    gimbal_link_rx_isr();
-  }
-  HAL_UART_IRQHandler(&huart7);
-}
-
-/**
-  * @brief This function handles USART10 global interrupt.
-  *
-  * 2026-10-07：K230 链路最终定在 USART10（排针 UART10，RX=PE02 / TX=PE03，
-  * 复用号 AF11）。道理和上面两段完全一样：
-  *   gimbal_link_rx_isr() 先用 RDR 清掉 RXNE，再把中断交给 HAL 处理发送。
-  */
+/** @brief USART10 蓝牙调试发送完成/错误中断。 */
 void USART10_IRQHandler(void)
 {
-  if (gimbal_link_is_rx_uart(&huart10) != 0u)
-  {
-    gimbal_link_rx_isr();
-  }
   HAL_UART_IRQHandler(&huart10);
 }
 
