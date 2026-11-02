@@ -1208,12 +1208,12 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * 偏置角在上一帧基础上持续积分，最终目标角 = IMU锁定角 + 偏置角。
  * 俯仰检测存在离散跳变，Kd 过大时会把像素抖动放大成高频目标角摆动，
  * 因此俯仰 Kp/Kd 比参考值更保守。 */
-#define VIS_KP_YAW          9.0f
+#define VIS_KP_YAW          10.0f
 #define VIS_KI_YAW          0.0f
-#define VIS_KD_YAW          0.6f
-#define VIS_KP_PITCH        8.0f
+#define VIS_KD_YAW          0.70f
+#define VIS_KP_PITCH        9.0f
 #define VIS_KI_PITCH        0.0f
-#define VIS_KD_PITCH        0.25f
+#define VIS_KD_PITCH        0.30f
 
 #define VIS_SIGN_YAW       -1.0f
 #define VIS_SIGN_PITCH     -1.0f
@@ -1221,7 +1221,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_LATENCY_COMP_GAIN       0.90f
+#define VIS_LATENCY_COMP_GAIN       1.00f
 #define VIS_LATENCY_MAX_MS          90.0f
 #define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
 #define VIS_LATENCY_PITCH_LIMIT_DEG  8.0f
