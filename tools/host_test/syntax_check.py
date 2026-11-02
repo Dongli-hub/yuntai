@@ -20,7 +20,7 @@ STUB = os.path.join(HERE, "stub")
 INC = os.path.join(PROJ, "Core", "Inc")
 SRC = os.path.join(PROJ, "Core", "Src")
 
-# 只检查自己编写的、依赖 HAL 的核心源文件。
+# 只检查"我自己写的、且依赖 HAL 的"文件；gimbal_proto.c 已在 run_test.py 里真编译过
 FILES = [
     "yuntai_task.c",
     # 注意：main.c 不在这里 —— 它调用 CubeMX/HAL 的 RCC 类型与初始化函数，
