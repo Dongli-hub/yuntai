@@ -340,7 +340,7 @@
                                           * 残余误差只要 <0.3° 就完全不补 -> 不会像
                                           * 9.30 那版那样一直以恒定转速推着轴走。 */
 
-/* ---- 俯仰：电机编码器位置环 + 陀螺前馈 ----
+/* ---- 俯仰：电机编码器位置 PID 直接出电流 ----
  * ⚠⚠ 比例增益的稳定上限（这条公式很重要，之前算错过一次，代价是"手一碰
  *    俯仰就前后越抖越大"）：
  *
@@ -397,8 +397,6 @@
                                          * 要略大于脱困转速(约10rpm)才能顶住静摩擦，
                                          * 但又不能大到积分自己就能把输出顶满 */
 #define PITCH_DEADZONE_DEG       0.03f  /* 死区，抑制编码器量化噪声 */
-#define PITCH_FF_RPM_PER_RADS   15.0f   /* ≈1.6 倍理论抵消量 */
-#define PITCH_FF_SIGN          (-1.0f)  /* 与 0x0A 默认符号一致 */
 #define PITCH_TRAVEL_LIMIT_DEG  95.0f   /* 相对上电位置的行程软限位 */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
 /* 底盘转速前馈（0x12）用的偏航电机反馈新鲜度上限：反馈断流/过期就把前馈停掉，
@@ -415,10 +413,7 @@
  * 位置环不会自己发现这件事，必须由 IMU 告诉它"世界倾斜了多少"，
  * 再按 IMU 平台俯仰变化修正编码器目标 —— 这就是本段的作用。
  *
- * 前馈（陀螺）和这里的分工：
- *   陀螺前馈：只对【正在倾斜】的那一瞬间起作用（快，但没有绝对基准）
- *   平台补偿：负责【倾斜之后的持续角度】（慢，但有绝对基准）
- * 两个都要有，缺一个都会"倾斜完就偏"。
+ * 底座倾斜后的持续角度由这里补偿；最终仍由编码器位置闭环稳住。
  *
  * 符号：最终方向由 0x0A 的 ±1 决定，必须现场确认。
  *   前馈测法：前后快倾底座，工具算 corr(陀螺, 电机角速度)，应为【负】
@@ -859,7 +854,6 @@ static float   g_ptq_kp   = 8000.0f;   /* mA/rad（0x05）*/
 static float   g_ptq_kd   = 1000.0f;   /* mA/(rad/s)（0x07）*/
 static float   g_ptq_ki   = 20000.0f;  /* mA/(rad·s)（0x06）*/
 static float   g_pitch_ilim_a = 3.0f;  /* 电流限幅 A（0x08）*/
-static float   g_pitch_tq_i;           /* 积分（mA）*/
 static float   g_pitch_iq_ma;          /* 最近输出（mA，给日志）*/
 static float   g_pitch_iq_filt;        /* 俯仰力矩指令一阶低通状态 */
 static float   g_pitch_imu_lock;       /* 锁基准时的 IMU 俯仰（rad）*/
@@ -868,7 +862,6 @@ static uint8_t g_pbreak_stuck, g_pbreak_want;
 /* 俯仰力矩模式的"速率环"（内环，1kHz）：把位置环输出的 rpm 变成电流。
  * 转速反馈 = 驱动器自报的编码器转速（俯仰这一路可信）。*/
 static float   g_prate_kp = 30.0f;     /* mA/rpm */
-static float   g_prate_ki = 1.0f;      /* mA/(rpm·s) */
 static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32 Nm
                                             * ⚠ 2026-10-13 由 2.5A 提到 6A：
                                             * 43/44 号日志证明 ±0.08Nm 推不动这一轴
@@ -935,8 +928,6 @@ static uint8_t g_break_stuck;              /* 迟滞状态：1=卡住（正在�
 static uint8_t g_break_want;               /* 迟滞状态：1=误差够大、想动 */
 static float   g_rate_i       = 0.0f;      /* 速率环积分器（mA）*/
 static float   g_rate_iq_ma   = 0.0f;      /* 最近一次输出的电流（mA，给日志看）*/
-static float g_pitch_ff_sign  = PITCH_FF_SIGN;
-static float g_pitch_ff_gain  = PITCH_FF_RPM_PER_RADS;
 static float g_pitch_kp       = PITCH_KP;
 static float g_pitch_ki       = PITCH_KI;
 static float g_pitch_kd       = PITCH_KD;
@@ -1656,7 +1647,6 @@ static void yuntai_lock_reference(void)
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
     g_pitch_motor_lock  = g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f;
     g_pitch_tgt_deg     = g_pitch_motor_lock;
-    g_pitch_tq_i        = 0.0f;
     g_pitch_iq_ma       = 0.0f;
     g_pitch_iq_filt     = 0.0f;
     g_mot_rate_f = 0.0f;
@@ -2492,26 +2482,18 @@ static void yuntai_control(uint32_t now)
     if (mode == GP_MODE_ESTOP)
     {
         PID_Reset(&g_pitch_pid);
-        g_pitch_tq_i = 0.0f;
         g_pitch_iq_ma = 0.0f;
         g_pitch_iq_filt = 0.0f;
         pitch_rpm = 0.0f;
     }
     else if (!pitch_fb_ok)
     {
-        /* ---- 降级路径：编码器反馈丢失 ----
-         * 退化成"纯角速度前馈"：只对【转动】有反应，对缓慢倾斜没有反应。
-         * 表现就是"俯仰只对快动有响应、慢慢倾斜没反应" —— 遇到这种
-         * 现象先怀疑编码器反馈断了，而不是 PID 没调好。 */
+        /* 编码器反馈丢失时没有可靠的位置反馈，停止 pitch 力矩输出。 */
         PID_Reset(&g_pitch_pid);
-        g_pitch_tq_i = 0.0f;
-        pitch_rpm = g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        g_pitch_iq_ma = 0.0f;
+        pitch_rpm = 0.0f;
         if (g_pitch_torque != 0u)
         {
-            g_pitch_iq_ma = clampf(
-                g_prate_kp * pitch_rpm,
-                -g_pitch_ilim_a * 1000.0f,
-                g_pitch_ilim_a * 1000.0f);
             g_pitch_iq_filt = g_pitch_iq_ma;
         }
     }
@@ -2521,9 +2503,8 @@ static void yuntai_control(uint32_t now)
          * 注意绝对不能写成"转到编码器 0" —— 编码器零点是任意值，
          * 那样会让俯仰猛地转过去（可能好几十度）。 */
         float err = g_pitch_motor_lock - g_pitch_fb.cont;
-        g_pitch_tq_i = 0.0f;
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
-        pitch_rpm = g_pitch_pid.out + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        pitch_rpm = g_pitch_pid.out;
         if (g_pitch_torque != 0u)
         {
             g_pitch_iq_ma = clampf(
@@ -2561,29 +2542,22 @@ static void yuntai_control(uint32_t now)
                           g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
         g_pitch_tgt_deg = tgt;
 
-        /* 位置环跟踪统一目标角，再叠加陀螺前馈进入 1kHz 速率环。
-         * STAB 或无有效目标时 visual_deg=0，只剩 IMU 自稳角和前馈。 */
+        /* 位置 PID 直接给出 pitch 控制量；只用 PID 自身的 D 阻尼。 */
         float err = tgt - g_pitch_fb.cont;
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
-        pitch_rpm = g_pitch_pid.out
-                  + g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+        pitch_rpm = g_pitch_pid.out;
         pitch_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
 
         if (g_pitch_torque != 0u)
         {
             float ilim_ma = g_pitch_ilim_a * 1000.0f;
-            float we;
-            we = pitch_rpm - g_pitch_fb.spd;              /* 速率环：编码器转速反馈 */
-            g_pitch_tq_i += g_prate_ki * we * dt;
-            g_pitch_tq_i = clampf(g_pitch_tq_i, -ilim_ma, ilim_ma);
-            g_pitch_iq_ma = clampf(g_prate_kp * we + g_pitch_tq_i,
+            g_pitch_iq_ma = clampf(g_prate_kp * pitch_rpm,
                                    -ilim_ma, ilim_ma);
             /* 安全闸：编码器转速异常（符号/量纲不对时会飞）→ 立刻清零。
              * ⚠ 收得很紧：正常输出上限才 120rpm，超过 250rpm 一定是出事了 */
             if (fabsf(g_pitch_fb.spd) > 250.0f)
             {
                 g_pitch_iq_ma = 0.0f;
-                g_pitch_tq_i  = 0.0f;
                 g_pitch_iq_filt = 0.0f;
                 g_fault |= FAULT_PITCH_RUNAWAY;
             }
@@ -2605,7 +2579,7 @@ static void yuntai_control(uint32_t now)
                 {
                     g_fault |= FAULT_PITCH_RUNAWAY;
                     PID_Reset(&g_pitch_pid);
-                    pitch_rpm = g_pitch_ff_sign * gyro_c[1] * g_pitch_ff_gain;
+                    pitch_rpm = 0.0f;
                 }
             }
             else
@@ -2624,7 +2598,6 @@ static void yuntai_control(uint32_t now)
     }
     else
     {
-        g_pitch_tq_i = 0.0f;
         g_pitch_iq_filt = 0.0f;
         yuntai_set_pitch(g_pitch_cmd_rpm);
     }
@@ -3388,20 +3361,6 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         g_yaw_pid.integral_limit = g_yaw_ilim;
         break;
 
-    case GP_PARAM_PITCH_FF_SIGN:
-        if (s != g_pitch_ff_sign)
-        {
-            g_pitch_ff_sign = s;
-            PID_Reset(&g_pitch_pid);      /* 换方向必须清掉旧积分 */
-        }
-        break;
-
-    case GP_PARAM_PITCH_FF_GAIN:
-        /* 上限 60：这个量是"速率反馈"，过大等于自己给自己加正反馈，
-         * 正常只会用到 5~20（理论抵消量 ≈ 9.55 rpm per rad/s） */
-        g_pitch_ff_gain = clampf(v, 0.0f, 60.0f);
-        break;
-
     case GP_PARAM_PITCH_KP:
         /* 俯仰位置环 KP（rpm/deg）——两种模式都用它：力矩模式下位置环→速率环 */
         g_pitch_kp = clampf(v, 0.0f, 40.0f);
@@ -3435,10 +3394,6 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         /* 平台俯仰补偿：0 = 关，±1 = 开并定方向。
          * IMU 目标与前馈必须同号，否则目标往前推、前馈反向拖。 */
         g_pitch_plat_sign = (v == 0.0f) ? 0.0f : s;
-        if (v != 0.0f)
-        {
-            g_pitch_ff_sign = s;
-        }
         g_plat_comp       = 0.0f;
         g_plat_dtheta     = 0.0f;
         PID_Reset(&g_pitch_pid);
@@ -3697,10 +3652,6 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
 
     case GP_PARAM_DUMP:
         /* 只汇报，不改动。两行，方便上位机直接打印 */
-        fmt_f(n1, sizeof(n1), g_pitch_ff_sign, 2);
-        fmt_f(n2, sizeof(n2), g_pitch_ff_gain, 1);
-        snprintf(buf, sizeof(buf), "[PARAM] pitFF %s x%s", n1, n2);
-        gimbal_link_log_force(buf);
         fmt_f(n1, sizeof(n1), g_pitch_kp, 2);
         fmt_f(n2, sizeof(n2), g_pitch_ki, 2);
         snprintf(buf, sizeof(buf), "[PARAM] pitKp %s Ki %s", n1, n2);

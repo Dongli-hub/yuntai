@@ -83,8 +83,6 @@
 #define GP_PARAM_DUMP            0x00u  /* 下发它 = 让 H723 回一行当前参数 */
 #define GP_PARAM_YAW_FF_SIGN     0x01u  /* ±1，前馈符号 */
 #define GP_PARAM_YAW_FF_GAIN     0x02u  /* 视觉目标角倍率（默认 1.00） */
-#define GP_PARAM_PITCH_FF_SIGN   0x03u  /* ±1，前馈符号（俯仰振荡第一嫌疑人） */
-#define GP_PARAM_PITCH_FF_GAIN   0x04u  /* rpm/(rad/s)，0 = 关掉前馈 */
 #define GP_PARAM_PITCH_KP        0x05u  /* rpm/deg */
 #define GP_PARAM_PITCH_KI        0x06u  /* rpm/(deg*s) */
 #define GP_PARAM_PITCH_KD        0x07u  /* rpm/(deg/s) */
