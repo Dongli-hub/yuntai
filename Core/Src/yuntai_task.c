@@ -59,6 +59,7 @@
 #include "debug_uart.h"
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ==========================================================================
  * 一、可调参数
@@ -1221,13 +1222,10 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_LATENCY_COMP_GAIN       1.00f
-#define VIS_LATENCY_MAX_MS          90.0f
-#define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
-#define VIS_LATENCY_PITCH_LIMIT_DEG  8.0f
+#define VIS_LATENCY_MAX_MS         200.0f
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
-#define VIS_FREEZE_MS       150u
+#define VIS_FREEZE_MS       250u
 #define VIS_ERROR_YAW_LIMIT_DEG   30.0f
 #define VIS_ERROR_PITCH_LIMIT_DEG 20.0f
 /* Pixel centroids move in discrete steps.  0.20 deg yaw (~1.4 px) and
@@ -1241,6 +1239,31 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_JUMP_MATCH_PITCH_DEG   0.8f
 #define VIS_JUMP_RETURN_YAW_DEG    1.0f
 #define VIS_JUMP_RETURN_PITCH_DEG  0.5f
+
+#define VIS_ANGLE_HISTORY_LEN       256u
+#define VIS_TRACK_ALPHA              0.50f
+#define VIS_TRACK_BETA               0.17f
+#define VIS_TRACK_RATE_CLIP_DEG      0.40f
+#define VIS_TRACK_MAX_RATE_DPS      90.0f
+#define VIS_TRACK_COAST_MS          450u
+#define VIS_TRACK_LOST_MS           500u
+
+typedef struct
+{
+    uint32_t ms;
+    float yaw_imu_deg;
+    float pitch_motor_deg;
+    float pitch_imu_deg;
+} VisAngleSample_t;
+
+typedef struct
+{
+    float value;
+    float rate;
+    uint32_t ms;
+    uint8_t active;
+    uint8_t wrap360;
+} VisAlphaBeta_t;
 
 typedef struct
 {
@@ -1273,6 +1296,162 @@ static float   g_vis_ki_pitch = VIS_KI_PITCH;
 static float   g_vis_kd_pitch = VIS_KD_PITCH;
 static float   g_vis_limyaw_deg = VIS_LIMIT_YAW_DEG;
 static float   g_yaw_out_rpm = YAW_OUT_RPM;
+static VisAngleSample_t g_vis_history[VIS_ANGLE_HISTORY_LEN];
+static uint16_t g_vis_history_head;
+static uint16_t g_vis_history_count;
+static VisAlphaBeta_t g_vis_track_yaw = {.wrap360 = 1u};
+static VisAlphaBeta_t g_vis_track_pitch;
+
+static float vis_wrap_deg(float deg)
+{
+    deg = fmodf(deg, 360.0f);
+    return (deg < 0.0f) ? (deg + 360.0f) : deg;
+}
+
+static float vis_wrap_pm180_deg(float deg)
+{
+    float wrapped = vis_wrap_deg(deg);
+    return (wrapped > 180.0f) ? (wrapped - 360.0f) : wrapped;
+}
+
+static void vis_history_reset(void)
+{
+    g_vis_history_head = 0u;
+    g_vis_history_count = 0u;
+    memset(&g_vis_track_yaw, 0, sizeof(g_vis_track_yaw));
+    memset(&g_vis_track_pitch, 0, sizeof(g_vis_track_pitch));
+    g_vis_track_yaw.wrap360 = 1u;
+}
+
+static void vis_history_push(uint32_t now)
+{
+    VisAngleSample_t *sample = &g_vis_history[g_vis_history_head];
+    sample->ms = now;
+    sample->yaw_imu_deg = vis_wrap_deg(imuAngle[0] * 57.29578f);
+    sample->pitch_motor_deg = g_pitch_fb.cont;
+    sample->pitch_imu_deg = imuAngle[1] * 57.29578f;
+    g_vis_history_head = (uint16_t)(
+        (g_vis_history_head + 1u) % VIS_ANGLE_HISTORY_LEN
+    );
+    if (g_vis_history_count < VIS_ANGLE_HISTORY_LEN)
+    {
+        g_vis_history_count++;
+    }
+}
+
+static VisAngleSample_t vis_history_at(uint32_t ms)
+{
+    VisAngleSample_t found;
+    uint16_t k;
+
+    found.ms = 0u;
+    found.yaw_imu_deg = vis_wrap_deg(imuAngle[0] * 57.29578f);
+    found.pitch_motor_deg = g_pitch_fb.cont;
+    found.pitch_imu_deg = imuAngle[1] * 57.29578f;
+    for (k = 1u; k <= g_vis_history_count; k++)
+    {
+        uint16_t index = (uint16_t)(
+            (g_vis_history_head + VIS_ANGLE_HISTORY_LEN - k) %
+            VIS_ANGLE_HISTORY_LEN
+        );
+        found = g_vis_history[index];
+        if ((int32_t)(found.ms - ms) <= 0)
+        {
+            break;
+        }
+    }
+    return found;
+}
+
+static float vis_track_value_at(const VisAlphaBeta_t *tracker,
+                                uint32_t at_ms)
+{
+    int32_t ahead = (int32_t)(at_ms - tracker->ms);
+    float value;
+
+    if (!tracker->active || ahead < 0)
+    {
+        return tracker->value;
+    }
+    if (ahead > (int32_t)VIS_TRACK_COAST_MS)
+    {
+        ahead = (int32_t)VIS_TRACK_COAST_MS;
+    }
+    value = tracker->value + tracker->rate * (float)ahead * 0.001f;
+    return tracker->wrap360 ? vis_wrap_deg(value) : value;
+}
+
+static float vis_track_predict(const VisAlphaBeta_t *tracker, uint32_t now,
+                               float *rate_dps)
+{
+    int32_t ahead = (int32_t)(now - tracker->ms);
+    float rate = tracker->rate;
+
+    if (!tracker->active)
+    {
+        *rate_dps = 0.0f;
+        return tracker->value;
+    }
+    if (ahead < 0)
+    {
+        ahead = 0;
+    }
+    if (ahead >= (int32_t)VIS_TRACK_COAST_MS)
+    {
+        ahead = (int32_t)VIS_TRACK_COAST_MS;
+        rate = 0.0f;
+    }
+    *rate_dps = rate;
+    if (tracker->wrap360 != 0u)
+    {
+        return vis_wrap_deg(tracker->value + rate * (float)ahead * 0.001f);
+    }
+    return tracker->value + rate * (float)ahead * 0.001f;
+}
+
+static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
+                             uint32_t capture_ms)
+{
+    int32_t gap = (int32_t)(capture_ms - tracker->ms);
+    float dt;
+    float predicted;
+    float residual;
+    float rate_residual;
+
+    if ((tracker->active == 0u) || (gap > (int32_t)VIS_TRACK_LOST_MS))
+    {
+        tracker->value = tracker->wrap360 ? vis_wrap_deg(measured) : measured;
+        tracker->rate = 0.0f;
+        tracker->ms = capture_ms;
+        tracker->active = 1u;
+        return;
+    }
+    if (gap < 0)
+    {
+        return;
+    }
+    dt = (float)gap * 0.001f;
+    predicted = tracker->value + tracker->rate * dt;
+    residual = measured - predicted;
+    if (tracker->wrap360 != 0u)
+    {
+        residual = vis_wrap_pm180_deg(residual);
+    }
+    tracker->value = tracker->wrap360 ?
+        vis_wrap_deg(predicted + VIS_TRACK_ALPHA * residual) :
+        predicted + VIS_TRACK_ALPHA * residual;
+    if (dt > 0.0f)
+    {
+        rate_residual = clampf(residual,
+                               -VIS_TRACK_RATE_CLIP_DEG,
+                               VIS_TRACK_RATE_CLIP_DEG);
+        tracker->rate += VIS_TRACK_BETA * rate_residual / dt;
+        tracker->rate = clampf(tracker->rate,
+                               -VIS_TRACK_MAX_RATE_DPS,
+                               VIS_TRACK_MAX_RATE_DPS);
+        tracker->ms = capture_ms;
+    }
+}
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
@@ -1341,6 +1520,7 @@ static float vis_pid_step(VisPidState_t *pid, float error_deg, float dt,
 
 static void vis_outer_reset(void)
 {
+    vis_history_reset();
     vis_pid_reset(&g_vis_pid_yaw);
     vis_pid_reset(&g_vis_pid_pitch);
     g_vis_yaw_rate_dps = 0.0f;
@@ -1416,10 +1596,18 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
     if (cmd->px_ms != g_vis_last_ms)
     {
         float frame_dt = 0.0125f;
+        float raw_yaw_deg;
+        float raw_pitch_deg;
         float yaw_deg;
         float pitch_deg;
+        float yaw_measure_deg;
+        float pitch_measure_deg;
+        float capture_age_ms;
+        uint32_t capture_ms;
+        VisAngleSample_t capture_pose;
+        VisAlphaBeta_t *yaw_tracker = &g_vis_track_yaw;
+        VisAlphaBeta_t *pitch_tracker = &g_vis_track_pitch;
         const float k = vis_k_px_deg(cmd);
-        float latency_s;
 
         if ((g_vis_applied_ms != 0u) && (cmd->px_ms > g_vis_applied_ms))
         {
@@ -1427,32 +1615,100 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         }
         g_vis_last_ms = cmd->px_ms;
 
-        vis_read_error_deg(cmd, k, &yaw_deg, &pitch_deg);
-        g_vis_latency_ms = vis_total_age_ms(cmd, now);
-        g_vis_latency_ms = clampf(
-            g_vis_latency_ms, 0.0f, VIS_LATENCY_MAX_MS
+        vis_read_error_deg(cmd, k, &raw_yaw_deg, &raw_pitch_deg);
+        capture_age_ms = clampf(vis_total_age_ms(cmd, now), 0.0f,
+                                VIS_LATENCY_MAX_MS);
+        g_vis_latency_ms = capture_age_ms;
+        capture_ms = now - (uint32_t)(capture_age_ms + 0.5f);
+        capture_pose = vis_history_at(capture_ms);
+        yaw_measure_deg = vis_wrap_deg(
+            capture_pose.yaw_imu_deg + VIS_SIGN_YAW * raw_yaw_deg
         );
-        latency_s = g_vis_latency_ms * 0.001f;
-        if (cmd->target_velocity_valid != 0u)
+        pitch_measure_deg =
+            capture_pose.pitch_motor_deg +
+            VIS_SIGN_PITCH * raw_pitch_deg +
+            capture_pose.pitch_imu_deg;
+
+        /* 保留原来的大跳确认：异常测量先挂起一帧。 */
+        if ((yaw_tracker->active != 0u) && (pitch_tracker->active != 0u))
         {
-            /* 把拍摄时刻的像素误差按目标图像速度投影到当前时刻。 */
-            yaw_deg += clampf(
-                (cmd->target_vx_px_s / k) * latency_s *
-                    VIS_LATENCY_COMP_GAIN,
-                -VIS_LATENCY_YAW_LIMIT_DEG,
-                VIS_LATENCY_YAW_LIMIT_DEG
+            float predicted_yaw = vis_track_value_at(yaw_tracker, capture_ms);
+            float predicted_pitch =
+                vis_track_value_at(pitch_tracker, capture_ms);
+            float yaw_from_prediction = fabsf(vis_wrap_pm180_deg(
+                yaw_measure_deg - predicted_yaw
+            ));
+            float pitch_from_prediction = fabsf(
+                pitch_measure_deg - predicted_pitch
             );
-            pitch_deg += clampf(
-                (cmd->target_vy_px_s / k) * latency_s *
-                    VIS_LATENCY_COMP_GAIN,
-                -VIS_LATENCY_PITCH_LIMIT_DEG,
-                VIS_LATENCY_PITCH_LIMIT_DEG
-            );
+
+            if (g_vis_jump_pending != 0u)
+            {
+                float yaw_from_pending = fabsf(vis_wrap_pm180_deg(
+                    yaw_measure_deg - g_vis_jump_yaw_deg
+                ));
+                float pitch_from_pending = fabsf(
+                    pitch_measure_deg - g_vis_jump_pitch_deg
+                );
+                if ((yaw_from_pending <= VIS_JUMP_MATCH_YAW_DEG) &&
+                    (pitch_from_pending <= VIS_JUMP_MATCH_PITCH_DEG))
+                {
+                    g_vis_jump_pending = 0u;
+                }
+                else if ((yaw_from_prediction <= VIS_JUMP_RETURN_YAW_DEG) &&
+                         (pitch_from_prediction <=
+                          VIS_JUMP_RETURN_PITCH_DEG))
+                {
+                    g_vis_jump_pending = 0u;
+                }
+                else
+                {
+                    g_vis_jump_yaw_deg = yaw_measure_deg;
+                    g_vis_jump_pitch_deg = pitch_measure_deg;
+                    g_vis_yaw_rate_dps = 0.0f;
+                    g_vis_pitch_rate_dps = 0.0f;
+                    g_vis_yaw_applied_rate_dps = 0.0f;
+                    return;
+                }
+            }
+            else if ((yaw_from_prediction > VIS_JUMP_YAW_DEG) ||
+                     (pitch_from_prediction > VIS_JUMP_PITCH_DEG))
+            {
+                g_vis_jump_pending = 1u;
+                g_vis_jump_yaw_deg = yaw_measure_deg;
+                g_vis_jump_pitch_deg = pitch_measure_deg;
+                g_vis_yaw_rate_dps = 0.0f;
+                g_vis_pitch_rate_dps = 0.0f;
+                g_vis_yaw_applied_rate_dps = 0.0f;
+                return;
+            }
         }
-        yaw_deg = clampf(VIS_SIGN_YAW * yaw_deg,
+
+        vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
+        vis_track_update(pitch_tracker, pitch_measure_deg, capture_ms);
+        {
+            float predicted_yaw = vis_track_predict(
+                yaw_tracker, now, &g_vis_yaw_applied_rate_dps
+            );
+            float predicted_pitch_rate;
+            float predicted_elevation = vis_track_predict(
+                pitch_tracker, now, &predicted_pitch_rate
+            );
+            float target_motor_pitch =
+                predicted_elevation - imuAngle[1] * 57.29578f;
+
+            yaw_deg = vis_wrap_pm180_deg(
+                predicted_yaw - imuAngle[0] * 57.29578f
+            );
+            pitch_deg = vis_wrap_pm180_deg(
+                target_motor_pitch - g_pitch_fb.cont
+            );
+            (void)predicted_pitch_rate;
+        }
+        yaw_deg = clampf(yaw_deg,
                          -VIS_ERROR_YAW_LIMIT_DEG,
                          VIS_ERROR_YAW_LIMIT_DEG);
-        pitch_deg = clampf(VIS_SIGN_PITCH * pitch_deg,
+        pitch_deg = clampf(pitch_deg,
                            -VIS_ERROR_PITCH_LIMIT_DEG,
                            VIS_ERROR_PITCH_LIMIT_DEG);
         if (fabsf(yaw_deg) < VIS_DEADBAND_YAW_DEG)
@@ -1465,53 +1721,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         }
         g_vis_yaw_error_deg = yaw_deg;
         g_vis_pitch_error_deg = pitch_deg;
-
-        /* 单帧大跳保护：先挂起一帧；下一帧仍在候选附近才接受，
-         * 回到原位置则撤销。正常的小变化和平滑跟踪不经过任何滤波。 */
-        if ((g_vis_pid_yaw.have_prev != 0u) &&
-            (g_vis_pid_pitch.have_prev != 0u))
-        {
-            float yaw_from_pending = fabsf(yaw_deg - g_vis_jump_yaw_deg);
-            float pitch_from_pending = fabsf(pitch_deg - g_vis_jump_pitch_deg);
-            float yaw_from_last =
-                fabsf(yaw_deg - g_vis_pid_yaw.prev_error_deg);
-            float pitch_from_last =
-                fabsf(pitch_deg - g_vis_pid_pitch.prev_error_deg);
-
-            if (g_vis_jump_pending != 0u)
-            {
-                if ((yaw_from_pending <= VIS_JUMP_MATCH_YAW_DEG) &&
-                    (pitch_from_pending <= VIS_JUMP_MATCH_PITCH_DEG))
-                {
-                    g_vis_jump_pending = 0u;  /* 连续帧确认新目标 */
-                }
-                else if ((yaw_from_last <= VIS_JUMP_RETURN_YAW_DEG) &&
-                         (pitch_from_last <= VIS_JUMP_RETURN_PITCH_DEG))
-                {
-                    g_vis_jump_pending = 0u;  /* 异常帧已消失 */
-                }
-                else
-                {
-                    g_vis_jump_yaw_deg = yaw_deg;
-                    g_vis_jump_pitch_deg = pitch_deg;
-                    g_vis_yaw_rate_dps = 0.0f;
-                    g_vis_pitch_rate_dps = 0.0f;
-                    g_vis_yaw_applied_rate_dps = 0.0f;
-                    return;
-                }
-            }
-            else if ((yaw_from_last > VIS_JUMP_YAW_DEG) ||
-                     (pitch_from_last > VIS_JUMP_PITCH_DEG))
-            {
-                g_vis_jump_pending = 1u;
-                g_vis_jump_yaw_deg = yaw_deg;
-                g_vis_jump_pitch_deg = pitch_deg;
-                g_vis_yaw_rate_dps = 0.0f;
-                g_vis_pitch_rate_dps = 0.0f;
-                g_vis_yaw_applied_rate_dps = 0.0f;
-                return;
-            }
-        }
 
         /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
          * 没有新视觉帧时偏置角保持，不清零。 */
@@ -1536,14 +1745,25 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             g_vis_pitch_angle_deg = clampf(
                 g_vis_pitch_angle_deg + pitch_rate * frame_dt,
                 -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
-            g_vis_yaw_applied_rate_dps = g_vis_yaw_rate_dps;
         }
         g_vis_applied_ms = cmd->px_ms;
     }
     else
     {
-        /* 姿态目标保持不变，但视觉目标角变化率前馈只属于新帧。 */
-        g_vis_yaw_applied_rate_dps = 0.0f;
+        float ignored_rate;
+        if (g_vis_track_yaw.active != 0u)
+        {
+            (void)vis_track_predict(
+                &g_vis_track_yaw, now, &g_vis_yaw_applied_rate_dps
+            );
+            (void)vis_track_predict(
+                &g_vis_track_pitch, now, &ignored_rate
+            );
+        }
+        else
+        {
+            g_vis_yaw_applied_rate_dps = 0.0f;
+        }
     }
 }
 
@@ -1875,6 +2095,8 @@ static void yuntai_control(uint32_t now)
     {
         yuntai_lock_reference();
     }
+
+    vis_history_push(now);
 
     /* ---- 视觉外环：角度误差 -> 视觉目标角 ---- */
     yuntai_mark_stage(32u);
