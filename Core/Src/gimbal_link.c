@@ -99,13 +99,14 @@ static int32_t gl_parse_x100(const char **cursor, uint8_t *ok)
 static void gl_handle_text_line(uint32_t now_ms)
 {
     const char *p = s_text_line;
-    int32_t values[7] = {0, 0, 0, 0, 0, 0, 0};
+    int32_t values[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t value_count = 0u;
+    uint8_t offset;
     uint8_t ok;
     uint8_t lost;
     uint8_t was_aim;
 
-    while (value_count < 7u)
+    while (value_count < 9u)
     {
         values[value_count] = gl_parse_x100(&p, &ok);
         if (!ok)
@@ -119,18 +120,41 @@ static void gl_handle_text_line(uint32_t now_ms)
         }
         p++;
     }
-    if ((value_count != 7u) || (*p != '\0'))
+    if (*p != '\0')
     {
         return;
     }
 
-    lost = (uint8_t)((values[0] == 40400) && (values[1] == 40400));
+    /*
+     * 新 K230：7 列原始像素。
+     * 旧 K230：2 列角度 + 7 列原始像素。
+     * 两版都在这一个解析器里转换为统一的控制量，避免分板烧录时断链。
+     */
+    if (value_count == 7u)
+    {
+        offset = 0u;
+    }
+    else if (value_count == 9u)
+    {
+        offset = 2u;
+    }
+    else
+    {
+        return;
+    }
+
+    lost = (uint8_t)(
+        (values[offset] == 40400) && (values[offset + 1u] == 40400)
+    );
     if (!lost)
     {
-        if ((values[0] < 0) || (values[0] > 100000) ||
-            (values[1] < 0) || (values[1] > 100000) ||
-            (values[2] < 0) || (values[2] > 100000) ||
-            (values[3] < 0) || (values[3] > 100000))
+        if ((values[offset] < 0) || (values[offset] > 100000) ||
+            (values[offset + 1u] < 0) ||
+            (values[offset + 1u] > 100000) ||
+            (values[offset + 2u] < 0) ||
+            (values[offset + 2u] > 100000) ||
+            (values[offset + 3u] < 0) ||
+            (values[offset + 3u] > 100000))
         {
             return;
         }
@@ -143,10 +167,14 @@ static void gl_handle_text_line(uint32_t now_ms)
     s_cmd.rx_count++;
     s_cmd.aim_valid = (uint8_t)(lost ? 0u : 1u);
 
-    s_cmd.px_ut = lost ? 0u : (uint16_t)(values[0] / 100);
-    s_cmd.px_vt = lost ? 0u : (uint16_t)(values[1] / 100);
-    s_cmd.px_us = lost ? 0u : (uint16_t)(values[2] / 100);
-    s_cmd.px_vs = lost ? 0u : (uint16_t)(values[3] / 100);
+    s_cmd.px_ut = lost ? 0u :
+        (uint16_t)(values[offset] / 100);
+    s_cmd.px_vt = lost ? 0u :
+        (uint16_t)(values[offset + 1u] / 100);
+    s_cmd.px_us = lost ? 0u :
+        (uint16_t)(values[offset + 2u] / 100);
+    s_cmd.px_vs = lost ? 0u :
+        (uint16_t)(values[offset + 3u] / 100);
 
     if (lost)
     {
@@ -159,8 +187,10 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
     else
     {
-        int32_t dx_x100 = values[0] - values[2];
-        int32_t dy_x100 = values[1] - values[3];
+        int32_t dx_x100 =
+            values[offset] - values[offset + 2u];
+        int32_t dy_x100 =
+            values[offset + 1u] - values[offset + 3u];
 
         s_cmd.vis_yaw_deg =
             ((float)dx_x100 / 100.0f) * K230_ANGLE_PER_PX;
@@ -169,9 +199,9 @@ static void gl_handle_text_line(uint32_t now_ms)
             -((float)dy_x100 / 100.0f) * K230_ANGLE_PER_PX;
 
         s_cmd.target_yaw_rate_dps =
-            ((float)values[4] / 100.0f) * K230_ANGLE_PER_PX;
+            ((float)values[offset + 4u] / 100.0f) * K230_ANGLE_PER_PX;
         s_cmd.target_pitch_rate_dps =
-            ((float)values[5] / 100.0f) * K230_ANGLE_PER_PX;
+            ((float)values[offset + 5u] / 100.0f) * K230_ANGLE_PER_PX;
         s_cmd.target_yaw_rate_dps = (s_cmd.target_yaw_rate_dps > 640.0f) ?
                                     640.0f : s_cmd.target_yaw_rate_dps;
         s_cmd.target_yaw_rate_dps = (s_cmd.target_yaw_rate_dps < -640.0f) ?
@@ -184,8 +214,11 @@ static void gl_handle_text_line(uint32_t now_ms)
             -640.0f : s_cmd.target_pitch_rate_dps;
         s_cmd.target_velocity_valid = 1u;
         s_cmd.vis_proc_age_ms =
-            (uint16_t)(((values[6] >= 0) && (values[6] <= 1000)) ?
-                       (values[6] * 10) : 0);
+            (uint16_t)(
+                ((values[offset + 6u] >= 0) &&
+                 (values[offset + 6u] <= 1000)) ?
+                (values[offset + 6u] * 10) : 0
+            );
     }
 
     s_last_aim_ms = now_ms;
