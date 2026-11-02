@@ -872,60 +872,6 @@ static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32
                                             * 的角度段需要更多；②"动的时候抖"要在一次
                                             * 滑动里刹住，刹车（阻尼）也吃限幅。
                                             * 8A=0.32Nm 仍是脉冲性质；嫌热 (0x17, 600)。*/
-/* ---- 力矩模式"脱困补偿"（2026-10-13）----
- * 滑环静摩擦大：线性环路要产生 0.2Nm 需要十几度误差，那就没法瞄准了。
- * 做法：误差超过死区、且平台几乎没在动时，**至少**往误差方向给这么多电流
- * （A）；一旦动起来就交回线性环路精修。0x1D 可在线改（单位 A×100）。*/
-/* ⚠⚠ 2026-10-14 十三版：**1.0A -> 2.5A**（38 号日志："远边晃动格外厉害"的根因）
- *   证据（38 号日志，那条"远离靶面"的边）：
- *     · 突发前 `e_u` 从 3px 涨到 24px（车在动、靶在走），而**电机位置一动不动**；
- *     · 紧接着一帧 30ms 内平台绝对角跳 **7.2°**、陀螺冲到 **±123°/s**，误差到 −66px
- *       （≈8.5°，1.3m 处约 20cm，差一点出靶），随后 5~8Hz 振铃约 0.5s 才收。
- *     · 出事时 `[DBG] ym=1007.5°`（电机相对底盘已累到 2.8 圈）——滑环静摩擦
- *       **随转角变化**，那条边正好停在摩擦最大的角度区。
- *   机理：卡住 →（补偿封顶 1.0A 顶不开）→ 位置环只能靠 P 项硬憋（6A/rad，要 19° 误差
- *   才够 2A）→ 外环把偏置卷到 −26° → 突然崩开 → 平台猛甩 → 振铃。就是"卡滞→崩开"。
- *   为什么敢给 2.5A：这套补偿自带自限（见下面斜坡率那段）——
- *     · 只在"误差>0.5° 且平台几乎不动"时才爬（10A/s，2.5A 需 250ms）；
- *     · **平台一动就以 30A/s 收回**（83ms 掉光）。
- *   所以摩擦小的角度区它涨到 ~0.5A 轴就动了、立刻收回，不会过推；只有真卡住的地方
- *   才会爬满。现场旋钮：还卡就 (0x1D, 300)/(0x1D, 400)；反而过冲就往 (0x1D, 150) 收。*/
-static float   g_yaw_stict_a  = 2.5f;      /* 脱困电流上限：A（0x1D）→ 0.10 Nm
-                                            * ⚠ 46 号日志：±4A 脉冲从静止推不动
-                                            * 这一轴（两段积分都 0.00°），而 6A 能动
-                                            * —— 那是"冷启动"数字；稳态下补偿只需
-                                            * 顶开静摩擦（0.5~1A 量级），2.5A 是
-                                            * 给"最坏角度段"留的余量。*/
-/* ---- 自适应脱困补偿的斜坡率（见控制环里那段）----
- * 固定偏置的两难：滑环静摩擦随角度变，固定 4A 在"好角度"上远大于需要
- * （一顶就冲过去 = 粘滑的来源）；调小又在"坏角度"上推不动。
- * 自适应版：卡着时以 8A/s 往上爬，一动/误差一小就以 30A/s 掉下来 ——
- * 偏置总是"刚好够"，冲过头的余量最小。0x1D 只当上限用。*/
-#define YAW_BREAK_SLEW_A_PER_S   10.0f
-#define YAW_BREAK_DECAY_A_PER_S  30.0f
-/* 误差到多大时脱困偏置给满（°）。0.3° 时给 1/3 的偏置，1.0° 以上给满 ——
- * 这样"小误差轻推、大误差立刻重推"，既快又不自己造极限环。0x1D 仍是上限。*/
-#define YAW_BREAK_FULL_ERR_DEG    1.0f
-/* ⚠⚠ 2026-10-13（53 号日志："手放到电机上能感到高频振动"）：
- *   两个判据全部改成**施密特迟滞**。原来"误差>0.2° 且 平台速率<2.9°/s = 卡住"，
- *   而稳态时平台速率就在 ±3°/s 附近飘、误差也在 0.2° 上下跳 —— 两个条件都贴着
- *   阈值来回穿，补偿就以高频通断（4A/s 上、30A/s 下），电机跟着"嗡嗡"。
- *   平台惯量大、姿态看不出在动，但手摸电机能明显感觉到。
- *   迟滞之后，进入/退出只在明确跨门限时发生，中间不抖。*/
-/* ⚠⚠ 2026-10-13 七版（用户："振动没有减弱、幅度反倒增大"）—— 把"想动"门限**大幅
- *   抬高**：0.5° 以下完全不出力，1.5° 才算"真想动"。
- *   为什么：补偿改成连续量后，它在**小误差区也持续出力**（原来硬开关在小误差时是关
- *   着的），于是靶心附近"推一下→过一点→反向推"自己造了个小极限环 —— 这正是
- *   "幅度反倒增大"的来源。抬门限后：稳态（误差 ~0.2°，等于视觉死区 1.5px 的量级）
- *   补偿完全不介入；只有在**移动/扰动**造成 0.5° 以上误差时才出来顶摩擦。
- *   0x1D 仍是上限。*/
-#define YAW_BREAK_ERR_DEG       1.50f   /* 上沿：误差超过它算"真想动"（°）*/
-#define YAW_BREAK_ERR_LO_DEG    0.50f   /* 下沿：误差低于它完全不出力 */
-#define YAW_BREAK_RATE_RADS     0.15f   /* 上沿：速率超过它才判"动起来"（8.6°/s）*/
-#define YAW_BREAK_RATE_LO_RADS  0.04f   /* 下沿：速率低于它才判"卡住"（2.3°/s）*/
-static float   g_break_i;                  /* 自适应脱困电流（A，0..上限）*/
-static uint8_t g_break_stuck;              /* 迟滞状态：1=卡住（正在脱困） */
-static uint8_t g_break_want;               /* 迟滞状态：1=误差够大、想动 */
 static float   g_rate_i       = 0.0f;      /* 速率环积分器（mA）*/
 static float   g_rate_iq_ma   = 0.0f;      /* 最近一次输出的电流（mA，给日志看）*/
 static float g_pitch_kp       = PITCH_KP;
@@ -2339,63 +2285,6 @@ static void yuntai_control(uint32_t now)
             g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
         }
 
-        /* ---- 自适应脱困补偿（2026-10-13 第三版，见 YAW_BREAK_* 说明）----
-         * 卡着（误差>0.5° 且平台几乎没动）→ 脱困电流以 10A/s 往上爬；
-         * 一动起来/误差小了 → 以 15A/s 掉下来。方向 = 误差方向。
-         * 好处：在滑环摩擦大的角度段它能爬到足够大把轴顶开；在摩擦小的段它
-         * 只爬到"刚好够"就停，冲过头的余量最小 —— 这才是粘滑极限环的根治点。*/
-        if ((g_yaw_test_run == 0u) && (g_yaw_stict_a > 0.0f))
-        {
-            float err_deg = g_yaw_err_rad * 57.29578f;
-            float aer = fabsf(err_deg);
-            float gr  = fabsf(gyro_c[2]);
-            /* ⚠ 2026-10-13 六版（用户："高频振动依然存在"）：把最后两处**硬判据**
-             * （want / stuck 的开关位）也做成**连续量**。
-             *   现场反馈：力矩模式下全程可感到高频颤动；而"卡住/动了"的开关在
-             *   陀螺噪声（±3°/s 量级）上通断，就会以同样的频率调制我们给的电流 ——
-             *   这正是我们这一侧能贡献的高频成分。改成连续因子后，噪声只造成
-             *   "斜坡快慢的轻微变化"，不再有开关边沿。
-             *   （如果这样改完颤动依旧，那它就来自驱动器电流环本身，见 0x1D=0 对照。）*/
-            float stuck_f = clampf((YAW_BREAK_RATE_RADS - gr) /
-                                   (YAW_BREAK_RATE_RADS - YAW_BREAK_RATE_LO_RADS),
-                                   0.0f, 1.0f);
-            float want_f  = clampf((aer - YAW_BREAK_ERR_LO_DEG) /
-                                   (YAW_BREAK_ERR_DEG - YAW_BREAK_ERR_LO_DEG),
-                                   0.0f, 1.0f);
-            {
-                float tgt_bias = g_yaw_stict_a *
-                                 clampf(aer / YAW_BREAK_FULL_ERR_DEG, 0.0f, 1.0f);
-                float drive = YAW_BREAK_SLEW_A_PER_S * want_f * stuck_f;
-                if (g_break_i < tgt_bias)
-                {
-                    g_break_i += drive * dt;
-                    if (g_break_i > tgt_bias)
-                    {
-                        g_break_i = tgt_bias;
-                    }
-                }
-                else
-                {
-                    g_break_i -= YAW_BREAK_DECAY_A_PER_S * dt;
-                }
-            }
-            g_break_i = clampf(g_break_i, 0.0f, g_yaw_stict_a);
-            if (g_break_i > 0.0f)
-            {
-                float want = (err_deg > 0.0f) ? g_break_i : -g_break_i;
-                g_rate_iq_ma += want * 1000.0f;
-                g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
-                g_yaw_stiction_on = 1u;
-            }
-            else
-            {
-                g_yaw_stiction_on = 0u;
-            }
-        }
-        else
-        {
-            g_break_i = 0.0f;
-        }
         /* ⚠ 安全闸：平台转太快（>200°/s）说明符号/量纲不对或失控，
          * 立刻把力矩清零并清积分（台架上第一次试的时候这道闸就是保命的）。*/
         if (fabsf(gyro_c[2]) > 3.5f)
@@ -3588,17 +3477,6 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
             snprintf(sb, sizeof(sb), "[CTRL] period <- %ums (%uHz)",
                      (unsigned)g_ctrl_period_ms,
                      (unsigned)(1000u / g_ctrl_period_ms));
-            gimbal_link_log_force(sb);
-        }
-        break;
-
-    case GP_PARAM_TQ_STICTION:
-        /* 力矩脱困补偿电流（A×100，见 gimbal_proto.h 的 0x1D 说明）*/
-        g_yaw_stict_a = clampf(v, 0.0f, 10.0f);
-        {
-            char sb[44], n0[12];
-            fmt_f(n0, sizeof(n0), g_yaw_stict_a, 2);
-            snprintf(sb, sizeof(sb), "[CTRL] tqStiction <- %sA", n0);
             gimbal_link_log_force(sb);
         }
         break;
