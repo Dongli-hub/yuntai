@@ -1265,10 +1265,6 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_KP_YAW          9.0f
 #define VIS_KI_YAW          0.0f
 #define VIS_KD_YAW          0.6f
-#define VIS_YAW_NEAR_DISTANCE_M    0.70f
-#define VIS_YAW_FAR_DISTANCE_M     1.30f
-#define VIS_YAW_FAR_KP_SCALE       1.0f
-#define VIS_YAW_FAR_KD_SCALE       1.0f
 #define VIS_KP_PITCH        8.0f
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.25f
@@ -1279,7 +1275,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_RATE_PITCH_DPS  250.0f
 #define VIS_I_LIMIT_ANGLE_DEG  30.0f /* 积分项对目标角的贡献上限 */
 #define VIS_D_LIMIT_ANGLE_DEG  30.0f /* 微分项对目标角的贡献上限 */
-#define VIS_LATENCY_COMP_GAIN       0.80f
+#define VIS_LATENCY_COMP_GAIN       0.90f
 #define VIS_LATENCY_MAX_MS          90.0f
 #define VIS_LATENCY_YAW_LIMIT_DEG   10.0f
 #define VIS_LATENCY_PITCH_LIMIT_DEG  8.0f
@@ -1331,30 +1327,6 @@ static float   g_vis_ki_pitch = VIS_KI_PITCH;
 static float   g_vis_kd_pitch = VIS_KD_PITCH;
 static float   g_vis_limyaw_deg = VIS_LIMIT_YAW_DEG;
 static float   g_yaw_out_rpm = YAW_OUT_RPM;
-
-static void vis_yaw_gain_scales(float distance_m,
-                                float *kp_scale, float *kd_scale)
-{
-    float blend;
-
-    if (distance_m <= VIS_YAW_NEAR_DISTANCE_M)
-    {
-        *kp_scale = 1.0f;
-        *kd_scale = 1.0f;
-        return;
-    }
-    if (distance_m >= VIS_YAW_FAR_DISTANCE_M)
-    {
-        *kp_scale = VIS_YAW_FAR_KP_SCALE;
-        *kd_scale = VIS_YAW_FAR_KD_SCALE;
-        return;
-    }
-
-    blend = (distance_m - VIS_YAW_NEAR_DISTANCE_M) /
-            (VIS_YAW_FAR_DISTANCE_M - VIS_YAW_NEAR_DISTANCE_M);
-    *kp_scale = 1.0f + blend * (VIS_YAW_FAR_KP_SCALE - 1.0f);
-    *kd_scale = 1.0f + blend * (VIS_YAW_FAR_KD_SCALE - 1.0f);
-}
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
@@ -1598,19 +1570,11 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
          * 没有新视觉帧时偏置角保持，不清零。 */
         {
-            float yaw_kp_scale;
-            float yaw_kd_scale;
-            float yaw_kp;
-            float yaw_kd;
             float yaw_rate;
-            vis_yaw_gain_scales(cmd->vis_distance_m,
-                                &yaw_kp_scale, &yaw_kd_scale);
-            yaw_kp = g_vis_kp_yaw * yaw_kp_scale;
-            yaw_kd = g_vis_kd_yaw * yaw_kd_scale;
             yaw_rate = g_yaw_vis_gain *
                 vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
-                             yaw_kp, g_vis_ki_yaw,
-                             yaw_kd, VIS_RATE_YAW_DPS);
+                             g_vis_kp_yaw, g_vis_ki_yaw,
+                             g_vis_kd_yaw, VIS_RATE_YAW_DPS);
             yaw_rate = clampf(
                 yaw_rate, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS
             );
