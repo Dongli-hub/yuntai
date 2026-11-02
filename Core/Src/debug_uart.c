@@ -10,7 +10,7 @@ void debug_uart10_init(void)
 {
     static const char header[] =
         "ms,mode,aim,age,seq,tu,tv,su,sv,ey,ep,wy,wp,ay,ap,"
-        "yr,gyro,yiq,pit,ptgt,pcmd,piq,vfps,flt\r\n";
+        "yr,gyro,yiq,pit,ptgt,pcmd,piq,vfps,rxb,lines,rej,flt\r\n";
     HAL_NVIC_SetPriority(USART10_IRQn, 6u, 0u);
     HAL_NVIC_EnableIRQ(USART10_IRQn);
     (void)debug_uart10_send(header);

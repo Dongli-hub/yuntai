@@ -799,6 +799,7 @@ static void yuntai_uart10_debug(uint32_t now)
     size_t position;
     float visual_age;
     float yaw_relative_deg;
+    GimbalLinkStats_t link_stats;
     int written;
 
     if (g_uart10_boot_logged == 0u)
@@ -849,6 +850,7 @@ static void yuntai_uart10_debug(uint32_t now)
     }
 
     visual_age = vis_total_age_ms(cmd, now);
+    link_stats = gimbal_link_stats();
     yaw_relative_deg =
         angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * 57.29578f;
 
@@ -892,7 +894,11 @@ static void yuntai_uart10_debug(uint32_t now)
     uart10_append_float(line, sizeof(line), &position, g_pitch_iq_ma, 0);
     uart10_append_float(line, sizeof(line), &position, g_vis_fps, 1);
     snprintf(line + position, sizeof(line) - position,
-             ",%lu\r\n", (unsigned long)g_fault);
+             ",%lu,%lu,%lu,%lu\r\n",
+             (unsigned long)link_stats.rx_bytes,
+             (unsigned long)link_stats.lines,
+             (unsigned long)link_stats.rejected_lines,
+             (unsigned long)g_fault);
     (void)debug_uart10_send(line);
 }
 

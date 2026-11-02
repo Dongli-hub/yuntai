@@ -42,10 +42,18 @@ typedef struct
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */
 } GimbalCmd_t;
 
+typedef struct
+{
+    uint32_t rx_bytes;
+    uint32_t lines;
+    uint32_t rejected_lines;
+} GimbalLinkStats_t;
+
 void               gimbal_link_init(void);
 void               gimbal_link_poll(uint32_t now_ms);
 void               gimbal_link_rx_isr(void);
 const GimbalCmd_t *gimbal_link_cmd(void);
+GimbalLinkStats_t  gimbal_link_stats(void);
 uint8_t            gimbal_link_take_zero_req(void);   /* 读并清"重新锁零"请求 */
 
 #endif /* __GIMBAL_LINK_H__ */

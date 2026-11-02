@@ -42,6 +42,7 @@ static uint8_t           s_alive;
 static uint8_t           s_zero_req;
 static char              s_text_line[GL_TEXT_BUF_SIZE];
 static uint8_t           s_text_len;
+static GimbalLinkStats_t s_stats;
 
 static int32_t gl_parse_x100(const char **cursor, uint8_t *ok)
 {
@@ -96,7 +97,7 @@ static int32_t gl_parse_x100(const char **cursor, uint8_t *ok)
     return sign * (whole * 100 + frac);
 }
 
-static void gl_handle_text_line(uint32_t now_ms)
+static uint8_t gl_handle_text_line(uint32_t now_ms)
 {
     const char *p = s_text_line;
     int32_t values[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -112,7 +113,7 @@ static void gl_handle_text_line(uint32_t now_ms)
         values[value_count] = gl_parse_x100(&p, &ok);
         if (!ok)
         {
-            return;
+            return 0u;
         }
         value_count++;
         if (*p != ',')
@@ -123,7 +124,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
     if (*p != '\0')
     {
-        return;
+        return 0u;
     }
 
     /*
@@ -148,7 +149,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
     else
     {
-        return;
+        return 0u;
     }
 
     lost = (uint8_t)(
@@ -164,7 +165,7 @@ static void gl_handle_text_line(uint32_t now_ms)
             (values[offset + 3u] < 0) ||
             (values[offset + 3u] > 100000))
         {
-            return;
+            return 0u;
         }
     }
 
@@ -237,6 +238,7 @@ static void gl_handle_text_line(uint32_t now_ms)
         s_zero_req = 1u;
     }
     s_alive = 1u;
+    return 1u;
 }
 
 static void gl_text_feed_byte(uint8_t byte, uint32_t now_ms)
@@ -250,7 +252,11 @@ static void gl_text_feed_byte(uint8_t byte, uint32_t now_ms)
         if (s_text_len > 0u)
         {
             s_text_line[s_text_len] = '\0';
-            gl_handle_text_line(now_ms);
+            s_stats.lines++;
+            if (gl_handle_text_line(now_ms) == 0u)
+            {
+                s_stats.rejected_lines++;
+            }
         }
         s_text_len = 0u;
         return;
@@ -281,6 +287,7 @@ static void gl_rx_push(uint8_t byte)
     {
         s_rx_buf[s_rx_head] = byte;
         s_rx_head = next;
+        s_stats.rx_bytes++;
     }
 }
 
@@ -292,6 +299,7 @@ void gimbal_link_init(void)
     s_alive = 0u;
     s_zero_req = 0u;
     s_text_len = 0u;
+    memset(&s_stats, 0, sizeof(s_stats));
     memset(&s_cmd, 0, sizeof(s_cmd));
     s_cmd.mode = GP_MODE_STAB;
 
@@ -362,6 +370,11 @@ void gimbal_link_poll(uint32_t now_ms)
 const GimbalCmd_t *gimbal_link_cmd(void)
 {
     return &s_cmd;
+}
+
+GimbalLinkStats_t gimbal_link_stats(void)
+{
+    return s_stats;
 }
 
 uint8_t gimbal_link_take_zero_req(void)
