@@ -1212,9 +1212,9 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_KP_YAW          11.0f
 #define VIS_KI_YAW          0.0f
 #define VIS_KD_YAW          0.70f
-#define VIS_KP_PITCH        9.0f
+#define VIS_KP_PITCH        7.0f
 #define VIS_KI_PITCH        0.0f
-#define VIS_KD_PITCH        0.30f
+#define VIS_KD_PITCH        0.20f
 
 #define VIS_SIGN_YAW       -1.0f
 #define VIS_SIGN_PITCH     -1.0f
