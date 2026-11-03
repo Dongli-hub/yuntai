@@ -387,6 +387,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t lost;
     uint8_t was_aim;
     uint8_t geometry_angle;
+    uint8_t geometry_state;
 
     yaw_x100 = gl_parse_text_x100(&p, &ok_yaw);
     if ((!ok_yaw) || (*p != ','))
@@ -424,8 +425,10 @@ static void gl_handle_text_line(uint32_t now_ms)
         /* 第10列单位为秒×100，因此乘10得到毫秒。 */
         s_cmd.vis_proc_age_ms = (uint16_t)(aux[7] * 10);
     }
-    geometry_angle =
-        (uint8_t)((aux_n >= 9u) && (aux[8] != 0));
+    geometry_state = (uint8_t)(
+        (aux_n >= 9u) ? ((aux[8] >= 0 && aux[8] <= 3) ? aux[8] : 0) : 0
+    );
+    geometry_angle = (uint8_t)(geometry_state == 1u);
     if (!lost)
     {
         /* ASCII 链路偶发丢字节时，小数点缺失会把 1.83 变成 183。
@@ -462,7 +465,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     s_cmd.mode = lost ? GP_MODE_STAB : GP_MODE_AIM;
     s_cmd.vis_direct_angle = 1u;
     s_cmd.vis_direct_error = 0u;
-    s_cmd.vis_geometry_valid = geometry_angle;
+    s_cmd.vis_geometry_state = geometry_state;
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
@@ -609,7 +612,7 @@ static void gl_handle_frame(uint32_t now_ms)
             }
             s_cmd.vis_direct_error = 0u;
             s_cmd.vis_direct_angle = 0u;
-            s_cmd.vis_geometry_valid = 0u;
+            s_cmd.vis_geometry_state = 0u;
             s_cmd.px_ms      = now_ms;
             s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
@@ -636,7 +639,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_err_v_px = gp_get_i16(&s_parser.payload[2]);
             s_cmd.vis_direct_error = 1u;
             s_cmd.vis_direct_angle = 0u;
-            s_cmd.vis_geometry_valid = 0u;
+            s_cmd.vis_geometry_state = 0u;
             s_cmd.mode      = GP_MODE_AIM;
             if (!was_aim)
             {
@@ -681,7 +684,7 @@ static void gl_handle_frame(uint32_t now_ms)
                 s_cmd.mode = mode;
                 if (mode != GP_MODE_AIM)
                 {
-                    s_cmd.vis_geometry_valid = 0u;
+                    s_cmd.vis_geometry_state = 0u;
                 }
             }
             else
