@@ -381,7 +381,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t aux[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t aux_n = 0u;
     uint8_t aux_i;
     uint8_t lost;
@@ -401,9 +401,9 @@ static void gl_handle_text_line(uint32_t now_ms)
         return;
     }
     /* K230 在第3~10列附带靶心/激光像素、距离、靶心像素速度
-     * 和图像处理年龄；第11列为 1 表示前两列是三维几何角度误差。
+     * 和图像处理年龄；第11~13列为几何状态、重投影误差和细化标志。
      * 老版缺少后续列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 9u; aux_i++)
+    for (aux_i = 0u; aux_i < 11u; aux_i++)
     {
         if (*p != ',')
         {
@@ -477,6 +477,13 @@ static void gl_handle_text_line(uint32_t now_ms)
     s_cmd.vis_direct_angle = 1u;
     s_cmd.vis_direct_error = 0u;
     s_cmd.vis_geometry_state = geometry_state;
+    s_cmd.vis_reprojection_x100 = (uint16_t)(
+        (aux_n >= 10u && aux[9] >= 0)
+            ? ((aux[9] > 100000) ? 100000 : aux[9])
+            : 0
+    );
+    s_cmd.vis_pose_refined =
+        (uint8_t)((aux_n >= 11u) && (aux[10] != 0));
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
@@ -624,6 +631,8 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_direct_error = 0u;
             s_cmd.vis_direct_angle = 0u;
             s_cmd.vis_geometry_state = 0u;
+            s_cmd.vis_reprojection_x100 = 0u;
+            s_cmd.vis_pose_refined = 0u;
             s_cmd.px_ms      = now_ms;
             s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
@@ -651,6 +660,8 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_direct_error = 1u;
             s_cmd.vis_direct_angle = 0u;
             s_cmd.vis_geometry_state = 0u;
+            s_cmd.vis_reprojection_x100 = 0u;
+            s_cmd.vis_pose_refined = 0u;
             s_cmd.mode      = GP_MODE_AIM;
             if (!was_aim)
             {
@@ -696,6 +707,8 @@ static void gl_handle_frame(uint32_t now_ms)
                 if (mode != GP_MODE_AIM)
                 {
                     s_cmd.vis_geometry_state = 0u;
+                    s_cmd.vis_reprojection_x100 = 0u;
+                    s_cmd.vis_pose_refined = 0u;
                 }
             }
             else
