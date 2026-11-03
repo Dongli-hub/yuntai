@@ -498,11 +498,19 @@ static void gl_handle_text_line(uint32_t now_ms)
             ? ((aux[12] > 65535) ? 65535 : aux[12])
             : 0
     );
-    s_cmd.vis_target_layer = (uint8_t)(
-        (aux_n >= 14u && aux[13] >= 0 && aux[13] <= 2)
-            ? aux[13]
-            : 0
-    );
+    s_cmd.vis_target_layer = 0u;
+    if (aux_n >= 14u)
+    {
+        if ((aux[13] >= 0) && (aux[13] <= 2))
+        {
+            s_cmd.vis_target_layer = (uint8_t)aux[13];
+        }
+        else if ((aux[13] >= 100) && (aux[13] <= 200) &&
+                 ((aux[13] % 100) == 0))
+        {
+            s_cmd.vis_target_layer = (uint8_t)(aux[13] / 100);
+        }
+    }
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
