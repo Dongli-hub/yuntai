@@ -425,9 +425,20 @@ static void gl_handle_text_line(uint32_t now_ms)
         /* 第10列单位为秒×100，因此乘10得到毫秒。 */
         s_cmd.vis_proc_age_ms = (uint16_t)(aux[7] * 10);
     }
-    geometry_state = (uint8_t)(
-        (aux_n >= 9u) ? ((aux[8] >= 0 && aux[8] <= 3) ? aux[8] : 0) : 0
-    );
+    geometry_state = 0u;
+    if (aux_n >= 9u)
+    {
+        if ((aux[8] >= 0) && (aux[8] <= 3))
+        {
+            geometry_state = (uint8_t)aux[8];
+        }
+        else if ((aux[8] >= 100) && (aux[8] <= 300) &&
+                 ((aux[8] % 100) == 0))
+        {
+            /* ASCII 浮点辅助字段统一按 x100 解析：1/2/3 -> 100/200/300。 */
+            geometry_state = (uint8_t)(aux[8] / 100);
+        }
+    }
     geometry_angle = (uint8_t)(geometry_state == 1u);
     if (!lost)
     {
