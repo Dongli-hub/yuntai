@@ -53,6 +53,9 @@ typedef struct
     uint8_t vis_geometry_state;/* 1=成功 2=无新框 4~11=几何拒绝原因 */
     uint16_t vis_reprojection_x100; /* K230 靶面pose重投影误差(px x100) */
     uint8_t vis_pose_refined;  /* 本帧是否执行 Gauss-Newton 细化 */
+    uint16_t vis_target_w_x100;/* K230 当前候选框宽(px x100) */
+    uint16_t vis_target_h_x100;/* K230 当前候选框高(px x100) */
+    uint8_t vis_target_layer;  /* 0=unknown 1=outer 2=inner */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */

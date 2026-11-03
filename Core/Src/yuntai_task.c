@@ -2837,8 +2837,18 @@ static void yuntai_uart10_debug(uint32_t now)
     }
     uart10_append_float(line, sizeof(line), &pos,
                         (float)cmd->vis_reprojection_x100 / 100.0f, 2);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u",
+                 (unsigned)cmd->vis_pose_refined);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        (float)cmd->vis_target_w_x100 / 100.0f, 1);
+    uart10_append_float(line, sizeof(line), &pos,
+                        (float)cmd->vis_target_h_x100 / 100.0f, 1);
     snprintf(line + pos, sizeof(line) - pos, ",%u\r\n",
-             (unsigned)cmd->vis_pose_refined);
+             (unsigned)cmd->vis_target_layer);
     (void)debug_uart10_send(line);
 }
 

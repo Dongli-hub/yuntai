@@ -381,7 +381,10 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t aux[14] = {
+        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0
+    };
     uint8_t aux_n = 0u;
     uint8_t aux_i;
     uint8_t lost;
@@ -401,9 +404,10 @@ static void gl_handle_text_line(uint32_t now_ms)
         return;
     }
     /* K230 在第3~10列附带靶心/激光像素、距离、靶心像素速度
-     * 和图像处理年龄；第11~13列为几何状态、重投影误差和细化标志。
+     * 和图像处理年龄；后面依次是几何状态、重投影误差、细化标志、
+     * 当前候选框宽高和内外框类型。
      * 老版缺少后续列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 11u; aux_i++)
+    for (aux_i = 0u; aux_i < 14u; aux_i++)
     {
         if (*p != ',')
         {
@@ -484,6 +488,21 @@ static void gl_handle_text_line(uint32_t now_ms)
     );
     s_cmd.vis_pose_refined =
         (uint8_t)((aux_n >= 11u) && (aux[10] != 0));
+    s_cmd.vis_target_w_x100 = (uint16_t)(
+        (aux_n >= 12u && aux[11] >= 0)
+            ? ((aux[11] > 65535) ? 65535 : aux[11])
+            : 0
+    );
+    s_cmd.vis_target_h_x100 = (uint16_t)(
+        (aux_n >= 13u && aux[12] >= 0)
+            ? ((aux[12] > 65535) ? 65535 : aux[12])
+            : 0
+    );
+    s_cmd.vis_target_layer = (uint8_t)(
+        (aux_n >= 14u && aux[13] >= 0 && aux[13] <= 2)
+            ? aux[13]
+            : 0
+    );
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
@@ -633,6 +652,9 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_geometry_state = 0u;
             s_cmd.vis_reprojection_x100 = 0u;
             s_cmd.vis_pose_refined = 0u;
+            s_cmd.vis_target_w_x100 = 0u;
+            s_cmd.vis_target_h_x100 = 0u;
+            s_cmd.vis_target_layer = 0u;
             s_cmd.px_ms      = now_ms;
             s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
@@ -662,6 +684,9 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_geometry_state = 0u;
             s_cmd.vis_reprojection_x100 = 0u;
             s_cmd.vis_pose_refined = 0u;
+            s_cmd.vis_target_w_x100 = 0u;
+            s_cmd.vis_target_h_x100 = 0u;
+            s_cmd.vis_target_layer = 0u;
             s_cmd.mode      = GP_MODE_AIM;
             if (!was_aim)
             {
@@ -709,6 +734,9 @@ static void gl_handle_frame(uint32_t now_ms)
                     s_cmd.vis_geometry_state = 0u;
                     s_cmd.vis_reprojection_x100 = 0u;
                     s_cmd.vis_pose_refined = 0u;
+                    s_cmd.vis_target_w_x100 = 0u;
+                    s_cmd.vis_target_h_x100 = 0u;
+                    s_cmd.vis_target_layer = 0u;
                 }
             }
             else
