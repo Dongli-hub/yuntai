@@ -50,7 +50,7 @@ typedef struct
     uint8_t target_velocity_valid; /* 本帧是否携带目标像素速度 */
     uint16_t vis_proc_age_ms;  /* K230从取图完成到发送该帧的处理年龄 */
     uint8_t vis_direct_angle;  /* 1 = 直接使用上面的角度误差 */
-    uint8_t vis_geometry_state;/* 1=三维成功 2=无新鲜靶框 3=几何失败 */
+    uint8_t vis_geometry_state;/* 1=成功 2=无新框 4~11=几何拒绝原因 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */

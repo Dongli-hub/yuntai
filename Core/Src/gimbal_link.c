@@ -428,11 +428,11 @@ static void gl_handle_text_line(uint32_t now_ms)
     geometry_state = 0u;
     if (aux_n >= 9u)
     {
-        if ((aux[8] >= 0) && (aux[8] <= 3))
+        if ((aux[8] >= 0) && (aux[8] <= 15))
         {
             geometry_state = (uint8_t)aux[8];
         }
-        else if ((aux[8] >= 100) && (aux[8] <= 300) &&
+        else if ((aux[8] >= 100) && (aux[8] <= 1500) &&
                  ((aux[8] % 100) == 0))
         {
             /* ASCII 浮点辅助字段统一按 x100 解析：1/2/3 -> 100/200/300。 */
