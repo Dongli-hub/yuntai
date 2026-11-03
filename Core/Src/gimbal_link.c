@@ -381,11 +381,12 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t aux[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t aux_n = 0u;
     uint8_t aux_i;
     uint8_t lost;
     uint8_t was_aim;
+    uint8_t geometry_angle;
 
     yaw_x100 = gl_parse_text_x100(&p, &ok_yaw);
     if ((!ok_yaw) || (*p != ','))
@@ -399,8 +400,9 @@ static void gl_handle_text_line(uint32_t now_ms)
         return;
     }
     /* K230 在第3~10列附带靶心/激光像素、距离、靶心像素速度
-     * 和图像处理年龄。老版缺少后续列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 8u; aux_i++)
+     * 和图像处理年龄；第11列为 1 表示前两列是三维几何角度误差。
+     * 老版缺少后续列时仍按原协议工作。 */
+    for (aux_i = 0u; aux_i < 9u; aux_i++)
     {
         if (*p != ',')
         {
@@ -422,16 +424,19 @@ static void gl_handle_text_line(uint32_t now_ms)
         /* 第10列单位为秒×100，因此乘10得到毫秒。 */
         s_cmd.vis_proc_age_ms = (uint16_t)(aux[7] * 10);
     }
+    geometry_angle =
+        (uint8_t)((aux_n >= 9u) && (aux[8] != 0));
     if (!lost)
     {
         /* ASCII 链路偶发丢字节时，小数点缺失会把 1.83 变成 183。
-         * 用同一帧的像素坐标反算角度，避免坏帧直接进入控制环。 */
+         * 旧像素协议用同一帧像素反算角度；三维几何角度不能再用
+         * 固定的 0.14°/px 校验，否则斜视时正确结果会被丢弃。 */
         if ((gl_abs_i32(yaw_x100) > 5500) ||
             (gl_abs_i32(pitch_x100) > 4000))
         {
             return;
         }
-        if (aux_n >= 4u)
+        if ((geometry_angle == 0u) && (aux_n >= 4u))
         {
             if (((aux[0] == 0) && (aux[1] == 0) &&
                  (aux[2] == 0) && (aux[3] == 0)) ||
@@ -467,11 +472,13 @@ static void gl_handle_text_line(uint32_t now_ms)
     s_cmd.boost = 0u;
     s_cmd.drawing = 0u;
     s_cmd.vis_yaw_deg = lost ? 0.0f
-        : (((float)yaw_x100 / 100.0f) * K230_TO_H723_ANGLE_SCALE);
+        : ((float)yaw_x100 / 100.0f *
+           (geometry_angle ? 1.0f : K230_TO_H723_ANGLE_SCALE));
     /* The new K230 code does not enable the old camera VFLIP, so its pitch
      * direction is reversed relative to the existing H723 image convention. */
     s_cmd.vis_pitch_deg = lost ? 0.0f
-        : (-(float)pitch_x100 / 100.0f * K230_TO_H723_ANGLE_SCALE);
+        : (-(float)pitch_x100 / 100.0f *
+           (geometry_angle ? 1.0f : K230_TO_H723_ANGLE_SCALE));
     if (aux_n >= 4u)
     {
         int32_t tx = aux[0] / 100;
