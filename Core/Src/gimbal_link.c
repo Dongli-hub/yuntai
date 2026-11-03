@@ -462,6 +462,7 @@ static void gl_handle_text_line(uint32_t now_ms)
     s_cmd.mode = lost ? GP_MODE_STAB : GP_MODE_AIM;
     s_cmd.vis_direct_angle = 1u;
     s_cmd.vis_direct_error = 0u;
+    s_cmd.vis_geometry_valid = geometry_angle;
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
@@ -608,6 +609,7 @@ static void gl_handle_frame(uint32_t now_ms)
             }
             s_cmd.vis_direct_error = 0u;
             s_cmd.vis_direct_angle = 0u;
+            s_cmd.vis_geometry_valid = 0u;
             s_cmd.px_ms      = now_ms;
             s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
@@ -634,6 +636,7 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_err_v_px = gp_get_i16(&s_parser.payload[2]);
             s_cmd.vis_direct_error = 1u;
             s_cmd.vis_direct_angle = 0u;
+            s_cmd.vis_geometry_valid = 0u;
             s_cmd.mode      = GP_MODE_AIM;
             if (!was_aim)
             {
@@ -676,6 +679,10 @@ static void gl_handle_frame(uint32_t now_ms)
                     gimbal_link_log(buf);
                 }
                 s_cmd.mode = mode;
+                if (mode != GP_MODE_AIM)
+                {
+                    s_cmd.vis_geometry_valid = 0u;
+                }
             }
             else
             {

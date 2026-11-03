@@ -2829,7 +2829,8 @@ static void yuntai_uart10_debug(uint32_t now)
     uart10_append_float(line, sizeof(line), &pos, g_pitch_iq_ma, 0);
     uart10_append_float(line, sizeof(line), &pos, g_vis_fps, 1);
     snprintf(line + pos, sizeof(line) - pos,
-             ",%lu\r\n", (unsigned long)g_fault);
+             ",%lu,%u\r\n", (unsigned long)g_fault,
+             (unsigned)cmd->vis_geometry_valid);
     (void)debug_uart10_send(line);
 }
 
