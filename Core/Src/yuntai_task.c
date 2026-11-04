@@ -517,7 +517,6 @@ typedef struct
     uint32_t cfsr;
     uint32_t hfsr;
     int16_t  yaw_torque_x100;
-    int16_t  pitch_torque_x100;
 } YuntaiRetained_t;
 
 #define YUNTAI_RETAINED_MAGIC 0x59414E54u
@@ -848,15 +847,7 @@ static float   g_yaw_off_rate;         /* 视觉目标角变化率（rad/s，AIM
  * ⇒ 俯仰的反馈**必须用电机自己的编码器**。
  * 当前结构：最终目标角（锁定角 + 平台补偿 + 视觉偏置）与编码器实际角
  * 做位置 PID，输出 rpm 交给驱动器速度模式闭环。固件不再把 rpm 转成电流。
- * g_pitch_torque 仅为保留的调试开关，默认必须为 0。 */
-static uint8_t g_pitch_torque = 0u;   /* 0=驱动器速度模式（默认）*/
-static float   g_pitch_ilim_a = 3.0f;  /* 电流限幅 A（0x08）*/
-static float   g_pitch_iq_ma;          /* 最近输出（mA，给日志）*/
-static float   g_pitch_iq_filt;        /* 俯仰力矩指令一阶低通状态 */
-static float   g_pitch_imu_lock;       /* 锁基准时的 IMU 俯仰（rad）*/
-/* 俯仰力矩模式的"速率环"（内环，1kHz）：把位置环输出的 rpm 变成电流。
- * 转速反馈 = 驱动器自报的编码器转速（俯仰这一路可信）。*/
-static float   g_prate_kp = 30.0f;     /* mA/rpm */
+ * 力矩模式相关状态已全部删除，避免异常恢复或调试参数重新进入该路径。 */
 static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32 Nm
                                             * ⚠ 2026-10-13 由 2.5A 提到 6A：
                                             * 43/44 号日志证明 ±0.08Nm 推不动这一轴
@@ -1130,8 +1121,7 @@ static void yuntai_read_feedback(uint32_t now)
         {
             g_pitch_mode_rb = mb;
             {
-            uint8_t expect_p = (g_pitch_torque != 0u) ? JC_MODE_TORQUE
-                                                      : g_speed_mode;
+            uint8_t expect_p = g_speed_mode;
             if (mb == expect_p)
             {
                 g_pitch_mode_bad_cnt = 0u;
@@ -1766,13 +1756,10 @@ static void yuntai_lock_reference(void)
     g_yaw_lock_rad      = imuAngle[0];       /* 绝对方位基准 */
     vis_outer_reset();                       /* 视觉目标角从 0 起步 */
     g_pitch_plat_lock   = imuAngle[1];       /* 平台俯仰基准 */
-    g_pitch_imu_lock    = imuAngle[1];       /* 力矩模式下俯仰的世界系基准 */
     g_plat_dtheta       = 0.0f;              /* 平台俯仰变化量从 0 重新算 */
     g_plat_comp         = 0.0f;              /* 补偿量也从 0 重新起步 */
     g_pitch_motor_lock  = g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f;
     g_pitch_tgt_deg     = g_pitch_motor_lock;
-    g_pitch_iq_ma       = 0.0f;
-    g_pitch_iq_filt     = 0.0f;
     g_mot_rate_f = 0.0f;
     g_yaw_base_rate = 0.0f;
     g_yaw_pos_ms = 0u;
@@ -2550,20 +2537,13 @@ static void yuntai_control(uint32_t now)
     if (mode == GP_MODE_ESTOP)
     {
         PID_Reset(&g_pitch_pid);
-        g_pitch_iq_ma = 0.0f;
-        g_pitch_iq_filt = 0.0f;
         pitch_rpm = 0.0f;
     }
     else if (!pitch_fb_ok)
     {
-        /* 编码器反馈丢失时没有可靠的位置反馈，停止 pitch 力矩输出。 */
+        /* 编码器反馈丢失时没有可靠的位置反馈，停止 pitch 速度输出。 */
         PID_Reset(&g_pitch_pid);
-        g_pitch_iq_ma = 0.0f;
         pitch_rpm = 0.0f;
-        if (g_pitch_torque != 0u)
-        {
-            g_pitch_iq_filt = g_pitch_iq_ma;
-        }
     }
     else if (mode == GP_MODE_UNWIND)
     {
@@ -2573,14 +2553,6 @@ static void yuntai_control(uint32_t now)
         float err = g_pitch_motor_lock - g_pitch_fb.cont;
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
         pitch_rpm = g_pitch_pid.out;
-        if (g_pitch_torque != 0u)
-        {
-            g_pitch_iq_ma = clampf(
-                g_prate_kp * pitch_rpm,
-                -g_pitch_ilim_a * 1000.0f,
-                g_pitch_ilim_a * 1000.0f);
-            g_pitch_iq_filt = g_pitch_iq_ma;
-        }
     }
     else
     {
@@ -2616,83 +2588,33 @@ static void yuntai_control(uint32_t now)
         pitch_rpm = g_pitch_pid.out;
         pitch_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
 
-        if (g_pitch_torque != 0u)
+        /* ---- 失控保护 ---- */
+        if (fabsf(err) > PITCH_RUNAWAY_DEG)
         {
-            float ilim_ma = g_pitch_ilim_a * 1000.0f;
-            g_pitch_iq_ma = clampf(g_prate_kp * pitch_rpm,
-                                   -ilim_ma, ilim_ma);
-            /* 安全闸：编码器转速异常（符号/量纲不对时会飞）→ 立刻清零。
-             * ⚠ 收得很紧：正常输出上限才 120rpm，超过 250rpm 一定是出事了 */
-            if (fabsf(g_pitch_fb.spd) > 250.0f)
+            g_runaway_ms += g_ctrl_period_ms;
+            if (g_runaway_ms > PITCH_RUNAWAY_MS)
             {
-                g_pitch_iq_ma = 0.0f;
-                g_pitch_iq_filt = 0.0f;
                 g_fault |= FAULT_PITCH_RUNAWAY;
-            }
-            else
-            {
-                g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
-                g_pitch_iq_filt += 0.5f *
-                    (g_pitch_iq_ma - g_pitch_iq_filt);
-                g_pitch_iq_ma = g_pitch_iq_filt;
+                PID_Reset(&g_pitch_pid);
+                pitch_rpm = 0.0f;
             }
         }
         else
         {
-            /* ---- 失控保护 ---- */
-            if (fabsf(err) > PITCH_RUNAWAY_DEG)
-            {
-                g_runaway_ms += g_ctrl_period_ms;
-                if (g_runaway_ms > PITCH_RUNAWAY_MS)
-                {
-                    g_fault |= FAULT_PITCH_RUNAWAY;
-                    PID_Reset(&g_pitch_pid);
-                    pitch_rpm = 0.0f;
-                }
-            }
-            else
-            {
-                g_runaway_ms = 0u;
-                g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
-            }
+            g_runaway_ms = 0u;
+            g_fault &= (uint8_t)~FAULT_PITCH_RUNAWAY;
         }
     }
     g_pitch_cmd_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
     g_pitch_pos_deg = g_pitch_fb.cont;
-    if (g_pitch_torque != 0u)
-    {
-        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                           (int16_t)(g_pitch_iq_ma * 0.004f));
-    }
-    else
-    {
-        g_pitch_iq_filt = 0.0f;
-        yuntai_set_pitch(g_pitch_cmd_rpm);
-    }
+    yuntai_set_pitch(g_pitch_cmd_rpm);
 
-    /* 保存最后一次力矩，IWDG 复位后用于短暂保持。 */
-    if ((g_yaw_torque != 0u) || (g_pitch_torque != 0u))
+    /* 仅偏航使用力矩模式；保存偏航最后一次力矩供 IWDG 复位后短暂保持。 */
+    if (g_yaw_torque != 0u)
     {
-        if (g_yaw_torque != 0u)
-        {
-            float yaw_tq = g_rate_iq_ma * 0.004f * g_torque_sign;
-            g_retained.yaw_torque_x100 =
-                (int16_t)clampf(yaw_tq, -30000.0f, 30000.0f);
-        }
-        else
-        {
-            g_retained.yaw_torque_x100 = 0;
-        }
-        if (g_pitch_torque != 0u)
-        {
-            float pitch_tq = g_pitch_iq_ma * 0.004f;
-            g_retained.pitch_torque_x100 =
-                (int16_t)clampf(pitch_tq, -30000.0f, 30000.0f);
-        }
-        else
-        {
-            g_retained.pitch_torque_x100 = 0;
-        }
+        float yaw_tq = g_rate_iq_ma * 0.004f * g_torque_sign;
+        g_retained.yaw_torque_x100 =
+            (int16_t)clampf(yaw_tq, -30000.0f, 30000.0f);
         g_retained.sequence++;
         g_retained.magic = YUNTAI_RETAINED_MAGIC;
         __DSB();
@@ -2741,6 +2663,7 @@ static void yuntai_uart10_debug(uint32_t now)
     size_t pos = 0u;
     uint32_t vis_age;
     float yaw_rel_deg;
+    float pitch_iq_disabled = 0.0f; /* 速度模式下不存在固件力矩指令 */
     int n;
 
     if (g_uart10_boot_logged == 0u)
@@ -2834,7 +2757,7 @@ static void yuntai_uart10_debug(uint32_t now)
                         g_pitch_fb.seen ? g_pitch_fb.cont : 0.0f, 2);
     uart10_append_float(line, sizeof(line), &pos, g_pitch_tgt_deg, 2);
     uart10_append_float(line, sizeof(line), &pos, g_pitch_cmd_rpm, 1);
-    uart10_append_float(line, sizeof(line), &pos, g_pitch_iq_ma, 0);
+    uart10_append_float(line, sizeof(line), &pos, pitch_iq_disabled, 0);
     uart10_append_float(line, sizeof(line), &pos, g_vis_fps, 1);
     n = snprintf(line + pos, sizeof(line) - pos,
                  ",%lu,%u", (unsigned long)g_fault,
@@ -3079,7 +3002,6 @@ void yuntai_init(void)
         jc_set_speed_rpm_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, 0);
         jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, 0);
         jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID, 0);
-        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, 0);
     }
     if (g_fast_recovery == 0u)
     {
@@ -3279,8 +3201,7 @@ void yuntai_control_loop(void)
                                 (g_yaw_torque != 0u) ? JC_MODE_TORQUE
                                                      : g_speed_mode);
             jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                                (g_pitch_torque != 0u) ? JC_MODE_TORQUE
-                                                       : g_speed_mode);
+                                g_speed_mode);
             /* ⚠ 2026-10-13：切完模式后**再补一次"进入闭环"**。
              * 依据：驱动器"切换后的模式不能保存" + 切模式有可能把自己的状态机
              * 复位；而上位机能驱动这一轴的流程是"先选模式发送、再点闭环模式"。
@@ -3292,8 +3213,7 @@ void yuntai_control_loop(void)
                 snprintf(sb, sizeof(sb), "[MOTOR] mode yaw=0x%02X pit=0x%02X",
                          (unsigned)((g_yaw_torque != 0u) ? JC_MODE_TORQUE
                                                          : g_speed_mode),
-                         (unsigned)((g_pitch_torque != 0u) ? JC_MODE_TORQUE
-                                                           : g_speed_mode));
+                         (unsigned)g_speed_mode);
                 gimbal_link_log(sb);
             }
         }
@@ -3478,7 +3398,7 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         break;
 
     case GP_PARAM_PITCH_KP:
-        /* 俯仰位置环 KP（rpm/deg）——两种模式都用它：力矩模式下位置环→速率环 */
+        /* 俯仰位置环 KP（rpm/deg），输出直接作为驱动器速度指令。 */
         g_pitch_kp = clampf(v, 0.0f, 40.0f);
         g_pitch_pid.kp = g_pitch_kp;
         PID_Reset(&g_pitch_pid);
