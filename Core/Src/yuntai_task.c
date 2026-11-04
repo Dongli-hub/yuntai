@@ -839,27 +839,21 @@ static float   g_yaw_ilim_ma = 1500.0f;
  *   (0x1D,250) 脱困补偿 2.5A（= 默认，2026-10-14 十三版）/ (0x1D,0) 关掉它*/
 static float   g_yaw_off_rate;         /* 视觉目标角变化率（rad/s，AIM 才有）*/
 
-/* ---- 俯仰力矩模式——⚠⚠⚠ 2026-10-14 试过并**失败回退，默认关闭** ----
+/* ---- 俯仰控制模式——默认使用驱动器速度模式 ----
  * 尝试：俯仰也搬进力矩模式、反馈用 IMU 俯仰（世界系，与偏航同构）。
  * 58 号日志证伪了这条路：**IMU 装在俯仰轴下方（偏航平台上），它根本看不到
  * 俯仰臂的运动** —— 现象是 `pmot` 自己转到 243° 停住、而 `pit` 一直纹丝不动
  * （1.0°）。用 IMU 当俯仰的反馈 = 开环：积分一路涨、电机一头转到行程尽头，
  * 现场就是"猛地向下、又猛地向上、毫无规律地晃"。
  * ⇒ 俯仰的反馈**必须用电机自己的编码器**。
- * ⚠⚠ 2026-10-14 二版（用户拍板的结构）：**目标值仍由 IMU 变化生成（平台补偿），
- *   闭环反馈用编码器**，但内环从"驱动器那条 50~100ms 慢速度环"换成**我们自己的
- *   1kHz 速率环**（反馈=驱动器自报的编码器转速，俯仰这一路它报得很准）。
- *   即：位置环(15rpm/deg, 沿用) → 速率环(30mA/rpm) → 电流。*/
-static uint8_t g_pitch_torque = 1u;   /* 1=编码器反馈的力矩模式（默认）*/
-static float   g_ptq_kp   = 8000.0f;   /* mA/rad（0x05）*/
-static float   g_ptq_kd   = 1000.0f;   /* mA/(rad/s)（0x07）*/
-static float   g_ptq_ki   = 20000.0f;  /* mA/(rad·s)（0x06）*/
+ * 当前结构：最终目标角（锁定角 + 平台补偿 + 视觉偏置）与编码器实际角
+ * 做位置 PID，输出 rpm 交给驱动器速度模式闭环。固件不再把 rpm 转成电流。
+ * g_pitch_torque 仅为保留的调试开关，默认必须为 0。 */
+static uint8_t g_pitch_torque = 0u;   /* 0=驱动器速度模式（默认）*/
 static float   g_pitch_ilim_a = 3.0f;  /* 电流限幅 A（0x08）*/
 static float   g_pitch_iq_ma;          /* 最近输出（mA，给日志）*/
 static float   g_pitch_iq_filt;        /* 俯仰力矩指令一阶低通状态 */
 static float   g_pitch_imu_lock;       /* 锁基准时的 IMU 俯仰（rad）*/
-static float   g_pbreak_i;             /* 俯仰脱困电流（A）*/
-static uint8_t g_pbreak_stuck, g_pbreak_want;
 /* 俯仰力矩模式的"速率环"（内环，1kHz）：把位置环输出的 rpm 变成电流。
  * 转速反馈 = 驱动器自报的编码器转速（俯仰这一路可信）。*/
 static float   g_prate_kp = 30.0f;     /* mA/rpm */
@@ -2677,14 +2671,28 @@ static void yuntai_control(uint32_t now)
     }
 
     /* 保存最后一次力矩，IWDG 复位后用于短暂保持。 */
-    if ((g_yaw_torque != 0u) && (g_pitch_torque != 0u))
+    if ((g_yaw_torque != 0u) || (g_pitch_torque != 0u))
     {
-        float yaw_tq = g_rate_iq_ma * 0.004f * g_torque_sign;
-        float pitch_tq = g_pitch_iq_ma * 0.004f;
-        g_retained.yaw_torque_x100 =
-            (int16_t)clampf(yaw_tq, -30000.0f, 30000.0f);
-        g_retained.pitch_torque_x100 =
-            (int16_t)clampf(pitch_tq, -30000.0f, 30000.0f);
+        if (g_yaw_torque != 0u)
+        {
+            float yaw_tq = g_rate_iq_ma * 0.004f * g_torque_sign;
+            g_retained.yaw_torque_x100 =
+                (int16_t)clampf(yaw_tq, -30000.0f, 30000.0f);
+        }
+        else
+        {
+            g_retained.yaw_torque_x100 = 0;
+        }
+        if (g_pitch_torque != 0u)
+        {
+            float pitch_tq = g_pitch_iq_ma * 0.004f;
+            g_retained.pitch_torque_x100 =
+                (int16_t)clampf(pitch_tq, -30000.0f, 30000.0f);
+        }
+        else
+        {
+            g_retained.pitch_torque_x100 = 0;
+        }
         g_retained.sequence++;
         g_retained.magic = YUNTAI_RETAINED_MAGIC;
         __DSB();
@@ -3040,19 +3048,27 @@ void yuntai_init(void)
         }
     }
 
-    /* 看门狗复位时优先恢复复位前最后一次力矩，让俯仰在启动窗口内
-     * 继续顶住重力；没有有效保存值时再使用零速制动。 */
+    /* 看门狗复位时偏航可恢复上次力矩；俯仰固定使用驱动器速度模式，
+     * 复位后的启动窗口内发送 0 rpm 制动。 */
     if ((g_fast_recovery != 0u) &&
         (g_retained.magic == YUNTAI_RETAINED_MAGIC))
     {
-        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_TORQUE);
-        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_TORQUE);
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                            (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                 : g_speed_mode);
+        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, g_speed_mode);
         jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
         jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
-        jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                           g_retained.yaw_torque_x100);
-        jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                           g_retained.pitch_torque_x100);
+        if (g_yaw_torque != 0u)
+        {
+            jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                               g_retained.yaw_torque_x100);
+        }
+        else
+        {
+            yuntai_set_yaw(0.0f);
+        }
+        yuntai_set_pitch(0.0f);
     }
     else
     {
@@ -3185,15 +3201,22 @@ void yuntai_control_loop(void)
             if (g_retained.magic == YUNTAI_RETAINED_MAGIC)
             {
                 jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                                    JC_MODE_TORQUE);
+                                    (g_yaw_torque != 0u) ? JC_MODE_TORQUE
+                                                         : g_speed_mode);
                 jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                                    JC_MODE_TORQUE);
+                                    g_speed_mode);
                 jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
                 jc_enter_closed_loop(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
-                jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                                   g_retained.yaw_torque_x100);
-                jc_set_torque_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID,
-                                   g_retained.pitch_torque_x100);
+                if (g_yaw_torque != 0u)
+                {
+                    jc_set_torque_x100(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
+                                       g_retained.yaw_torque_x100);
+                }
+                else
+                {
+                    yuntai_set_yaw(0.0f);
+                }
+                yuntai_set_pitch(0.0f);
             }
             else
             {

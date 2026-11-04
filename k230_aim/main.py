@@ -42,7 +42,7 @@ except Exception:
 
 # 每次修改本文件时更新版本号，使启动日志能确认
 # 板端实际运行的版本。
-VISION_VERSION = "v109-20261104-geometry-y-minus-9"
+VISION_VERSION = "v110-20261104-raw-geometry"
 RUN_MODE = "PRODUCTION"  # 测试或生产模式
 
 FRAME_WIDTH = 640
@@ -147,13 +147,6 @@ CAMERA_CALIBRATION = {
         0.1146951914,
     ),
 }
-# 用户现场修正：几何预测落点在图像 y 方向累计向上 9 px。
-# 图像 y 向下为正，因此 offset 为负；H723 在 geom=1 时使用角度而不是
-# 像素坐标，所以同时把等价的俯仰角修正加入控制量。
-LASER_POINT_Y_OFFSET_PX = -9.0
-LASER_POINT_Y_OFFSET_DEG = math.degrees(
-    -LASER_POINT_Y_OFFSET_PX / CAMERA_CALIBRATION["fy"]
-)
 # 2026-11-04 使用 0.5/1.0/1.5 m 共 17 张内框样本联合拟合。
 LASER_ORIGIN_MM = (-1.068, 17.549, 0.0)
 LASER_DIRECTION = (0.003813, -0.007213, 0.999967)
@@ -3733,18 +3726,12 @@ def main():
                 geometry_state = 1
                 laser_point = {
                     "x": geometry_solution["laser_uv"][0],
-                    "y": (
-                        geometry_solution["laser_uv"][1] +
-                        LASER_POINT_Y_OFFSET_PX
-                    ),
+                    "y": geometry_solution["laser_uv"][1],
                     "distance_m": geometry_solution["depth_mm"] / 1000.0,
                 }
                 gimbal_error = {
                     "yaw_deg": geometry_solution["yaw_deg"],
-                    "pitch_deg": (
-                        geometry_solution["pitch_deg"] +
-                        LASER_POINT_Y_OFFSET_DEG
-                    ),
+                    "pitch_deg": geometry_solution["pitch_deg"],
                 }
                 diagnostics["geometry_valid"] = 1
                 diagnostics["geometry_state"] = 1
