@@ -443,7 +443,11 @@ static void gl_handle_text_line(uint32_t now_ms)
             geometry_state = (uint8_t)(aux[8] / 100);
         }
     }
-    geometry_angle = (uint8_t)(geometry_state == 1u);
+    /* 1 = 三维几何直接角度；12 = 固定激光点的直接角度。
+     * 两者都已换算为角度，不能再乘旧像素比例。 */
+    geometry_angle = (uint8_t)(
+        (geometry_state == 1u) || (geometry_state == 12u)
+    );
     if (!lost)
     {
         /* ASCII 链路偶发丢字节时，小数点缺失会把 1.83 变成 183。

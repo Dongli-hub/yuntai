@@ -50,7 +50,7 @@ typedef struct
     uint8_t target_velocity_valid; /* 本帧是否携带目标像素速度 */
     uint16_t vis_proc_age_ms;  /* K230从取图完成到发送该帧的处理年龄 */
     uint8_t vis_direct_angle;  /* 1 = 直接使用上面的角度误差 */
-    uint8_t vis_geometry_state;/* 1=成功 2=无新框 4~11=几何拒绝原因 */
+    uint8_t vis_geometry_state;/* 1=几何成功 2=无新框 4~11=几何拒绝 12=固定激光点 */
     uint16_t vis_reprojection_x100; /* K230 靶面pose重投影误差(px x100) */
     uint8_t vis_pose_refined;  /* 本帧是否执行 Gauss-Newton 细化 */
     uint16_t vis_target_w_x100;/* K230 当前候选框宽(px x100) */

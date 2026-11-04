@@ -42,7 +42,7 @@ except Exception:
 
 # 每次修改本文件时更新版本号，使启动日志能确认
 # 板端实际运行的版本。
-VISION_VERSION = "v110-20261104-raw-geometry"
+VISION_VERSION = "v111-20261104-fixed-laser-317-230"
 RUN_MODE = "PRODUCTION"  # 测试或生产模式
 
 FRAME_WIDTH = 640
@@ -115,6 +115,12 @@ UART_TX_PIN = 9
 UART_RX_PIN = 10
 VISION_LOST_VALUE = 404
 VISION_LOST_SEND_INTERVAL_MS = 100
+
+# 几何激光落点开关。关闭时只保留矩形检测/靶心跟踪，瞄准使用固定点。
+GEOMETRY_LANDING_ENABLED = False
+FIXED_LASER_POINT_X_PX = 317.0
+FIXED_LASER_POINT_Y_PX = 230.0
+GIMBAL_ANGLE_PER_PIXEL_DEG = 0.28 * 320.0 / FRAME_WIDTH
 
 # 目标外框 300×210 mm，实际内框 260×170 mm，
 # 因此黑胶带宽度为 (300-260)/2 = (210-170)/2 = 20 mm。
@@ -2937,7 +2943,7 @@ def build_vision_frame(
     target_h=0.0,
     target_layer=0,
 ):
-    # 末尾：1=成功；2=无新鲜靶框；3~11=具体几何拒绝原因。
+    # 末尾：1=几何成功；2=无新鲜靶框；3~11=几何拒绝；12=固定激光点。
     # K230 只在状态 1 时发送本帧，其余状态发送视觉无效帧。
     return "{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.1f},{:.1f},{:.2f},{},{:.1f},{},{:.1f},{:.1f},{:.2f}\n".format(
         yaw_deg,
@@ -2963,6 +2969,31 @@ def build_vision_lost_frame():
     return "{},{},0,0,0,0,0\n".format(
         VISION_LOST_VALUE, VISION_LOST_VALUE
     )
+
+
+def calculate_fixed_laser_point(target):
+    """固定激光落点；只从目标复制距离用于现有遥测协议。"""
+    if target is None:
+        return None
+    return {
+        "x": FIXED_LASER_POINT_X_PX,
+        "y": FIXED_LASER_POINT_Y_PX,
+        "distance_m": target["distance_m"],
+    }
+
+
+def calculate_gimbal_error(target, laser_point):
+    """固定像素点到靶心的角度误差；geometry_state=12 表示直接角度。"""
+    if target is None or laser_point is None:
+        return None
+    return {
+        "yaw_deg": (
+            target["cx"] - laser_point["x"]
+        ) * GIMBAL_ANGLE_PER_PIXEL_DEG,
+        "pitch_deg": (
+            target["cy"] - laser_point["y"]
+        ) * GIMBAL_ANGLE_PER_PIXEL_DEG,
+    }
 
 
 def update_pitch_trim(trim_deg, gimbal_error, tracker):
@@ -3501,10 +3532,11 @@ def main():
         logger = RunLogger("PRODUCTION", None)
         if logger is not None:
             logger.trace("logger-ready")
-        try:
-            laser_aimer = PlanarLaserAimer()
-        except Exception as exc:
-            print("[GEOM] disabled:", exc)
+        if GEOMETRY_LANDING_ENABLED:
+            try:
+                laser_aimer = PlanarLaserAimer()
+            except Exception as exc:
+                print("[GEOM] disabled:", exc)
         if logger is not None:
             logger.trace(
                 "aimer-ready={}".format(1 if laser_aimer is not None else 0)
@@ -3674,7 +3706,7 @@ def main():
             geometry_solution = None
             reprojection_px = 0.0
             pose_refined = 0
-            if target is not None:
+            if GEOMETRY_LANDING_ENABLED and target is not None:
                 if laser_aimer is not None:
                     try:
                         geometry_target = target
@@ -3719,6 +3751,9 @@ def main():
                 else:
                     geometry_state = 11
                     diagnostics["geometry_reject"] = "aimer unavailable"
+            elif not GEOMETRY_LANDING_ENABLED and control_target is not None:
+                geometry_state = 12
+                diagnostics["geometry_reject"] = "fixed laser point"
             elif control_target is not None:
                 geometry_state = 2
                 diagnostics["geometry_reject"] = "predicted target"
@@ -3751,8 +3786,17 @@ def main():
             else:
                 diagnostics["geometry_valid"] = 0
                 diagnostics["geometry_state"] = geometry_state
-                laser_point = None
-                gimbal_error = None
+                if (
+                    not GEOMETRY_LANDING_ENABLED
+                    and control_target is not None
+                ):
+                    laser_point = calculate_fixed_laser_point(control_target)
+                    gimbal_error = calculate_gimbal_error(
+                        control_target, laser_point
+                    )
+                else:
+                    laser_point = None
+                    gimbal_error = None
             pitch_trim_deg = update_pitch_trim(pitch_trim_deg, gimbal_error, tracker)
             diagnostics["pitch_trim_deg"] = pitch_trim_deg
             sent_error = apply_pitch_trim(gimbal_error, pitch_trim_deg)
@@ -4163,9 +4207,13 @@ def run_test_mode():
             )
             target = tracker.update(candidates, diagnostics)
             best_candidate = tracker.selected_candidate
-            # 抓图测试不执行三维几何，因此不发送任何伪激光点。
-            laser_point = None
-            gimbal_error = None
+            prediction_target = (
+                target if target is not None else best_candidate
+            )
+            laser_point = calculate_fixed_laser_point(prediction_target)
+            gimbal_error = calculate_gimbal_error(
+                prediction_target, laser_point
+            )
             pitch_trim_deg = update_pitch_trim(
                 pitch_trim_deg,
                 gimbal_error if target is not None else None,
