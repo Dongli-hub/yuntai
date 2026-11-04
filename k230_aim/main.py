@@ -1,2820 +1,4411 @@
-# -*- coding: utf-8 -*-
-"""main.py —— K230 视觉瞄准主程序
+"""用于 2025 年电赛 E 题的 K230 靶面矩形检测程序。
 
-整体上电即自动运行：把本文件保存到 K230 SD 卡根目录、命名 main.py 即可。
+本文件保持自包含，可直接保存为 CanMV IDE 中的 /sdcard/main.py，
+并在上电后自动运行。
 
-K230 只做视觉：
-   相机取图 -> 靶纸/激光像素坐标 -> AIM 串口帧 -> H723
-H723 负责像素误差 -> 角度偏置 -> 云台控制。
-调试画面请用 tools/vision_check.py；整机 main.py 不做显示。
-
-和 H723 的约定（协议不变）：
-   帧: AA 55 | msg_id | seq | len | payload | crc16(小端)
-   0x12 心跳 / 0x13 SET_ZERO / 0x11 MODE(0IDLE 1STAB 2AIM) / 0x10 AIM(偏置)
-   0x90 遥测 / 0x91 ACK / 0x93 调试文本
-   H723 端: 0.5s 收不到 AIM 自动切 STAB 并关激光（安全看门狗）
-
-接线：
-   K230 IO9 (TXD)  <-> H723 USART1 的 RX (PA10)
-   K230 IO10(RXD)  <-> H723 USART1 的 TX (PA9)
-   GND             <-> GND（必须共地）
-   5V              <-  H723 UART10 排针 VCC
-
-调参都在下面「配置区」。改完直接重新运行即可。
+K230 检测靶面并计算标定激光射线到靶面目标点的三维角度误差；
+云台闭环和电机控制仍在 H723 上完成。
 """
+
 import gc
 import math
 import os
 import time
 
 try:
-    import image
-except Exception:
-    image = None
+    import json
+except ImportError:
+    import ujson as json
+
+import image
+import uos
+from machine import FPIOA, UART
+from media.display import *
+from media.media import *
+from media.sensor import *
+from ybUtils.YbKey import YbKey
+
 try:
-    import cv_lite as _cv_lite
+    import cv_lite
 except Exception:
-    _cv_lite = None
+    cv_lite = None
 
-# ============================================================================
-#  配置区
-# ============================================================================
-
-# --- 串口引脚 ---
-UART_BACKEND = "auto"      # auto(=先 machine.UART, 失败退 YbUart) | machine | yb
-UART_UNIT = 1
-UART_TX = 9
-UART_RX = 10
-UART_BAUD = 115200
-
-CAM_VFLIP = True           # 画面上下颠倒 -> True
-CAM_HMIRROR = False        # 画面左右镜像 -> True
-
-PROC_W = 640
-PROC_H = 480
-IMG_W = PROC_W
-IMG_H = PROC_H
-S_SCALE = PROC_W / 640.0    # 像素常数缩放系数（640 档 = 1.0，800 档 = 1.25）
-VIS_K = 7.8 * S_SCALE       # px/°（现场标定 7.8 @640x480，随分辨率同比缩放）
-USE_CLOSE_DETECTOR = False  # True=新灰度闭运算检测器；False=10.13 已验证检测器
-GRAY_DIRECT = True
-CLOSE_BIN_TH = 130          # 二值化阈值
-CLOSE_MORPH_SIZE = 1        # close(1) = 3x3
-FULL_FRAME_CLOSE = True
-USE_CLOSE_ROI = True
-CLOSE_FRAME_COS = 0.65
-CLOSE_ROI_KERNEL = 3
-CLOSE_ROI_ITERS = 1
-CLOSE_ROI_TH = 0
-CLOSE_ROI_K = 0.52
-CLOSE_ROI_PAD = int(round(18 * S_SCALE))
-CLOSE_ROI_MIN_LONG = int(round(100 * S_SCALE))
-EXPO_FIX = False
-EXPO_US = 8000
-
-PAPER_TH = 50              # 亮度阈值（0~100）的**下限**；实际由 scene_th() 自适应
-PAPER_TH_FIXED = 0
-# 近处反光试验旋钮：0=关闭（远处/未锁定始终自动）；
-# >0=锁定且目标长边进入近处后，强制使用这个 LAB-L 阈值。
-PAPER_TH_NEAR_FIXED = 0
-PAPER_A_MAX = 32           # |a| 上限（偏色背景会被排除）
-PAPER_B_MAX = 32           # |b| 上限
-PAPER_MIN_AREA = int(350 * S_SCALE * S_SCALE)   # 最小像素面积（面积随 S² 缩放）
-PAPER_MAX_AREA_RATIO = 0.50
-PAPER_MIN_LONG = int(round(36 * S_SCALE))    # 长边下限 px（长度随 S 缩放）
-PAPER_MAX_LONG = int(round(480 * S_SCALE))   # 长边上限 px
-PAPER_ASPECT_MIN = 0.70    # A4=1.41；斜视透视下会缩到接近 1
-PAPER_ASPECT_MAX = 2.00
-PAPER_DENSITY_MIN = 0.56   # 兜底（没拟合出四边形时）下限
-PAPER_DENSITY_MIN_STRONG = 0.45
-PAPER_CONTRAST_STRONG = 70
-PAPER_DENSITY_QUAD_MIN = 0.65
-PAPER_DENSITY_NEAR_MIN = 0.72  # 近处纸面应明显更实心（大背景块密度约 0.6~0.7）
-PAPER_CONTRAST_MIN = 30    # 内亮度 - 外亮度（0~255 量程）
-PAPER_DARK_MARGIN = 25     # 单个外侧采样点算“暗”的门槛
-PAPER_DARK_FRAC_MIN = 0.80  # 外侧 12 点里至少 10 点比纸暗
-QUAD_SCAN_N = 3            # 每边取几行/几列做扫描
-QUAD_PERP_PX = 1           # 扫描时垂直方向各看几像素
-QUAD_AREA_LO = 0.50        # 四边形面积 / 亮块像素 的合理范围
-QUAD_AREA_HI = 1.60
-# 近处大靶纸：印刷同心圆会让边扫描停在内圈黑线上。长边超过这个值后，
-# 只接受“贴着靶纸外沿”的四边形；缩在框内部的四边形一律弃用，
-# 退回同一个亮块的外接框中心。这样斜视时保留透视中心，内圈拟合时不会乱跳。
-QUAD_NEAR_LONG = int(round(190 * S_SCALE))
-QUAD_NEAR_SIDE_K = 0.70    # 近处四边形长边 / 外接框长边 的下限
-QUAD_NEAR_FILL_K = 0.50    # 近处四边形面积 / 外接框面积 的下限
-QUAD_NEAR_EDGE_K = 0.30    # 四个角离外框边的最大距离（允许反光把框撑大）
-QUAD_NEAR_DENSITY_HI = 1.30  # 近处 px/qa 的上限（px 可能含框外反光）
-QUAD_NEAR_COS_LIM = 0.42   # 近处四边形内角允许偏离 90° 约 ±25°
-# 扫描用的相对亮度门槛（纸面有阴影时固定阈值会把暗的那半边切掉）
-SCAN_TH_K = 0.68           # 现场实证：0.5 时柜子面(≈95)会时过时不过 -> 边飞出去
-SCAN_TH_LO = 65
-SCAN_TH_HI = 125
-QUAD_LIM_PAD = int(round(18 * S_SCALE))   # 扫描半径 = 中心到亮块该边的距离 + 这个余量
-# "外侧采样点"离纸边的距离（paper_contrast 里那 12 个点）：固定 5px 时，
-# 分辨率越高 = 物理上离纸边越近。跟着 S 缩放 = 物理含义完全不变。
-PROBE_OFF_PX = int(round(5 * S_SCALE))
-# 跟踪窗必须大于整张纸（四边形扫描要摸到四条边，窗口小了亮块会被裁掉）
-TRACK_K = 0.50             # 跟踪窗 = 四边形长边 x TRACK_K + TRACK_PAD
-# 跟踪窗半径 = 长边×TRACK_K + TRACK_PAD。K 不能小于 0.5（要装得下整张纸，
-# 否则四边形扫描会被窗口裁掉）；能省的是"外扩量"：60 -> 35，窗口面积少 ~27%，
-# 而 0.5×长边+35 仍然比整张纸（0.5×长边）大 35px，纸还是完整在窗内。
-# 现场锁定后每 3 帧要在这个窗里做一次 find_blobs，这是"目标耗时"的大头。
-TRACK_PAD = int(round(35 * S_SCALE))
-TRACK_PAD_FAR = int(round(90 * S_SCALE))  # 远距离（纸小）时窗口外扩加大：防"候选0"丢靶
-# 碎片合并只处理嵌套的同心碎片；相邻反光/背景不拼。
-# 近处靶纸被印刷圈切成“外环 + 中心白盘”：中心盘的尺寸远小于外环，
-# 旧规则（嵌套且长边比 >=0.75 才拼）会把它留在外面，导致中心盘自己
-# 也能过闸门 -> 预览里一堆小框、锁定对象在中心盘和外环之间跳。
-# 允许“外环有洞（密度低）+ 内盘同心 + 内盘不是噪点”时把内盘并回去。
-MERGE_RING_DENSITY_MAX = 0.72
-MERGE_CENTER_K = 0.15
-MERGE_INNER_AREA_MIN = 0.03
-SEED_EVERY = 16            # 锁定后每几帧做一次亮块搜索（12->16：帧率再提一截；
-                           # 其余帧只做"四边形复测"（几毫秒），靶心照旧每帧更新；
-                           # 复测失败会立刻补一次完整搜索，安全性不变）
-RE_CHECK_EVERY = 40        # 锁定后每几帧做一次"全图复查"（20->40：每 40 帧一次
-                           # 足够发现"锁错对象"，省下每 20 帧一次全图 find_blobs）：
-                           # 一旦锁到旁边的白壁/白盒上，窗口搜索只会在那附近打转，
-                           # 靶纸就在画面中间也不会被看见（截图实证）。全图复查若
-                           # 发现"明显更好的合法候选"就直接换过去，见 detect()。
-HOLD_FRAMES = 25           # 丢靶后还画/还用多少帧（15 -> 25：靶纸闪一下不再掉框）
-# 丢靶容限：丢这么多帧之后不再找靶（用户要求：比赛里丢靶=失败，不做"找靶"）。
-# 25 帧≈0.8s，足够扛住"一闪过"的漏检（这段时间窗口搜索还在跑），
-# 再久就说明真的丢了，直接把偏置冻住（不让它照着旧误差乱推）。
-LOST_FULL = 25
-SMOOTH = 0.90              # 平滑系数（越大越跟手、越小越稳）
-# 近处大靶纸：候选在“真纸”和“纸+背景大块”之间轻微切换时，测量的中心
-# 会上下偏几十像素。这里比中距离更稳一档，把这种测量跳变压下去；
-# 代价是多约 20ms 的群延迟（20fps 下），换近处激光不上下抖。
-SMOOTH_NEAR = 0.90
-DEADBAND_PX = 1.5 * S_SCALE   # 平滑死区（小于它不动，画面不抖）
-SIZE_GATE_LO = 0.50        # 跟踪时允许的长边变化范围（不许换目标）
-SIZE_GATE_HI = 1.35
-# 最近转弯时目标会快速变大，尺寸可能一帧跨过正常闸门。只有“高密度 +
-# 强对比”的真纸候选允许走救援通道；低密度糊块/背景大块仍然被挡住。
-SIZE_RESCUE_DENSITY = 0.88
-SIZE_RESCUE_CONTRAST = 30
-SIZE_RESCUE_MAX = 2.50
-CONFIRM_N = 1              # 连续确认几次才算锁定（2->1：一帧即锁）
-CONFIRM_DXY = int(round(60 * S_SCALE))   # 确认时的位置一致范围 px（35 -> 60）
-CONFIRM_DSIZE = 1.00       # 确认时的尺寸一致范围（±100%；2.0 会连"碎片"一起认进来）
-PENDING_MISS = 8           # 确认过程中允许漏几次（5 -> 8）
-JUMP_REJECT_PX = int(round(100 * S_SCALE))  # 跟踪期单帧中心跳变上限（超了当误检丢）
-SMOOTH_FAR = 0.60          # 远距离平滑（0.30 -> 0.60：51ms -> 15ms）
-FAR_LONG_PX = 120.0 * S_SCALE  # 长边小于它 = "远"（平滑/滤波/增益按它分档）
-PAPER_LONG_M = 0.275       # 白色区域长边实际长度（米），用于估距离
-
-# --- 激光光斑检测 ---
-SPOT_ROI_HALF = int(round(45 * S_SCALE))  # 光轴固定，只在学习到的点附近找光斑
-SPOT_THRESHOLDS = [        # LAB 阈值，可多组
-    (88, 100, -40, 90, -50, 90),   # 过曝白芯（纸面 LAB-L≈78 到不了）
-    (58, 100, 25, 90, -20, 70),    # 明显红边（a>=25，原 a>=6 太松）
-]
-SPOT_MIN_AREA = 2
-# 远距离时激光在纸上的光斑/眩光会变大（用户现场观察），上限从 3000 放到 6000，
-# 免得"光斑太大反而检不出来"（检不到光斑 -> 误差是旧的 -> 环路跟着旧误差走）。
-SPOT_MAX_AREA = 6000
-SPOT_MAX_ASPECT = 3.0
-SPOT_EVERY = 4             # 每几帧搜一次光斑（光轴固定，中间帧复用）
-SPOT_ADAPT_GAIN = 0.06     # 光轴点慢速自适应（把误检拖跑的风险限制住）
-SPOT_ADAPT_LIMIT = 6.0     # 单次最多修正多少像素
-SPOT_PREF_PX = int(round(70 * S_SCALE))
-SPOT_UV = [IMG_W / 2.0, IMG_H / 2.0]   # 最近一次找到的激光点，主循环每帧更新
-USE_FIXED_LASER = True
-LASER_UV = (int(round(323 * S_SCALE)), int(round(246 * S_SCALE)))
-
-AUTO_CALIB_LASER = False
-CALIB_FRAMES = 60          # 标定取多少帧（≈1.5~2s）
-CALIB_MIN_N = 12           # 至少检出多少帧才算数
-CALIB_SHIFT_MAX = 30.0     # 中位数离标称值最大偏移（px）
-CALIB_SPREAD_MAX = 6.0     # 允许的散布（px）
-
-FX_PX = 445.0 * S_SCALE    # 像素焦距（随分辨率同比缩放），仅用于日志里估距离显示
-LOST_COAST_S = 0.5         # 丢靶后还能沿用最后目标位置多久（仅本地显示/日志）
-
-# --- 时序 / 安全 ---
-AIM_HZ = 100               # 给 H723 发 AIM 的频率（H723 控制环 500Hz/2ms，见 0x1C）
-HEARTBEAT_MS = 200
-MODE_REASSERT_MS = 2000    # 周期性重发 MODE（H723 可能被看门狗切回 STAB）
-TELEM_TIMEOUT_MS = 1500    # 遥测断这么久 -> 主动发 STAB
-PARAM_SEND = []
-PARAM_SEND_DELAY_MS = 30   # 每条之间隔一下，别把 H723 的接收缓冲挤爆
-LASER_ENABLE = True        # 是否让 H723 点激光（AIM 模式下才有效）
-
-DRAIN_OLD_FRAMES = True
-DRAIN_MAX = 3              # 每次最多再丢几帧（防止极端情况下卡太久）
-DRAIN_FAST_MS = 4          # "几乎是立刻拿到"的判据（ms）
-DEBUG_PRINT_MS = 1000      # 终端打印周期
-TRACE_EVERY = 0            # 0=关；逐帧写 SD 会明显拖慢主循环
-LOG_TO_FILE = True         # 整机跑（没接电脑）时把日志写进 SD 卡，跑完插回电脑看
-LOG_PATH = "/sdcard/k230_log.txt"
-H723_TEXT_MIN_MS = 200     # H723 调试文本最快 200ms 一条（否则刷屏也占时间）
-LOG_ONLY = False           # 只监听模式（云台单独测试用）：
-                           #   True  = 只收 H723 日志并写进上面的日志文件，**不发
-                           #           SET_ZERO / MODE(AIM) / AIM 帧**，H723 会一直停在
-                           #           上电默认的 STAB —— 等价于"没接 K230"的独立测试；
-                           #   False = 正常瞄准（改完这一个字即可，不用换文件）。
-
-# ============================================================================
-#  协议
-# ============================================================================
-SOF = b"\xAA\x55"
-
-MSG_AIM = 0x10
-MSG_MODE = 0x11
-MSG_HEARTBEAT = 0x12
-MSG_SET_ZERO = 0x13
-MSG_PARAM = 0x15            # 运行时就地调参（H723 侧不用重新烧固件）
-MSG_GIMBAL_STATE = 0x90
-MSG_ACK = 0x91
-MSG_TEXT = 0x93
-
-MODE_IDLE = 0
-MODE_STAB = 1
-MODE_AIM = 2
-
-FLAG_LASER_ON = 0x01
-FLAG_AIM_VALID = 0x02
-FLAG_LOCKED = 0x10
-
-ST_READY = 0x10
+try:
+    from ulab import numpy as np
+except Exception:
+    np = None
 
 
-_log_f = None
-_log_n = 0
+# ---------------------------------------------------------------------------
+# 用户配置
+# ---------------------------------------------------------------------------
+
+# 每次修改本文件时更新版本号，使启动日志能确认
+# 板端实际运行的版本。
+VISION_VERSION = "v109-20261104-geometry-y-minus-9"
+RUN_MODE = "PRODUCTION"  # 测试或生产模式
+
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+REFERENCE_FRAME_WIDTH = 640
+REFERENCE_FRAME_HEIGHT = 480
+PIXEL_REFERENCE_WIDTH = 480
+PIXEL_REFERENCE_HEIGHT = 360
+REFERENCE_FOCAL_LENGTH_PX = 380.0
+# 像素类常数以 480x360 为基准；320x240 的老标定值只用于换算角度基准。
+PIXEL_SCALE = FRAME_WIDTH / PIXEL_REFERENCE_WIDTH
+SENSOR_ID = 2
+SENSOR_SOURCE_WIDTH = 1280
+SENSOR_SOURCE_HEIGHT = 960
+SENSOR_FPS = 90
+TARGET_PROCESS_FPS = 80
+FRAME_INTERVAL_MS = 1000 // TARGET_PROCESS_FPS
+# 检测通道本身已经是 640x480；高分辨率通道仅保留给 IDE 预览。
+# 独立高分辨率搜索不再有意义，关闭以避免重复取图和重复检测。
+#
+# 将间隔从 3 改回 1：即使跳过快照，ISP 仍会继续生成
+# 通道 1，缓冲池也会持续轮转，而显示引擎仍在扫描上一次显示的缓冲，
+# 从而出现撕裂预览。34/111 厘米测试后的截图
+# 正是该现象：绿色边框只有两条完整竖边，
+# 上下边只剩右半部分，即画面撕裂，而不是
+# 检测错误（日志中的框在 40 多帧内稳定为 92.3x65.3 像素，比例 1.41）。
+# 每帧取图并重新显示，可确保显示缓冲始终是最新一帧。
+DISPLAY_EVERY_N_FRAMES = 1
+# 光照统计和垃圾回收开销都较大，无需每帧执行。
+PROFILE_EVERY_N_FRAMES = 15
+GC_EVERY_N_FRAMES = 150
+
+# 测试模式设置。
+# 每个距离分别改成 laser_050 / laser_100 / laser_150。
+TEST_CASE_NAME = "laser_150"
+TEST_SAVE_ROOT = "/data/snapshot"
+TEST_DISPLAY_ENABLED = True
+# 标定抓图时关闭视觉指令发送，避免云台运动改变拍摄视角。
+TEST_UART_ENABLED = False
+
+# 生产联调期间按板载用户键保存一张无叠加 RGB 原图。
+PRODUCTION_SNAPSHOT_ENABLED = True
+PRODUCTION_SNAPSHOT_ROOT = "/data/snapshot"
+
+DISPLAY_WIDTH = 640
+DISPLAY_HEIGHT = 480
+HIGH_RES_WIDTH = 640
+HIGH_RES_HEIGHT = 480
+# 高分辨率 ROI 微调未验证稳定前保持关闭。
+# 640x480 通道仍只作为 IDE 预览缓冲。
+HIGH_RES_VERIFY_ENABLED = False
+HIGH_RES_VERIFY_EVERY_N_FRAMES = 2
+HIGH_RES_VERIFY_MIN_WIDTH = 75 * PIXEL_SCALE
+HIGH_RES_VERIFY_DISTANCE_M = 1.2
+
+# 检测通道已经是 640x480，旧的 640x480 独立搜索仅保留为
+# 已关闭的兼容路径，避免重复取图和重复检测。
+HIGH_RES_SEARCH_ENABLED = False
+HIGH_RES_SEARCH_EVERY_N_FRAMES = 3
+
+# 联调关闭画面显示通道。
+DISPLAY_ENABLED = False
+DISPLAY_DRAW_RAW_RECTANGLES = False
+DISPLAY_DRAW_FINAL_TARGET = False
+DISPLAY_DRAW_LASER_PREDICTION = False
+DISPLAY_DRAW_TARGET_TEXT = False
+
+UART_BAUDRATE = 921600
+UART_TX_PIN = 9
+UART_RX_PIN = 10
+VISION_LOST_VALUE = 404
+VISION_LOST_SEND_INTERVAL_MS = 100
+
+# 目标外框 300×210 mm，实际内框 260×170 mm，
+# 因此黑胶带宽度为 (300-260)/2 = (210-170)/2 = 20 mm。
+TARGET_OUTER_WIDTH_M = 0.30
+TARGET_OUTER_HEIGHT_M = 0.21
+BLACK_BORDER_WIDTH_M = 0.020
+FOCAL_LENGTH_PX = REFERENCE_FOCAL_LENGTH_PX * FRAME_WIDTH / REFERENCE_FRAME_WIDTH
+MIN_VALID_DISTANCE_M = 0.30
+MAX_VALID_DISTANCE_M = 1.60
+
+# 相机内参、畸变和激光相对相机的位姿。
+# 使用 2026-11-04 当场多距离、多视角标定结果。
+CALIBRATION_JSON_PATH = "/data/calibration.json"
+# 当前相机和激光参数已按本车重新标定，禁止旧 calibration.json 覆盖。
+USE_CAMERA_JSON_CALIBRATION = False
+# 本次实车激光标定结果已经固化在下面；禁止旧 calibration.json 覆盖
+# laser.origin_mm / laser.direction，避免板端继续使用参考项目参数。
+USE_LASER_JSON_CALIBRATION = False
+CAMERA_CALIBRATION = {
+    # 2026-11-04 使用当前设备 0.5/1.0/1.5 m 多视角内框联合标定。
+    "fx": 610.783983,
+    "fy": 621.307476,
+    "cx": 313.270140,
+    "cy": 238.263723,
+    "distortion": (
+        -0.0303490623,
+        -0.0389638370,
+        0.0,
+        0.0,
+        0.1146951914,
+    ),
+}
+# 用户现场修正：几何预测落点在图像 y 方向累计向上 9 px。
+# 图像 y 向下为正，因此 offset 为负；H723 在 geom=1 时使用角度而不是
+# 像素坐标，所以同时把等价的俯仰角修正加入控制量。
+LASER_POINT_Y_OFFSET_PX = -9.0
+LASER_POINT_Y_OFFSET_DEG = math.degrees(
+    -LASER_POINT_Y_OFFSET_PX / CAMERA_CALIBRATION["fy"]
+)
+# 2026-11-04 使用 0.5/1.0/1.5 m 共 17 张内框样本联合拟合。
+LASER_ORIGIN_MM = (-1.068, 17.549, 0.0)
+LASER_DIRECTION = (0.003813, -0.007213, 0.999967)
+GEOMETRY_MAX_REPROJECTION_PX = 12.5
+GEOMETRY_REPROJECTION_FRACTION = 0.08
+GEOMETRY_MAX_REPROJECTION_CAP_PX = 16.0
+GEOMETRY_MAX_TILT_DEG = 65.0
+GEOMETRY_MIN_DEPTH_MM = 250.0
+GEOMETRY_MAX_DEPTH_MM = 4000.0
+GEOMETRY_MAX_COMMAND_DEG = 60.0
+GEOMETRY_REFINE_TRIGGER_PX = 1.5
+GEOMETRY_REFINE_ITERATIONS = 2
+GEOMETRY_CORNER_REFINE_ENABLED = True
+GEOMETRY_CORNER_SEARCH_PX = 3
+GEOMETRY_CORNER_SAMPLES = 11
+GEOMETRY_CORNER_MAX_SHIFT_PX = 2.0
+
+# 灰度光斑慢速校正。只在靶纸内部搜索，每 5 个有效跟踪帧更新一次。
+SPOT_CORRECTION_ENABLED = True
+SPOT_CORRECTION_EVERY = 5
+SPOT_CORRECTION_ALPHA = 0.25
+SPOT_MIN_PEAK = 200
+SPOT_MIN_CONTRAST = 45
+SPOT_CORE_DROP = 25
+SPOT_WINDOW_PX = 20
+SPOT_BORDER_FRACTION = 0.5
+SPOT_PAPER_MARGIN_MM = 4.0
+SPOT_GATE_DEG = 3.0
+SPOT_MAX_CORRECTION_DEG = 4.0
+
+# 对发送给 H723 的俯仰误差进行缓慢自学习补偿。
+#
+# H723 根据电机角度闭环俯仰，因此电机到达目标角后就会停止，
+# 但相机仍可能未到达期望的世界角度。
+# 2026-10-11 台架实测：当调试俯仰误差为 0.0045 度时，
+# 相机仍偏离世界目标 1.6 度；不同姿态下
+# 该偏差在 0.9 到 9.7 度之间。云台看不到这部分残余，
+# 因为其自身误差已经为零。
+#
+# 在此累积该残差可使云台持续修正，直到图像误差
+# 归零，最终让激光落到靶心。
+# 这是一个慢速外环：只在目标大致静止时学习，
+# 具有限幅，并且目标丢失时不清零。
+# 2026-10-14 第 4 轮诊断：暂时关掉，用来分清"进入中心区后慢慢趋中被磨进去"
+# 究竟是谁在做——是这个慢学习器，还是 H723 那个纯比例位置环。
+# 关掉之后 trim 恒为 0，静态基准回到原始零位（残余不再被吸收），读数时注意
+# 这个前提；要恢复把下一行改回 True 即可。
+PITCH_TRIM_ENABLED = False
+PITCH_TRIM_GAIN = 0.02
+PITCH_TRIM_LIMIT_DEG = 15.0
+PITCH_TRIM_STATIC_PX_PER_S = 40.0 * FRAME_WIDTH / REFERENCE_FRAME_WIDTH
+
+# 联调只使用 H723 的蓝牙遥测，关闭 K230 的 SD 卡周期日志。
+RUN_LOG_ENABLED = False
+RUN_LOG_PATH = "/data/snapshot/current_run.log"
+# 原间隔为 3，每 3 帧中有 1 帧额外耗时 5 到 19 毫秒（字符串格式化和文件写入）。
+# 当前间隔 5，便于捕获短时几何失败；现场稳定后可改回 15。
+LOG_EVERY_N_FRAMES = 5
+
+# 搜索、确认、跟踪和重捕获统一只使用 cv_lite。
+USE_CV_LITE = True
+
+# cv_lite 与 Canny 参数。
+CANNY_LOW = 100
+CANNY_HIGH = 220
+RED_TARGET_CANNY_GAIN = 2.0
+NEAR_FIXED_CANNY_DISTANCE_M = 0.70
+NEAR_FIXED_CANNY_LOW = 75
+NEAR_FIXED_CANNY_HIGH = 185
+APPROX_EPSILON = 0.02
+AREA_MIN_RATIO = 0.001
+# 国赛方案在此处使用 0.5，将真正的筛选交给
+# 几何条件；0.3 会在远距离丢弃可用四边形。
+MAX_ANGLE_COS = 0.5
+# 新靶使用红色圆环，依赖高 Canny 阈值抑制其弱边缘。
+GAUSSIAN_BLUR = 1
+
+# 几何优先的筛选条件来自同一脚本，只保留必要的
+# 形状硬门槛：远距离时 2 厘米黑框只有 2 到 3 像素宽，硬门槛仍然有效，
+# 白暗覆盖率不再作为硬门槛，只作为评分项。
+# 按 30x21cm 外框、380px 焦距和 1.5m 实际最远距离预留少量余量。
+MIN_TARGET_BOX_AREA = int(
+    0.85 * FOCAL_LENGTH_PX * FOCAL_LENGTH_PX *
+    TARGET_OUTER_WIDTH_M * TARGET_OUTER_HEIGHT_M /
+    (MAX_VALID_DISTANCE_M * MAX_VALID_DISTANCE_M)
+)
+MIN_TARGET_SIDE_PX = int(round(
+    0.85 * FOCAL_LENGTH_PX * TARGET_OUTER_HEIGHT_M /
+    MAX_VALID_DISTANCE_M
+))
+MAX_OPPOSITE_SIDE_DELTA_PX = 120.0 * PIXEL_SCALE
+MAX_EDGE_ANGLE_DEG = 30.0
+
+# 480x360 下为675像素，640x480 下为1200像素。
+MIN_ABSOLUTE_AREA = int(675 * PIXEL_SCALE * PIXEL_SCALE)
+ASPECT_RATIO_MIN = 0.55
+ASPECT_RATIO_MAX = 1.85
+MIN_RECTANGULARITY = 0.55
+NEAR_GEOMETRY_MIN_LONG_PX = int(round(90 * PIXEL_SCALE))
+NEAR_ASPECT_RATIO_MIN = 0.40
+NEAR_ASPECT_RATIO_MAX = 2.30
+NEAR_MIN_RECTANGULARITY = 0.42
+NEAR_MAX_EDGE_ANGLE_DEG = 40.0
+NEAR_MAX_OPPOSITE_SIDE_DELTA_PX = 160.0 * PIXEL_SCALE
+# 白色覆盖率只作为评分项，不作为硬门槛：不均匀光照和反光造成的波动
+# 远大于目标模型预测。
+ACQUIRE_MIN_WHITE_RATIO = 0.15
+TRACK_MIN_WHITE_RATIO = 0.10
+# 只有几乎全黑的四边形会被直接丢弃；旧版本曾使用
+# 0.05 的硬门槛，这是远距离最先导致失败的条件。
+MIN_WHITE_RATIO_FLOOR = 0.02
+# 胶带内边缘判据：候选边外侧应为黑胶带，内侧应为白纸。
+BORDER_OUTSIDE_PX = 2
+BORDER_INSIDE_PX = 3
+BORDER_MIN_INSIDE_GRAY = 90
+BORDER_MIN_CONTRAST = 30
+MIN_INNER_EDGE_SCORE = 8
+MIN_DARK_BORDER_RATIO = 0.05
+# 同一目标的宽度和高度应给出相近的相机距离。
+# 仅作为评分项：透视条件下，即使四边形正确，两者也可能不一致。
+MIN_DISTANCE_CONSISTENCY = 0.55
+
+# 远距离识别：约 1.2 米外的目标黑框只有 2 到 3 像素，
+# 因此在空搜索帧中再执行一次低 Canny 阈值检测。
+LONG_RANGE_CANNY_SCALE = 0.70
+
+# 亮度配置采样：画面任意位置的灯曾通过全局最大值抬高
+# 白色阈值，因此现在只从画面中央区域采样，
+# 并使用分位数而不是最小值和最大值。
+PROFILE_ROI_FRACTION = 0.60
+PROFILE_LOW_PERCENTILE = 0.05
+PROFILE_HIGH_PERCENTILE = 0.95
+
+# 时序逻辑。
+CONFIRM_WINDOW_FRAMES = 5
+CONFIRM_HITS_REQUIRED = 3
+# 快速重捕获：确认阶段落在预测框上的候选
+# 直接计为完整命中，短暂闪烁一两帧的目标
+# 可立即恢复，无需重新满足五帧内命中三次的条件。
+CONFIRM_FAST_CENTER_FACTOR = 0.60
+CONFIRM_FAST_AREA_RATIO_MIN = 0.70
+CONFIRM_FAST_AREA_RATIO_MAX = 1.40
+# 离开跟踪状态前允许连续漏检的帧数。远距离偶尔漏检
+# 属于正常现象，而随后重捕获大约需要二十个
+# 无目标帧，这期间云台完全看不到目标，因此短暂丢失
+# 不应直接破坏锁定。
+HOLD_LOST_FRAMES = 12
+# 短暂丢失预测：跟踪器丢失目标时不再立即发送 404，
+# 而是按目标速度外推上一个框，并在该时间内继续发送，
+# 使云台在空档期继续运动，避免先停住再突然跳动。
+PREDICT_SEND_MS = 250
+TRACK_AREA_RATIO_MIN = 0.78
+TRACK_AREA_RATIO_MAX = 1.30
+TRACK_AXIS_RATIO_MIN = 0.90
+TRACK_AXIS_RATIO_MAX = 1.12
+TRACK_CENTER_RADIUS_FACTOR = 0.75
+NEAR_TRACK_AREA_RATIO_MIN = 0.65
+NEAR_TRACK_AREA_RATIO_MAX = 1.60
+NEAR_TRACK_AXIS_RATIO_MIN = 0.80
+NEAR_TRACK_AXIS_RATIO_MAX = 1.30
+NEAR_TRACK_CENTER_RADIUS_FACTOR = 1.00
+INNER_CANDIDATE_SCORE_FACTOR = 2.00
+# 原值为 0.60。跟踪 ROI 是真实裁剪区域（裁剪检测与 cv_lite），
+# 因此边距直接决定开销：面积按 ((1+2m)^2) 缩放，0.60 改为 0.30 后
+# 裁剪面积降至 53%，这是检测阶段最大的一项提速。
+# 在 80 帧每秒下，目标每帧只移动几个像素，每侧 0.30 个框宽
+# 仍然足够。若快速移动时开始频繁丢锁，
+# 应先将该值调回 0.45 附近。
+TRACK_DETECTION_ROI_MARGIN_FACTOR = 0.30
+NEAR_TRACK_DISTANCE_M = 0.90
+NEAR_TRACK_DETECTION_ROI_MARGIN_FACTOR = 0.30
+# 跟踪模式中的低成本预筛选：近距离大目标会产生大量四边形，
+# build_candidate（白暗采样与几何计算）每帧可能耗时 5 到 11 毫秒，
+# 而跟踪器最终也会丢弃远离预测位置的候选，因此先按中心距离
+# 过滤四边形。每轴 1.0 个框宽已经比较宽松，
+# 即使目标一帧移动半个框宽也不会被丢弃。
+TRACK_CANDIDATE_GATE_FACTOR = 1.00
+LAYER_SWITCH_SCORE_FACTOR = 0.55
+LAYER_SWITCH_VOTES = 2
+LAYER_ALTERNATE_AREA_RATIO_MIN = 0.55
+LAYER_ALTERNATE_AREA_RATIO_MAX = 1.55
+LAYER_ALTERNATE_AXIS_RATIO_MIN = 0.72
+LAYER_ALTERNATE_AXIS_RATIO_MAX = 1.30
+CONFIRM_OUTER_AREA_RATIO_MIN = 1.08
+CONFIRM_OUTER_AREA_RATIO_MAX = 1.45
+MAX_TRACK_VELOCITY_PX_PER_S = 2250.0 * PIXEL_SCALE
+SMOOTH_CENTER_ALPHA = 0.50
+SMOOTH_SIZE_ALPHA = 0.30
+RECAPTURE_ROI_FRAMES = 8
+RECAPTURE_FULL_FRAMES = 12
+RECAPTURE_ROI_MARGIN_FACTOR = 0.30
+LIGHT_FALLBACK_ENABLED = True
+
+# 使用 None 保持传感器增益不变；后续若暗光测试显示画面过暗，
+# 可使用约 16 到 24 的增益值。
+SENSOR_GAIN = None
+
+DEBUG_PRINT = False
+DEBUG_PRINT_EVERY_N_FRAMES = 120
 
 
-def log(msg):
-    """同时输出到终端和 SD 卡；每 8 条 flush 一次，避免 SD 写入拖慢视觉环。"""
-    global _log_n
-    print(msg)
-    if _log_f is not None:
-        try:
-            _log_f.write(msg + "\n")
-            _log_n += 1
-            if (_log_n % 8) == 0:
-                _log_f.flush()
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# 亮度配置。
+# ---------------------------------------------------------------------------
+
+PROFILE_DARK = {
+    "canny_low": 35,
+    "canny_high": 100,
+    "white_threshold": 105,
+}
+
+PROFILE_NORMAL = {
+    "canny_low": CANNY_LOW,
+    "canny_high": CANNY_HIGH,
+    "white_threshold": 165,
+}
+
+PROFILE_BRIGHT = {
+    "canny_low": 70,
+    "canny_high": 180,
+    "white_threshold": 200,
+}
 
 
-_trace_n = 0
-
-
-def flog(msg):
-    """只写 SD 卡、不 print（高速示踪用：40Hz 下 print 会把 USB 终端拖死）。"""
-    global _trace_n
-    if _log_f is None:
-        return
+def get_gray_value(img, x, y):
     try:
-        _log_f.write(msg + "\n")
-        _trace_n += 1
-        if (_trace_n % 40) == 0:
-            _log_f.flush()
+        value = img.get_pixel(int(x), int(y))
     except Exception:
-        pass
+        return 0
+
+    if isinstance(value, (tuple, list)):
+        return (value[0] + value[1] + value[2]) // 3
+    return value
 
 
-def einfo(e):
-    """异常信息带类型 —— 这版固件上 Python 异常的字符串经常只有一个数字
-    （现场被 `叠加层异常(0)` / `二值预览失败(0)` 坑过好几轮，其实就是
-    KeyError(0)）。带上类型，下次一眼就能看出是什么错。"""
-    return "%s: %s" % (type(e).__name__, e)
+def estimate_mean_brightness(img):
+    return sample_image_statistics(img)["mean"]
 
 
-def _crc_table():
-    t = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = (c >> 1) ^ 0xA001 if (c & 1) else (c >> 1)
-        t.append(c)
-    return t
+def sample_image_statistics(img, roi=None, step=24):
+    if roi is None:
+        x0 = 0
+        y0 = 0
+        x1 = FRAME_WIDTH
+        y1 = FRAME_HEIGHT
+    else:
+        x0 = max(0, int(roi[0]))
+        y0 = max(0, int(roi[1]))
+        x1 = min(FRAME_WIDTH, int(roi[0] + roi[2]))
+        y1 = min(FRAME_HEIGHT, int(roi[1] + roi[3]))
 
+    if x1 <= x0 or y1 <= y0:
+        return {
+            "mean": 0,
+            "min": 0,
+            "max": 0,
+            "spread": 0,
+            "median": 0,
+            "count": 0,
+        }
 
-_CRC = _crc_table()
+    samples = []
+    total = 0
 
+    for y in range(y0 + step // 2, y1, step):
+        for x in range(x0 + step // 2, x1, step):
+            value = get_gray_value(img, x, y)
+            samples.append(value)
+            total += value
 
-def crc16(data):
-    crc = 0xFFFF
-    for b in data:
-        crc = (crc >> 8) ^ _CRC[(crc ^ b) & 0xFF]
-    return crc & 0xFFFF
+    count = len(samples)
+    if count == 0:
+        return {
+            "mean": 0,
+            "min": 0,
+            "max": 0,
+            "spread": 0,
+            "median": 0,
+            "count": 0,
+        }
 
+    # 使用分位数代替最小值和最大值，避免单个灯具或暗物体
+    # 使计算出的阈值大幅摆动。
+    samples.sort()
+    low_value = samples[int(count * PROFILE_LOW_PERCENTILE)]
+    high_index = min(count - 1, int(count * PROFILE_HIGH_PERCENTILE))
+    high_value = samples[high_index]
 
-def build_frame(msg_id, payload=b"", seq=0):
-    import ustruct
-    body = ustruct.pack("<BBB", msg_id & 0xFF, seq & 0xFF,
-                        len(payload)) + payload
-    return SOF + body + ustruct.pack("<H", crc16(body))
-
-
-def pack_aim_px(ut, vt, us, vs, flags, quality, k_x100):
-    """AIM payload：只发像素坐标，偏置由 H723 算。
-    ut/vt = 靶心像素，us/vs = 激光光斑像素（u16 小端）；flags/quality 原样。
-    末尾多 2 字节 k_x100 = 像素/度 ×100：分辨率一换，px/° 跟着变，
-    H723 收到就用这个值（没收到 = 旧固件，用默认 7.8）。"""
-    import ustruct
-    return ustruct.pack("<HHHHBBh",
-                        max(0, min(IMG_W - 1, int(ut))),
-                        max(0, min(IMG_H - 1, int(vt))),
-                        max(0, min(IMG_W - 1, int(us))),
-                        max(0, min(IMG_H - 1, int(vs))),
-                        flags & 0xFF,
-                        max(0, min(255, int(quality))),
-                        max(-32768, min(32767, int(round(k_x100)))))
-
-
-def pack_mode(mode, arg=0):
-    import ustruct
-    return ustruct.pack("<BB", mode & 0xFF, arg & 0xFF)
-
-
-def pack_param(param_id, value):
-    """GP_MSG_PARAM：param_id(u8) + value(i16 小端)，value = 真实值 × 100。"""
-    import ustruct
-    return ustruct.pack("<Bh", param_id & 0xFF,
-                        max(-32768, min(32767, int(round(value)))))
-
-
-class FrameParser(object):
-    def __init__(self):
-        self.buf = bytearray()
-        self.ok = 0
-        self.crc_err = 0
-        self.bad_len = 0
-        self.resync = 0
-
-    def feed(self, data):
-        out = []
-        self.buf.extend(data)
-        while True:
-            i = self.buf.find(SOF)
-            if i < 0:
-                if len(self.buf) > 1:
-                    self.resync += 1
-                    # MicroPython 的 bytearray 不支持切片删除（del buf[x:]），
-                    # 必须用重新切片代替，否则报
-                    # "TypeError: 'bytearray' object doesn't support item deletion"
-                    self.buf = self.buf[-1:]
-                break
-            if i > 0:
-                self.resync += 1
-                self.buf = self.buf[i:]
-            if len(self.buf) < 5:
-                break
-            length = self.buf[4]
-            if length > 240:
-                self.bad_len += 1
-                self.buf = self.buf[2:]
-                continue
-            total = 5 + length + 2
-            if len(self.buf) < total:
-                break
-            body = bytes(self.buf[2:5 + length])
-            crc_rx = self.buf[5 + length] | (self.buf[6 + length] << 8)
-            if crc16(body) != crc_rx:
-                self.crc_err += 1
-                self.buf = self.buf[2:]
-                continue
-            self.ok += 1
-            out.append((body[0], body[1], bytes(body[3:])))
-            self.buf = self.buf[total:]
-        return out
-
-
-_GIMBAL_FMT = "<BBhhhhhhhBI"
-
-
-def unpack_state(payload):
-    """-> dict or None"""
-    import ustruct
-    if len(payload) != 21:
-        return None
-    v = ustruct.unpack(_GIMBAL_FMT, payload)
     return {
-        "state": v[0], "fault": v[1],
-        "yaw": v[2] / 100.0, "pitch": v[3] / 100.0, "roll": v[4] / 100.0,
-        "ymotor": v[5] / 100.0, "pmotor": v[6] / 100.0,
-        "gyro_y": v[7] / 100.0, "gyro_z": v[8] / 100.0,
-        "flags": v[9], "up_ms": v[10],
+        "mean": total // count,
+        "min": low_value,
+        "max": high_value,
+        "spread": high_value - low_value,
+        "median": samples[count // 2],
+        "count": count,
     }
 
 
-# ============================================================================
-#  串口链路
-# ============================================================================
-class Link(object):
-    """串口后端自动选择。
-
-    实测（CanMV v1.4.3 / k230_canmv_yahboom 固件）：
-      · machine.UART(1, tx=Pin(9), rx=Pin(10)) 打不开 ——
-        固件启动时已经把 IO9/IO10 分配给了它自己的功能（报
-        "pin(9) is not a GPIO pin"），所以这条要放在后面当备选。
-      · ybUtils.YbUart 是可用的，它在固件里占的就是 IO9(TXD)/IO10(RXD)。
-    按顺序试，哪个先打开用哪个。
-    """
-
-    @staticmethod
-    def _candidates():
-        def yb():
-            from ybUtils.YbUart import YbUart
-            return YbUart(baudrate=UART_BAUD)
-
-        def m_nopin():
-            from machine import UART
-            return UART(UART_UNIT, baudrate=UART_BAUD, bits=8,
-                        parity=None, stop=0)
-
-        def m_pins19():
-            from machine import UART, Pin
-            return UART(1, baudrate=UART_BAUD, tx=Pin(9), rx=Pin(10),
-                        bits=8, parity=None, stop=0)
-
-        def m_pins3233():
-            from machine import UART, Pin
-            return UART(3, baudrate=UART_BAUD, tx=Pin(32), rx=Pin(33),
-                        bits=8, parity=None, stop=0)
-
-        def uart3_fpioa():
-            # 备用线路：12Pin GPIO 的 IO32(TXD)/IO33(RXD) 手动配成 UART3。
-            # 和 YbUart 配 IO9/IO10 是同一套做法（先 FPIOA 再建 UART）。
-            from machine import FPIOA, UART
-            fp = FPIOA()
-            fp.set_function(32, FPIOA.UART3_TXD, ie=0, oe=1, pu=1)
-            fp.set_function(33, FPIOA.UART3_RXD, ie=1, oe=0, pu=1)
-            return UART(3, baudrate=UART_BAUD)
-
-        def yb_swapped():
-            # IO9/IO10 反着用（IO10=TXD, IO9=RXD）：
-            # 两根数据线如果接反了，不用拆线也能通信。
-            from machine import FPIOA, UART
-            fp = FPIOA()
-            fp.set_function(10, FPIOA.UART1_TXD, ie=0, oe=1, pu=1)
-            fp.set_function(9, FPIOA.UART1_RXD, ie=1, oe=0, pu=1)
-            return UART(1, baudrate=UART_BAUD)
-
-        return [("YbUart(亚博封装, IO9/IO10)", yb),
-                ("UART1 IO9/IO10 反接", yb_swapped),
-                ("UART3 手配 IO32/IO33", uart3_fpioa),
-                ("UART(%d) 不指定引脚" % UART_UNIT, m_nopin),
-                ("UART(1) tx=IO9 rx=IO10", m_pins19),
-                ("UART(3) tx=IO32 rx=IO33", m_pins3233)]
-
-    def __init__(self):
-        self.dev = None
-        self.name = ""
-        for label, opener in self._candidates():
-            try:
-                self.dev = opener()
-                self.name = label
-                break
-            except Exception as e:
-                print("串口后端 %s 打不开: %s" % (label, e))
-        if self.dev is None:
-            raise OSError("没有任何串口后端能打开")
-        print("串口: %s @%d" % (self.name, UART_BAUD))
-
-    def send(self, data):
-        try:
-            self.dev.write(data)
-        except Exception as e:
-            print("串口写失败: %s" % e)
-
-    def read(self, n=256):
-        try:
-            if hasattr(self.dev, "any") and self.dev.any() <= 0:
-                return b""
-            return self.dev.read(n) or b""
-        except Exception:
-            return b""
-
-    def close(self):
-        try:
-            self.dev.deinit()
-        except Exception:
-            pass
+def center_profile_roi():
+    """画面中央区域；没有跟踪 ROI 时使用该区域。"""
+    width = int(FRAME_WIDTH * PROFILE_ROI_FRACTION)
+    height = int(FRAME_HEIGHT * PROFILE_ROI_FRACTION)
+    return ((FRAME_WIDTH - width) // 2, (FRAME_HEIGHT - height) // 2, width, height)
 
 
-# ============================================================================
-#  视觉：靶纸（黑胶带框）检测
-# ============================================================================
-def luma(r, g, b):
-    return (r * 77 + g * 150 + b * 29) >> 8
+def make_near_fixed_profile(previous_profile):
+    """近距离复用上一帧光照参数，只固定 Canny 阈值。"""
+    return {
+        "level": "near_fixed",
+        "mean": previous_profile.get("mean", 0),
+        "min": previous_profile.get("min", 0),
+        "max": previous_profile.get("max", 0),
+        "spread": previous_profile.get("spread", 0),
+        "canny_low": NEAR_FIXED_CANNY_LOW,
+        "canny_high": NEAR_FIXED_CANNY_HIGH,
+        "white_threshold": previous_profile.get(
+            "white_threshold", PROFILE_NORMAL["white_threshold"]
+        ),
+    }
 
 
-_PIXBUF = [0, 0, 0]
-_PIX_FAST = False      # get_pixel(x,y,buf) 这种"就地填"写法能不能用（见下）
-_ARR_MODE = 0
+def make_dynamic_profile(
+    img,
+    roi=None,
+    near_target=False,
+    previous_profile=None,
+):
+    if near_target and previous_profile is not None:
+        return make_near_fixed_profile(previous_profile)
 
+    # 过去画面边缘的灯会通过全局最大值抬高白色阈值，
+    # 因此搜索配置现在只从画面中央区域读取。
+    if roi is None:
+        roi = center_profile_roi()
 
-def px_probe_fast(img):
-    """启动时探一次：get_pixel 支不支持"传一个 buf 就地填"。
+    stats = sample_image_statistics(img, roi)
+    mean_value = stats["mean"]
+    spread = stats["spread"]
 
-    为什么值得做：px_luma 是四边形复测的**热路径**（每帧几百次调用），而
-    `img.get_pixel(x, y)` 每次都要新建一个 (r,g,b) 元组 —— MicroPython 里
-    一次分配就是几微秒，几百次就是 1~3ms/帧（占检测耗时的 10~20%）。
-    OpenMV/CanMV 的 get_pixel 支持 `get_pixel(x, y, rgbtuple)` 就地写，
-    我们探一下：能用就用（省掉分配 -> 帧率上去 -> 反应更快）。
-    """
-    global _PIX_FAST
-    try:
-        img.get_pixel(0, 0, _PIXBUF)
-        _PIX_FAST = True
-    except Exception:
-        _PIX_FAST = False
-    return _PIX_FAST
-
-
-def px_luma(img, x, y):
-    """取某点亮度（0~255）。取不到返回 -1。"""
-    if x < 0:
-        x = 0
-    elif x >= IMG_W:
-        x = IMG_W - 1
-    if y < 0:
-        y = 0
-    elif y >= IMG_H:
-        y = IMG_H - 1
-    try:
-        p = None
-        if _PIX_FAST:
-            try:
-                p = img.get_pixel(int(x), int(y), _PIXBUF)
-            except Exception:
-                p = None
-        if p is None:
-            p = img.get_pixel(int(x), int(y))
-    except Exception:
-        return -1
-    if p is None:
-        return -1
-    if type(p) is int:
-        return p
-    try:
-        if len(p) == 1:
-            return p[0]
-    except Exception:
-        pass
-    return luma(p[0], p[1], p[2])
-
-
-def px_luma_arr(arr, x, y):
-    """直接从 RGB888 ndarray 取亮度，避免 RGB888 get_pixel 失效。"""
-    global _ARR_MODE
-    if x < 0:
-        x = 0
-    elif x >= IMG_W:
-        x = IMG_W - 1
-    if y < 0:
-        y = 0
-    elif y >= IMG_H:
-        y = IMG_H - 1
-    x = int(x)
-    y = int(y)
-    if (_ARR_MODE == 0) or (_ARR_MODE == 1):
-        try:
-            p = arr[y][x]
-            if len(p) >= 3:
-                _ARR_MODE = 1
-                return luma(int(p[0]), int(p[1]), int(p[2]))
-        except Exception:
-            pass
-    if (_ARR_MODE == 0) or (_ARR_MODE == 3):
-        try:
-            p = arr[y, x]
-            if len(p) >= 3:
-                _ARR_MODE = 3
-                return luma(int(p[0]), int(p[1]), int(p[2]))
-        except Exception:
-            pass
-    try:
-        row = arr[y]
-        i = x * 3
-        _ARR_MODE = 2
-        return luma(int(row[i]), int(row[i + 1]), int(row[i + 2]))
-    except Exception:
-        return -1
-
-
-_scene_cache = [0, 0.0, 0.0]   # [帧计数, 上一次算出的阈值, 预留]
-
-
-def scene_th(img, n_frame=0):
-    """按直方图用大津法决定白纸的 LAB-L 阈值（0~100）。
-
-    优先设备 Otsu；结果不可用或不在 [38,62] 时用采样 Otsu；
-    仍不可用则回退“画面均值 + 8”并夹到 [PAPER_TH,72]。
-    每 10 帧重算一次，避免逐帧抖动。
-    """
-    if PAPER_TH_FIXED > 0:          # 手动固定阈值（调试/现场离线标定用）
-        _scene_cache[1] = float(PAPER_TH_FIXED)
-        _scene_cache[2] = 4.0       # 4 = 手动固定（日志里打 "(固定)"）
-        return int(PAPER_TH_FIXED)
-    if (n_frame % 10) != 0 and _scene_cache[1] > 0:
-        return int(_scene_cache[1])
-    t = -1.0
-    src = 3.0                      # 1=设备Otsu  2=自算Otsu  3=回退老办法
-    try:
-        # CanMV/OpenMV：直方图 + Otsu 阈值（C 实现，比 Python 逐点快得多）
-        thr = img.get_histogram().get_threshold().value()      # 0~255
-        t = float(thr) * 100.0 / 255.0
-        src = 1.0
-    except Exception:
-        t = -1.0
-    if (t < 38.0) or (t > 62.0):
-        # 设备直方图不可用/离谱 -> 自己算 Otsu（保证"确定性二值化"一定在跑）
-        t = _otsu_from_samples(img)
-        if (t >= 38.0) and (t <= 62.0):
-            src = 2.0
-    if (t < 38.0) or (t > 62.0):
-        # ---- 兜底：老办法"30 点均值 + 8，夹 [PAPER_TH, 72]" ----
-        s = 0
-        k = 0
-        for gy in range(5):
-            y = int(IMG_H * (gy + 0.5) / 5)
-            for gx in range(6):
-                x = int(IMG_W * (gx + 0.5) / 6)
-                v = px_luma(img, x, y)
-                if v >= 0:
-                    s += v
-                    k += 1
-        if k <= 0:
-            return PAPER_TH
-        t = (s / float(k)) * 100.0 / 255.0 + 8.0
-        if t < PAPER_TH:
-            t = PAPER_TH
-        elif t > 72.0:
-            t = 72.0
-        src = 3.0
-    _scene_cache[1] = t
-    _scene_cache[2] = src
-    return int(t)
-
-
-def _otsu_from_samples(img):
-    """自实现大津法（设备直方图 API 不可用时的备胎）：
-    40x30 网格采样 -> 32 桶直方图 -> 找双峰分界 -> 折回 0~100。
-    QGimbal 的"确定性二值化"就靠这个保证：每 10 帧一定有一个"算出来的"阈值，
-    不依赖任何单一 API。返回 -1 表示样本不足。"""
-    hist = [0] * 32
-    n = 0
-    for gy in range(30):
-        y = int(IMG_H * (gy + 0.5) / 30)
-        for gx in range(40):
-            x = int(IMG_W * (gx + 0.5) / 40)
-            v = px_luma(img, x, y)
-            if v >= 0:
-                hist[v >> 3] += 1
-                n += 1
-    if n < 200:
-        return -1.0
-    total = 0.0
-    for i in range(32):
-        total += hist[i] * i
-    sum_b = 0.0
-    wb = 0
-    best = -1.0
-    th_lo = 0
-    th_hi = 0
-    for i in range(32):
-        wb += hist[i]
-        if wb == 0:
-            continue
-        wf = n - wb
-        if wf == 0:
-            break
-        sum_b += hist[i] * i
-        mb = sum_b / wb
-        mf = (total - sum_b) / wf
-        var = wb * wf * (mb - mf) * (mb - mf)
-        # 双峰之间若有很宽的空隙，类间方差在空隙里是"平的"——直接取第一个
-        #   最大值会落到空隙最左边（等于没切）。这里把得分相同（±0.2%）的
-        #   平台段整段记下来，最后取中点（真实图像的直方图连续，不受影响）。
-        if var > best * 1.002:
-            best = var
-            th_lo = i
-            th_hi = i
-        elif var >= best * 0.998:
-            th_hi = i
-    th = (th_lo + th_hi) * 0.5
-    return (th + 0.5) * 8.0 * 100.0 / 255.0
-
-
-def log_scene(img):
-    """每 5 秒打一行"画面亮度"（6x8 网格自己采样），用来判断为什么没锁到靶：
-      · 均/大 都很小（均<60 且 大<90）-> 画面太暗 / 镜头被挡 / 对着暗墙
-      · 有大亮块（大>=200）但没靶     -> 靶纸不在视野里，或太远太小
-      · 均 100+ 且有大亮块            -> 视野正常，那是靶纸判据/阈值的问题
-    以前没有这行时，"候选0"（一个亮块都没有）只能靠猜。"""
-    lo = 255
-    hi = 0
-    s = 0
-    k = 0
-    for gy in range(6):
-        y = int(IMG_H * (gy + 0.5) / 6)
-        for gx in range(8):
-            x = int(IMG_W * (gx + 0.5) / 8)
-            v = px_luma(img, x, y)
-            if v < 0:
-                continue
-            if v < lo:
-                lo = v
-            if v > hi:
-                hi = v
-            s += v
-            k += 1
-    if k:
-        _src = _scene_cache[2]
-        _tag = "(Otsu)" if _src == 1.0 else \
-               ("(自算Otsu)" if _src == 2.0 else
-                ("(固定)" if _src == 4.0 else "(回退)"))
-        log("[SCENE] 画面亮度 均=%.0f 小=%d 大=%d (0~255) 阈值=%d%s  靶=无靶时看这行"
-            % (s / float(k), lo, hi, int(_scene_cache[1]), _tag))
-
-
-def paper_contrast(img, x, y, w, h, use_arr=False):
-    """内亮外暗校验：返回 (内部平均亮度, 外侧平均亮度, 外侧合格比例)。
-
-    外侧取 12 个点（四边各 3 个），要求其中至少 PAPER_DARK_FRAC_MIN 的比例
-    明显比内部暗 —— 背景柜子那种“只有一边有暗边”的亮块因此过不了。
-    """
-    u = ((x + w * 0.30, y + h * 0.50), (x + w * 0.70, y + h * 0.50),
-         (x + w * 0.50, y + h * 0.30), (x + w * 0.50, y + h * 0.70),
-         (x + w * 0.50, y + h * 0.50))
-    o = ((x - PROBE_OFF_PX, y + h * 0.25), (x - PROBE_OFF_PX, y + h * 0.50),
-         (x - PROBE_OFF_PX, y + h * 0.75),
-         (x + w + PROBE_OFF_PX, y + h * 0.25),
-         (x + w + PROBE_OFF_PX, y + h * 0.50),
-         (x + w + PROBE_OFF_PX, y + h * 0.75),
-         (x + w * 0.25, y - PROBE_OFF_PX), (x + w * 0.50, y - PROBE_OFF_PX),
-         (x + w * 0.75, y - PROBE_OFF_PX),
-         (x + w * 0.25, y + h + PROBE_OFF_PX),
-         (x + w * 0.50, y + h + PROBE_OFF_PX),
-         (x + w * 0.75, y + h + PROBE_OFF_PX))
-    si = 0
-    so = 0
-    ni = 0
-    no = 0
-    outer_vals = []
-    if use_arr:
-        get_luma = px_luma_arr
+    if mean_value < 70:
+        level = "dark"
+    elif mean_value > 190:
+        level = "bright"
     else:
-        get_luma = px_luma
-    for p in u:
-        v = get_luma(img, p[0], p[1])
-        if v >= 0:
-            si += v
-            ni += 1
-    for p in o:
-        v = get_luma(img, p[0], p[1])
-        outer_vals.append(v)
-        if v >= 0:
-            so += v
-            no += 1
-    if ni < 3 or no < 6:
-        return -1, -1, 0.0
-    ins = si / float(ni)
-    ok = 0
-    for v in outer_vals:
-        if v >= 0 and v < (ins - PAPER_DARK_MARGIN):
-            ok += 1
-    return ins, so / float(no), ok / float(no)
+        level = "normal"
+
+    # 保留按画面亮度动态调节，并整体提高阈值，
+    # 优先保留黑胶带的高对比边缘，抑制红色圆环的弱边缘。
+    base_low = int(mean_value * 0.24 + 20)
+    base_low = max(25, min(80, base_low))
+    base_high = int(base_low * 2.6)
+    base_high = max(base_low + 35, min(200, base_high))
+    canny_low = int(base_low * RED_TARGET_CANNY_GAIN)
+    canny_low = max(35, min(145, canny_low))
+    canny_high = int(base_high * RED_TARGET_CANNY_GAIN)
+    canny_high = max(canny_low + 60, min(255, canny_high))
+
+    white_threshold = int(stats["min"] + spread * 0.52)
+    white_threshold = max(85, min(215, white_threshold))
+
+    return {
+        "level": level,
+        "mean": mean_value,
+        "min": stats["min"],
+        "max": stats["max"],
+        "spread": spread,
+        "canny_low": canny_low,
+        "canny_high": canny_high,
+        "white_threshold": white_threshold,
+    }
 
 
-def paper_frame_sides(img, x, y, w, h, ins):
-    """近处黑胶带框校验：四边各 3 点，至少 2 点比纸面暗才算该边有框。
+def make_light_fallback_profile(profile):
+    """为一次全图重捕获构建较低阈值的检测配置。"""
+    canny_low = max(15, int(profile["canny_low"] * 0.72))
+    canny_high = max(canny_low + 30, int(profile["canny_high"] * 0.78))
 
-    反光可能破坏一边，所以允许 3/4 边；破坏两边以上就拒绝。
+    return {
+        "level": profile["level"] + "_fallback",
+        "mean": profile["mean"],
+        "min": profile["min"],
+        "max": profile["max"],
+        "spread": profile["spread"],
+        "canny_low": canny_low,
+        "canny_high": canny_high,
+        "white_threshold": max(70, profile["white_threshold"] - 20),
+    }
+
+
+def make_long_range_profile(profile):
+    """用于远距离目标的低阈值配置，此时边框仅约 2 到 3 像素宽。
+
+    模糊核和默认 Canny 参数针对 4 到 8 像素宽的边框调整。
+    超过约 1.2 米后，边框比模糊核还细，因此需要使用更低边缘阈值
+    进行第二次检测才能可靠找到目标。
     """
-    lim = ins - PAPER_DARK_MARGIN
-    sides = 0
-    for sx in (x - PROBE_OFF_PX, x + w + PROBE_OFF_PX):
-        k = 0
-        for fy in (0.25, 0.50, 0.75):
-            v = px_luma(img, sx, y + h * fy)
-            if v >= 0 and v < lim:
-                k += 1
-        if k >= 2:
-            sides += 1
-    for sy in (y - PROBE_OFF_PX, y + h + PROBE_OFF_PX):
-        k = 0
-        for fx in (0.25, 0.50, 0.75):
-            v = px_luma(img, x + w * fx, sy)
-            if v >= 0 and v < lim:
-                k += 1
-        if k >= 2:
-            sides += 1
-    return sides
+    canny_low = max(15, int(profile["canny_low"] * LONG_RANGE_CANNY_SCALE))
+    canny_high = max(canny_low + 30, int(profile["canny_high"] * 0.78))
+
+    return {
+        "level": profile["level"] + "_long",
+        "mean": profile["mean"],
+        "min": profile["min"],
+        "max": profile["max"],
+        "spread": profile["spread"],
+        "canny_low": canny_low,
+        "canny_high": canny_high,
+        "white_threshold": max(70, profile["white_threshold"] - 10),
+    }
 
 
-def norm_bbox(bx, by, bw, bh, roi):
-    """兼容 find_blobs 返回“相对 ROI”或“全图”两种坐标。"""
-    if roi[0] or roi[1]:
-        if (bx + bw / 2.0) < roi[0] or (by + bh / 2.0) < roi[1]:
-            return bx + roi[0], by + roi[1]
-    return bx, by
+def make_tracking_roi(last_candidate, margin_factor=0.30):
+    if last_candidate is None:
+        return None
+
+    margin_x = max(20, int(last_candidate["w"] * margin_factor))
+    margin_y = max(20, int(last_candidate["h"] * margin_factor))
+    x = max(0, int(last_candidate["x"] - margin_x))
+    y = max(0, int(last_candidate["y"] - margin_y))
+    width = min(FRAME_WIDTH - x, int(last_candidate["w"] + 2 * margin_x))
+    height = min(FRAME_HEIGHT - y, int(last_candidate["h"] + 2 * margin_y))
+    return (x, y, width, height)
 
 
-def merge_fragments(blobs, roi):
-    """把"被印刷圈/阴影切碎的靶纸"重新拼成一块，**但绝不吸收背景大块**。
+def crop_for_detection(img, roi):
+    if roi is None:
+        return img, 0, 0
 
-    为什么不用 find_blobs(merge=True)：那个 merge 是按**外接框**做的 ——
-    两块的外接框一靠近（margin 之内）就并成一块。于是只要背景里有个大亮块
-    （白墙/亮桌面），它的外接框罩住靶纸，靶纸就被吞进去，最后只剩一个
-    "26 万像素 框800 ✗框长"的大块：**真靶纸永远不作为候选出现**。
-    这里的规则：只拼“嵌套”的碎片 —— 印刷圈把纸切成同心环时，
-    内圈的外接框在外圈里面，这种情况必须拼；相邻但不嵌套的亮块
-    （反光、背景）一律不拼。
-      · 嵌套但尺寸差很多时，只有“外环密度低 + 内盘同心 + 内盘不是噪点”
-        才拼：这是近处印刷圈产生的中心白盘，必须并回外环；而背景大块
-        罩住靶纸时外块是实心的（密度高），不会被这条规则吞掉；
-      · 两块各自的长度 <= PAPER_MAX_LONG*1.3（"整幅背景大块"在这一步就被挡住）；
-      · 并起来之后：长边 <= PAPER_MAX_LONG、长宽比 <= PAPER_ASPECT_MAX、
-        面积 <= PAPER_MAX_AREA_RATIO × 画面（拼完还得像一张靶纸）。
-    输入/输出都是 [(x, y, w, h, px), ...]（已归一化到全图坐标），
-    输出按面积从大到小排。
+    x = max(0, int(roi[0]))
+    y = max(0, int(roi[1]))
+    width = min(FRAME_WIDTH - x, int(roi[2]))
+    height = min(FRAME_HEIGHT - y, int(roi[3]))
+
+    if width < 32 or height < 32:
+        return img, 0, 0
+
+    try:
+        return img.copy(roi=(x, y, width, height)), x, y
+    except Exception:
+        return img, 0, 0
+
+
+def pace_frame(last_frame_ms):
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), last_frame_ms)
+    if elapsed_ms < FRAME_INTERVAL_MS:
+        time.sleep_ms(FRAME_INTERVAL_MS - elapsed_ms)
+    return time.ticks_ms()
+
+
+# ---------------------------------------------------------------------------
+# 几何辅助函数。
+# ---------------------------------------------------------------------------
+
+
+def polygon_area(corners):
+    area = 0.0
+    count = len(corners)
+
+    for i in range(count):
+        x1, y1 = corners[i]
+        x2, y2 = corners[(i + 1) % count]
+        area += x1 * y2 - x2 * y1
+
+    return abs(area) * 0.5
+
+
+def bounding_box(corners):
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    min_x = int(min(xs))
+    max_x = int(max(xs))
+    min_y = int(min(ys))
+    max_y = int(max(ys))
+    return min_x, min_y, max_x - min_x + 1, max_y - min_y + 1
+
+
+def center_of_corners(corners):
+    x_sum = 0.0
+    y_sum = 0.0
+
+    for point in corners:
+        x_sum += point[0]
+        y_sum += point[1]
+
+    return x_sum / len(corners), y_sum / len(corners)
+
+
+def perspective_center_of_corners(corners):
+    """直接按透视关系计算投影矩形的中心。
+
+    检测到的四个角点是平面矩形的投影；目标未正对相机时会形成梯形，
+    此时简单平均四个角点会偏向较近的一侧。因此改用两条对角线的交点：
+    利用投影变换可以直接得到矩形中心的对应点，计算量仅为两次叉积。
+
+    当角点未按环形顺序排列，或四边形退化、两条对角线不在两条边段
+    内部相交时，回退到普通平均值。
     """
-    items = []
-    for b in blobs:
-        x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
-        x, y = norm_bbox(x, y, w, h, roi)
-        items.append([x, y, w, h, px])
-    lim = PAPER_MAX_LONG * 1.3
-    amax = PAPER_MAX_AREA_RATIO * IMG_W * IMG_H
-    again = True
-    while again:
-        again = False
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                a = items[i]
-                c = items[j]
-                la = a[2] if a[2] > a[3] else a[3]
-                lc = c[2] if c[2] > c[3] else c[3]
-                if (la > lim) or (lc > lim):
-                    continue                    # 有一块是"背景大块" -> 不拼
-                nested = ((a[0] >= c[0]) and (a[1] >= c[1]) and
-                          (a[0] + a[2] <= c[0] + c[2]) and
-                          (a[1] + a[3] <= c[1] + c[3])) or \
-                         ((c[0] >= a[0]) and (c[1] >= a[1]) and
-                          (c[0] + c[2] <= a[0] + a[2]) and
-                          (c[1] + c[3] <= a[1] + a[3]))
-                if not nested:
-                    continue
-                if nested and ((la < lc * 0.75) or (lc < la * 0.75)):
-                    # 嵌套但尺寸差很多：只有中心白盘并回外环这一种情况放行。
-                    # 外环是有洞的形状（密度低），内盘与外环同心，且内盘
-                    # 至少占外框的 3% —— 不是噪点。背景大块是实心的，密度高，
-                    # 因此不会在这里把靶纸吞掉。
-                    if la >= lc:
-                        outer, inner, ol = a, c, la
-                    else:
-                        outer, inner, ol = c, a, lc
-                    oa = outer[2] * outer[3]
-                    ia = inner[2] * inner[3]
-                    ocx = outer[0] + outer[2] * 0.5
-                    ocy = outer[1] + outer[3] * 0.5
-                    icx = inner[0] + inner[2] * 0.5
-                    icy = inner[1] + inner[3] * 0.5
-                    od = outer[4] / float(oa) if oa > 0 else 0.0
-                    if (od > MERGE_RING_DENSITY_MAX) or \
-                            (abs(icx - ocx) > MERGE_CENTER_K * ol) or \
-                            (abs(icy - ocy) > MERGE_CENTER_K * ol) or \
-                            (ia < MERGE_INNER_AREA_MIN * oa):
-                        continue
-                ux = min(a[0], c[0])
-                uy = min(a[1], c[1])
-                uw = max(a[0] + a[2], c[0] + c[2]) - ux
-                uh = max(a[1] + a[3], c[1] + c[3]) - uy
-                ulong = uw if uw > uh else uh
-                ushort = uw if uw < uh else uh
-                if (ulong > PAPER_MAX_LONG) or \
-                        (ulong / max(1.0, ushort) > PAPER_ASPECT_MAX) or \
-                        (uw * uh > amax):
-                    continue                    # 拼完不像靶纸 -> 不拼
-                items[i] = [ux, uy, uw, uh, a[4] + c[4]]
-                del items[j]
-                again = True
-                break
-            if again:
-                break
-    items.sort(key=lambda it: -it[4])
-    return items
+    if len(corners) != 4:
+        return center_of_corners(corners)
+
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
+    diagonal_a_x = x2 - x0
+    diagonal_a_y = y2 - y0
+    diagonal_b_x = x3 - x1
+    diagonal_b_y = y3 - y1
+
+    denominator = diagonal_a_x * diagonal_b_y - diagonal_a_y * diagonal_b_x
+    if abs(denominator) < 1e-6:
+        return center_of_corners(corners)
+
+    offset_x = x1 - x0
+    offset_y = y1 - y0
+    t = (offset_x * diagonal_b_y - offset_y * diagonal_b_x) / denominator
+    s = (offset_x * diagonal_a_y - offset_y * diagonal_a_x) / denominator
+    if t < -0.05 or t > 1.05 or s < -0.05 or s > 1.05:
+        return center_of_corners(corners)
+
+    return x0 + t * diagonal_a_x, y0 + t * diagonal_a_y
 
 
-def _scan_th(ref):
-    """按纸面自身亮度定的扫描门槛（纸面有阴影时也能摸到真边）。"""
-    t = ref * SCAN_TH_K
-    if t < SCAN_TH_LO:
-        t = SCAN_TH_LO
-    elif t > SCAN_TH_HI:
-        t = SCAN_TH_HI
-    return t
+def angle_between(v1, v2):
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    length_1 = math.sqrt(v1[0] * v1[0] + v1[1] * v1[1])
+    length_2 = math.sqrt(v2[0] * v2[0] + v2[1] * v2[1])
+
+    if length_1 == 0 or length_2 == 0:
+        return 0.0
+
+    cosine = dot / (length_1 * length_2)
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
 
 
-def _requad(img, seed):
-    """快速复测：拿上次的四边形当种子只重扫四条边（省一次 find_blobs 的固定开销）。
+def edge_direction_deg(vector):
+    return math.degrees(math.atan2(vector[1], vector[0]))
 
-    seed/main 的测量元组: (px,x,y,w,h,long,aspect,den,ins,outs,corners,cx,cy)
-    返回同样格式的 (best, 亮块数=0, 诊断串)。
+
+def line_angle_difference_deg(first, second):
+    difference = abs(first - second) % 180.0
+    return min(difference, 180.0 - difference)
+
+
+def rectangle_shape_ok(corners, near_target=False):
+    """仅依据几何关系判断目标，参考 2025 年电赛国赛方案。
+
+    四项检查均不读取像素值：每条边足够长、对边长度接近、
+    对边平行、相邻边垂直。亮度类门槛在目标最困难的场景下容易失效，
+    例如 1.6 米处 2 厘米边框仅约三个像素宽；几何条件仍能稳定成立，
+    因此现在由这些条件承担主要筛选。
     """
-    px = seed[0]
-    c = seed[10]
-    if c is None:
-        return None, 0, ""
-    xs = (c[0][0], c[1][0], c[2][0], c[3][0])
-    ys = (c[0][1], c[1][1], c[2][1], c[3][1])
-    bx = min(xs)
-    by = min(ys)
-    w = max(xs) - bx
-    h = max(ys) - by
-    if w < 8 or h < 8:
-        return None, 0, ""
-    ins, outs, frac = paper_contrast(img, bx, by, w, h)
-    if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
-            (frac < PAPER_DARK_FRAC_MIN):
-        return None, 0, "[复测:亮度] "
-    q = quad_from_blob(img, bx, by, w, h, _scan_th(ins))
-    if q is None:
-        return None, 0, "[复测:拟合] "
-    corners, ctr, long_side, short_side, qa = q
-    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
-        return None, 0, "[复测:面积] "
-    if seed[5] >= QUAD_NEAR_LONG:
-        box_long = w if w > h else h
-        if (long_side < QUAD_NEAR_SIDE_K * box_long) or \
-                (qa < QUAD_NEAR_FILL_K * w * h) or \
-                _quad_inside_bad(corners, bx, by, w, h, QUAD_NEAR_EDGE_K):
-            return None, 0, "[复测:内圈] "
-    aspect = long_side / max(1.0, short_side)
-    if (long_side < PAPER_MIN_LONG) or (long_side > PAPER_MAX_LONG) or \
-            (aspect < PAPER_ASPECT_MIN) or (aspect > PAPER_ASPECT_MAX):
-        return None, 0, "[复测:尺寸] "
-    return (px, bx, by, w, h, long_side, aspect, px / max(1.0, qa),
-            ins, outs, corners, ctr[0], ctr[1]), 0, ""
-
-
-def _probe(img, x, y, dx, dy, th):
-    """沿射线前后各 1px 取样，多数（>=2/3）亮才算“纸”。
-
-    印刷圆圈的细线在“圆的正左/正右”几乎与横向射线垂直，只做垂直方向
-    取最大跨不过去（扫描会停在第一圈圆环，四边形缩到圆环范围）；
-    沿射线取多数则与细线角度无关。
-    复测里每帧要上千次 _probe，3 个采样是速度和抗印刷圈之间的折中。
-    """
-    if dx:
-        offs = ((x - 1, y), (x, y), (x + 1, y))
-    else:
-        offs = ((x, y - 1), (x, y), (x, y + 1))
-    k = 0
-    for p in offs:
-        v = px_luma(img, p[0], p[1])
-        if v >= th:
-            k += 1
-    return k >= 2
-
-
-def _edge(img, xc, yc, dx, dy, limit, th):
-    """从 (xc,yc) 沿 (dx,dy) 二分找最后一个“纸”像素的距离；找不到给 -1。"""
-    if not _probe(img, xc, yc, dx, dy, th):
-        return -1
-    lo = 0
-    hi = limit
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _probe(img, xc + dx * mid, yc + dy * mid, dx, dy, th):
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
-
-
-def _lsq(pts):
-    """最小二乘拟合 v = a*u + b（点数<2 返回 None）。"""
-    n = len(pts)
-    if n < 2:
-        return None
-    su = sv = suu = suv = 0.0
-    for u, v in pts:
-        su += u
-        sv += v
-        suu += u * u
-        suv += u * v
-    den = n * suu - su * su
-    if abs(den) < 1e-6:
-        return None
-    a = (n * suv - su * sv) / den
-    return a, (sv - a * su) / float(n)
-
-
-def _lsq_robust(pts):
-    """Theil-Sen：点对斜率取中位数。斜视时部分扫描点会打到相邻边，
-    普通最小二乘会被带偏几十像素，中位数法最多容忍一半坏点。"""
-    n = len(pts)
-    if n < 2:
-        return None
-    if n == 2:
-        (u1, v1), (u2, v2) = pts[0], pts[1]
-        if abs(u2 - u1) < 1e-6:
-            return None
-        a = (v2 - v1) / (u2 - u1)
-        return a, v1 - a * u1
-    sl = []
-    for i in range(n - 1):
-        for j in range(i + 1, n):
-            du = pts[j][0] - pts[i][0]
-            if (du > 1.5) or (du < -1.5):
-                sl.append((pts[j][1] - pts[i][1]) / du)
-    if len(sl) < 2:
-        return _lsq(pts)
-    sl.sort()
-    m = len(sl)
-    a = sl[m // 2] if (m % 2) else 0.5 * (sl[m // 2 - 1] + sl[m // 2])
-    bs = []
-    for u, v in pts:
-        bs.append(v - a * u)
-    bs.sort()
-    nb = len(bs)
-    b = bs[nb // 2] if (nb % 2) else 0.5 * (bs[nb // 2 - 1] + bs[nb // 2])
-    return a, b
-
-
-def _cross(e1, e2):
-    """竖边 x = a*y+b 与横边 y = a*x+b 的交点。"""
-    al, bl = e1
-    at, bt = e2
-    den = 1.0 - al * at
-    if abs(den) < 1e-3:
-        return None
-    x = (al * bt + bl) / den
-    return (x, at * x + bt)
-
-
-def _quad_angle_bad(corners, cos_lim=0.574):
-    """QGimbal-Vision 同款判据：矩形四个内角都应接近 90°（±35° -> |cos|≤0.574）。
-    返回 True = 不合格（弃用四边形、退回外接框）。斜视透视下角度会偏离直角，
-    容差放到 ±35°；超过这个限度的一定不是我们的靶纸（是乱接边的糊块）。"""
-    for i in range(4):
-        p0 = corners[i]
-        p1 = corners[(i + 1) % 4]
-        p2 = corners[(i + 2) % 4]
-        v1x = p0[0] - p1[0]
-        v1y = p0[1] - p1[1]
-        v2x = p2[0] - p1[0]
-        v2y = p2[1] - p1[1]
-        n1 = (v1x * v1x + v1y * v1y) ** 0.5
-        n2 = (v2x * v2x + v2y * v2y) ** 0.5
-        if (n1 < 1e-3) or (n2 < 1e-3):
-            return True
-        c = (v1x * v2x + v1y * v2y) / (n1 * n2)
-        if c > 1.0:
-            c = 1.0
-        elif c < -1.0:
-            c = -1.0
-        if (c > cos_lim) or (c < -cos_lim):
-            return True
-    return False
-
-
-def _quad_inside_bad(corners, x, y, w, h, k):
-    """近处四边形必须贴着亮块外框。
-
-    如果四个角都缩在框内一大截，说明边扫描停在印刷圈上，不是靶纸外沿。
-    返回 True = 不合格（弃用四边形，退回这个亮块的框中心）。
-    """
-    for p in corners:
-        dx = min(abs(p[0] - x), abs(p[0] - (x + w)))
-        dy = min(abs(p[1] - y), abs(p[1] - (y + h)))
-        if (dx > w * k) and (dy > h * k):
-            return True
-    return False
-
-
-def quad_from_blob(img, bx, by, bw, bh, th, pad=None):
-    """把亮块拟合成四边形（斜视=梯形）。
-    返回 (corners, center, long_side, short_side, quad_area) 或 None；
-    center = 两条对角线交点 = 透视意义下的靶心。"""
-    if pad is None:
-        pad = QUAD_LIM_PAD
-    icx = int(bx + bw / 2.0)
-    icy = int(by + bh / 2.0)
-    # 每条边的扫描半径 = 中心到亮块该边的距离 + QUAD_LIM_PAD（放太远会越过
-    # 黑胶带摸到背景亮边，那一条边就会“跳”出去）
-    lim_l = icx - int(bx) + pad
-    lim_r = int(bx + bw) - icx + pad
-    lim_u = icy - int(by) + pad
-    lim_d = int(by + bh) - icy + pad
-    left = []
-    right = []
-    top = []
-    bot = []
-    for k in range(1, QUAD_SCAN_N + 1):
-        yy = int(by + bh * k / float(QUAD_SCAN_N + 1))
-        dl = _edge(img, icx, yy, -1, 0, lim_l, th)
-        dr = _edge(img, icx, yy, 1, 0, lim_r, th)
-        if dl >= 0:
-            left.append((yy, icx - dl))
-        if dr >= 0:
-            right.append((yy, icx + dr))
-        xx = int(bx + bw * k / float(QUAD_SCAN_N + 1))
-        du = _edge(img, xx, icy, 0, -1, lim_u, th)
-        dd = _edge(img, xx, icy, 0, 1, lim_d, th)
-        if du >= 0:
-            top.append((xx, icy - du))
-        if dd >= 0:
-            bot.append((xx, icy + dd))
-    if (len(left) < 3) or (len(right) < 3) or \
-            (len(top) < 3) or (len(bot) < 3):
-        return None
-    e_l = _lsq_robust(left)
-    e_r = _lsq_robust(right)
-    e_t = _lsq_robust(top)
-    e_b = _lsq_robust(bot)
-    if (e_l is None) or (e_r is None) or (e_t is None) or (e_b is None):
-        return None
-    tl = _cross(e_l, e_t)
-    tr = _cross(e_r, e_t)
-    br = _cross(e_r, e_b)
-    bl = _cross(e_l, e_b)
-    if (tl is None) or (tr is None) or (br is None) or (bl is None):
-        return None
-    c = [tl, tr, br, bl]
-    bad = []
-    for i in range(4):
-        p = c[i]
-        if (p[0] < bx - 5) or (p[0] > bx + bw + 5) or \
-                (p[1] < by - 5) or (p[1] > by + bh + 5):
-            bad.append(i)
-    if len(bad) == 1:
-        i = bad[0]
-        a = c[(i - 1) % 4]
-        b = c[(i + 1) % 4]
-        d = c[(i + 2) % 4]
-        c[i] = (a[0] + b[0] - d[0], a[1] + b[1] - d[1])
-    elif len(bad) > 1:
-        return None
-    for p in c:
-        if (p[0] < 1) or (p[0] > IMG_W - 2) or \
-                (p[1] < 1) or (p[1] > IMG_H - 2):
-            return None
-    c = (c[0], c[1], c[2], c[3])
-    qa = 0.0
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        qa += x1 * y2 - x2 * y1
-    qa = abs(qa) * 0.5
-    if qa < 1.0:
-        return None
-    d = []
-    for i in range(4):
-        x1, y1 = c[i]
-        x2, y2 = c[(i + 1) % 4]
-        d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
-    dl1 = (d[0] + d[2]) / 2.0
-    dl2 = (d[1] + d[3]) / 2.0
-    if dl1 >= dl2:
-        long_side, short_side = dl1, dl2
-    else:
-        long_side, short_side = dl2, dl1
-    d1x, d1y = br[0] - tl[0], br[1] - tl[1]
-    d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
-    den = d1x * d2y - d1y * d2x
-    if abs(den) < 1e-6:
-        ctr = ((tl[0] + br[0]) / 2.0, (tl[1] + br[1]) / 2.0)
-    else:
-        t = ((tr[0] - tl[0]) * d2y - (tr[1] - tl[1]) * d2x) / den
-        ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
-    if (ctr[0] < 0) or (ctr[0] >= IMG_W) or \
-            (ctr[1] < 0) or (ctr[1] >= IMG_H):
-        return None
-    return (c, ctr, long_side, max(1.0, short_side), qa)
-
-
-class PaperDetector(object):
-    """A4 靶纸检测（C 加速 find_blobs）+ 三道闸门 + 连续确认 + 平滑。
-
-    返回 dict: center/box/area/aspect/density/long_side/contrast/n/state
-    state: 锁定 / 确认x/3 / 搜索
-    详细判据与依据见 tools/vision_check.py 顶部注释。
-    """
-
-    def __init__(self):
-        self.u = IMG_W / 2.0
-        self.v = IMG_H / 2.0
-        self.w = 0.0
-        self.h = 0.0
-        self.have = False
-        self.lost = 0
-        self.meas = None
-        self.corners = None
-        self.pend = None
-        self.frame = 0
-        self.last_n = 0
-        self.last_dbg = ""
-        self.cands = []
-        self.did_full = False
-        self.state = "搜索"
-        self.err = 0
-        self.err_msg = ""
-        self.last_long = 0.0
-        self.vel_u = 0.0
-        self.vel_v = 0.0
-        self.prev_cu = None
-        self.prev_cv = None
-
-    def roi(self, expand=1.0):
-        L = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
-        pu = self.u + self.vel_u * 0.70
-        pv = self.v + self.vel_v * 0.70
-        if pu < 0:
-            pu = 0
-        elif pu >= IMG_W:
-            pu = IMG_W - 1
-        if pv < 0:
-            pv = 0
-        elif pv >= IMG_H:
-            pv = IMG_H - 1
-        _v = abs(self.vel_u)
-        if abs(self.vel_v) > _v:
-            _v = abs(self.vel_v)
-        r = int(L * 0.60 + 18 + min(36.0, _v * 2.0))
-        if self.lost > 0:
-            r += min(TRACK_PAD_FAR, self.lost * 8)
-        r = int(r * expand)
-        x = int(pu - r)
-        y = int(pv - r)
-        if x < 0:
-            x = 0
-        if y < 0:
-            y = 0
-        w = 2 * r
-        h = 2 * r
-        if x + w > IMG_W:
-            w = IMG_W - x
-        if y + h > IMG_H:
-            h = IMG_H - y
-        return (x, y, w, h)
-
-    def fresh(self):
-        return self.have and (self.lost < HOLD_FRAMES)
-
-    def _size_ok(self, long_side, density=0.0, contrast=0.0):
-        if not self.have:
-            return True
-        old = self.last_long if self.last_long > 1.0 else max(self.w, self.h)
-        lo = SIZE_GATE_LO
-        hi = SIZE_GATE_HI
-        if self.lost > 0:
-            k = 1.0 - 0.02 * self.lost
-            if k < 0.6:
-                k = 0.6
-            lo = SIZE_GATE_LO * k
-            hi = SIZE_GATE_HI / k
-        if (lo * old) <= long_side <= (hi * old):
-            return True
-        return (density >= SIZE_RESCUE_DENSITY) and \
-               (contrast >= SIZE_RESCUE_CONTRAST) and \
-               (0.35 * old <= long_side <= SIZE_RESCUE_MAX * old)
-
-    def _confirm(self, cand):
-        """全图候选的连续确认。返回 True = 确认为目标。"""
-        if cand is None:
-            if self.pend is not None:
-                self.pend[4] += 1
-                if self.pend[4] > PENDING_MISS:
-                    self.pend = None
-            return False
-        cu, cv, lo = cand[11], cand[12], cand[5]
-        if self.have and (self.lost < 30):
-            old = max(self.w, self.h)
-            if (lo < 0.30 * old) or (lo > 3.0 * old):
-                self.pend = None
-                return False
-        if self.pend is None:
-            self.pend = [cu, cv, lo, 1, 0]
-            if CONFIRM_N <= 1:
-                self.pend = None
-                return True
-            return False
-        if (abs(cu - self.pend[0]) <= CONFIRM_DXY) and \
-                (abs(cv - self.pend[1]) <= CONFIRM_DXY) and \
-                (abs(lo - self.pend[2]) <= CONFIRM_DSIZE * self.pend[2]):
-            n = self.pend[3] + 1
-            self.pend[0] += (cu - self.pend[0]) / float(n)
-            self.pend[1] += (cv - self.pend[1]) / float(n)
-            self.pend[2] += (lo - self.pend[2]) / float(n)
-            self.pend[3] = n
-            self.pend[4] = 0
-            if n >= CONFIRM_N:
-                self.pend = None
-                return True
-        else:
-            self.pend = [cu, cv, lo, 1, 0]
+    if len(corners) != 4:
         return False
 
-    def _accept(self, cand):
-        x, y, w, h = cand[1], cand[2], cand[3], cand[4]
-        c = cand[10]
-        cu, cv = cand[11], cand[12]
-        old_l = self.last_long if self.last_long > 1.0 \
-            else max(self.w, self.h)
-        if self.have and (self.lost < LOST_FULL):
-            _jump = max(JUMP_REJECT_PX * 0.55, old_l * 0.45) + 20.0
-            _jump += self.lost * 8.0
-            if abs(cu - self.u) > _jump:
-                return False
-            if abs(cv - self.v) > _jump:
-                return False
-            if old_l > 1.0:
-                if (cand[5] < 0.40 * old_l) or (cand[5] > 2.50 * old_l):
-                    return False
-        if (not self.have) or (self.lost >= LOST_FULL):
-            self.u, self.v, self.w, self.h = cu, cv, w, h
-            self.have = True
-            self.corners = c
-            self.prev_cu, self.prev_cv = cu, cv
-        else:
-            if (self.lost == 0) and (self.prev_cu is not None):
-                self.vel_u = 0.5 * self.vel_u + 0.5 * (cu - self.prev_cu)
-                self.vel_v = 0.5 * self.vel_v + 0.5 * (cv - self.prev_cv)
-            self.prev_cu, self.prev_cv = cu, cv
-            if 0.0 < cand[5] < FAR_LONG_PX:
-                k = SMOOTH_FAR
-            elif cand[5] >= QUAD_NEAR_LONG:
-                k = SMOOTH_NEAR
-            else:
-                k = SMOOTH
-            if abs(cu - self.u) > DEADBAND_PX:
-                self.u += k * (cu - self.u)
-            if abs(cv - self.v) > DEADBAND_PX:
-                self.v += k * (cv - self.v)
-            if abs(w - self.w) > 2 * DEADBAND_PX:
-                self.w += k * (w - self.w)
-            if abs(h - self.h) > 2 * DEADBAND_PX:
-                self.h += k * (h - self.h)
-            if c is not None:
-                if self.corners is None:
-                    self.corners = c
-                else:
-                    sc = []
-                    for i in range(4):
-                        ax = self.corners[i][0]
-                        ay = self.corners[i][1]
-                        sc.append((ax + k * (c[i][0] - ax),
-                                   ay + k * (c[i][1] - ay)))
-                    self.corners = tuple(sc)
-            else:
-                self.corners = None
-        self.meas = cand
-        self.lost = 0
-        self.state = "锁定"
-        self.last_long = cand[5]
+    vectors = []
+    lengths = []
+    for index in range(4):
+        x1, y1 = corners[index]
+        x2, y2 = corners[(index + 1) % 4]
+        vector = (x2 - x1, y2 - y1)
+        vectors.append(vector)
+        lengths.append(math.sqrt(vector[0] * vector[0] + vector[1] * vector[1]))
+
+    if min(lengths) < MIN_TARGET_SIDE_PX:
+        return False
+
+    opposite_limit = (NEAR_MAX_OPPOSITE_SIDE_DELTA_PX
+                      if near_target else MAX_OPPOSITE_SIDE_DELTA_PX)
+    angle_limit = (NEAR_MAX_EDGE_ANGLE_DEG
+                   if near_target else MAX_EDGE_ANGLE_DEG)
+
+    if abs(lengths[0] - lengths[2]) > opposite_limit:
+        return False
+    if abs(lengths[1] - lengths[3]) > opposite_limit:
+        return False
+
+    angles = [edge_direction_deg(vector) for vector in vectors]
+    if line_angle_difference_deg(angles[0], angles[2]) > angle_limit:
+        return False
+    if line_angle_difference_deg(angles[1], angles[3]) > angle_limit:
+        return False
+
+    for index in range(4):
+        perpendicular = line_angle_difference_deg(
+            angles[index], angles[(index + 1) % 4]
+        )
+        if abs(perpendicular - 90.0) > angle_limit:
+            return False
+
+    return True
+
+
+def point_in_polygon(x, y, corners):
+    inside = False
+    j = len(corners) - 1
+
+    for i in range(len(corners)):
+        xi, yi = corners[i]
+        xj, yj = corners[j]
+
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi) + xi
+        ):
+            inside = not inside
+
+        j = i
+
+    return inside
+
+
+def sample_white_ratio(img, corners, white_threshold):
+    x, y, width, height = bounding_box(corners)
+    if width < 3 or height < 3:
+        return 0.0
+
+    # 采样步长比整除 10 更粗：样本数受 (框尺寸/步长)^2 限制，步长越大
+    # Python 开销越低。回退前已用整除 8 在 55 帧每秒下验证；
+    # 若白色比例噪声增大，再改回整除 10。
+    step = max(3, min(width, height) // 8)
+    white_pixels = 0
+    total_pixels = 0
+
+    for sample_y in range(y + step // 2, y + height, step):
+        for sample_x in range(x + step // 2, x + width, step):
+            if point_in_polygon(sample_x, sample_y, corners):
+                total_pixels += 1
+                if get_gray_value(img, sample_x, sample_y) >= white_threshold:
+                    white_pixels += 1
+
+    if total_pixels == 0:
+        return 0.0
+    return white_pixels / total_pixels
+
+
+def order_corners(corners):
+    center_x, center_y = center_of_corners(corners)
+    return sorted(
+        corners,
+        key=lambda point: math.atan2(
+            point[1] - center_y,
+            point[0] - center_x,
+        ),
+    )
+
+
+def sample_inner_edge_score(img, corners, white_threshold):
+    """统计四条边满足“外侧黑胶带、内侧白纸”的次数。"""
+    ordered = order_corners(corners)
+    if len(ordered) != 4:
+        return 0
+
+    center_x, center_y = center_of_corners(ordered)
+    dark_threshold = max(35, min(120, int(white_threshold * 0.60)))
+    inside_threshold = max(
+        BORDER_MIN_INSIDE_GRAY,
+        min(155, int(white_threshold * 0.72)),
+    )
+    score = 0
+
+    for index in range(4):
+        first_x, first_y = ordered[index]
+        second_x, second_y = ordered[(index + 1) % 4]
+        edge_x = second_x - first_x
+        edge_y = second_y - first_y
+        edge_length = math.sqrt(edge_x * edge_x + edge_y * edge_y)
+        if edge_length <= 0.0:
+            continue
+
+        normal_x = edge_y / edge_length
+        normal_y = -edge_x / edge_length
+        midpoint_x = (first_x + second_x) * 0.5
+        midpoint_y = (first_y + second_y) * 0.5
+        if (normal_x * (midpoint_x - center_x) +
+                normal_y * (midpoint_y - center_y)) < 0.0:
+            normal_x = -normal_x
+            normal_y = -normal_y
+
+        for fraction in (0.25, 0.50, 0.75):
+            edge_point_x = first_x + edge_x * fraction
+            edge_point_y = first_y + edge_y * fraction
+            outside_x = int(round(
+                edge_point_x + normal_x * BORDER_OUTSIDE_PX
+            ))
+            outside_y = int(round(
+                edge_point_y + normal_y * BORDER_OUTSIDE_PX
+            ))
+            if (
+                outside_x < 0 or outside_x >= FRAME_WIDTH
+                or outside_y < 0 or outside_y >= FRAME_HEIGHT
+            ):
+                continue
+            outside = get_gray_value(img, outside_x, outside_y)
+
+            inside_total = 0
+            inside_valid = True
+            for offset in range(1, BORDER_INSIDE_PX + 1):
+                inside_x = int(round(
+                    edge_point_x - normal_x * offset
+                ))
+                inside_y = int(round(
+                    edge_point_y - normal_y * offset
+                ))
+                if (
+                    inside_x < 0 or inside_x >= FRAME_WIDTH
+                    or inside_y < 0 or inside_y >= FRAME_HEIGHT
+                ):
+                    inside_valid = False
+                    break
+                inside_total += get_gray_value(img, inside_x, inside_y)
+            if not inside_valid:
+                continue
+            inside = inside_total / float(BORDER_INSIDE_PX)
+
+            if (
+                outside <= dark_threshold
+                and inside >= inside_threshold
+                and inside - outside >= BORDER_MIN_CONTRAST
+            ):
+                score += 1
+
+    return score
+
+
+def bump_diagnostic(diagnostics, name, amount=1):
+    if diagnostics is None:
+        return
+    diagnostics[name] = diagnostics.get(name, 0) + amount
+
+
+def calculate_distance_metrics(width, height, is_inner):
+    width_m = TARGET_OUTER_WIDTH_M
+    height_m = TARGET_OUTER_HEIGHT_M
+
+    if is_inner:
+        width_m -= 2.0 * BLACK_BORDER_WIDTH_M
+        height_m -= 2.0 * BLACK_BORDER_WIDTH_M
+
+    distance_width = FOCAL_LENGTH_PX * width_m / max(1.0, width)
+    distance_height = FOCAL_LENGTH_PX * height_m / max(1.0, height)
+    larger_distance = max(distance_width, distance_height)
+
+    if larger_distance <= 0:
+        distance_consistency = 0.0
+    else:
+        distance_consistency = min(distance_width, distance_height) / larger_distance
+
+    return {
+        "distance_m": (distance_width + distance_height) * 0.5,
+        "distance_width_m": distance_width,
+        "distance_height_m": distance_height,
+        "distance_consistency": distance_consistency,
+    }
+
+
+def refresh_candidate_distance(candidate):
+    metrics = calculate_distance_metrics(
+        candidate["w"], candidate["h"], candidate["inner"]
+    )
+    candidate["distance_m"] = metrics["distance_m"]
+    candidate["distance_width_m"] = metrics["distance_width_m"]
+    candidate["distance_height_m"] = metrics["distance_height_m"]
+    candidate["distance_consistency"] = metrics["distance_consistency"]
+
+
+def build_candidate(
+    img,
+    raw_corners,
+    profile,
+    source="unknown",
+    diagnostics=None,
+    min_white_ratio=ACQUIRE_MIN_WHITE_RATIO,
+):
+    if raw_corners is None or len(raw_corners) != 4:
+        return None
+
+    corners = []
+    for point in raw_corners:
+        corners.append((float(point[0]), float(point[1])))
+
+    area = polygon_area(corners)
+    if area < MIN_ABSOLUTE_AREA or area < FRAME_WIDTH * FRAME_HEIGHT * AREA_MIN_RATIO:
+        bump_diagnostic(diagnostics, "area_reject")
+        return None
+
+    x, y, width, height = bounding_box(corners)
+    if width <= 0 or height <= 0:
+        bump_diagnostic(diagnostics, "area_reject")
+        return None
+
+    near_target = max(width, height) >= NEAR_GEOMETRY_MIN_LONG_PX
+    aspect_min = NEAR_ASPECT_RATIO_MIN if near_target else ASPECT_RATIO_MIN
+    aspect_max = NEAR_ASPECT_RATIO_MAX if near_target else ASPECT_RATIO_MAX
+    min_rectangularity = (NEAR_MIN_RECTANGULARITY
+                          if near_target else MIN_RECTANGULARITY)
+
+    aspect_ratio = width / height
+    if aspect_ratio < aspect_min or aspect_ratio > aspect_max:
+        bump_diagnostic(diagnostics, "aspect_reject")
+        return None
+
+    if width * height < MIN_TARGET_BOX_AREA:
+        bump_diagnostic(diagnostics, "area_reject")
+        return None
+
+    if not rectangle_shape_ok(corners, near_target):
+        bump_diagnostic(diagnostics, "angle_reject")
+        return None
+
+    rectangularity = area / (width * height)
+    if rectangularity < min_rectangularity:
+        bump_diagnostic(diagnostics, "rectangularity_reject")
+        return None
+
+    white_ratio = sample_white_ratio(img, corners, profile["white_threshold"])
+    # 低于下限时，四边形完全不是白色目标；高于下限但低于
+    # 名义要求时只扣分，因为反光和不均匀光照造成的覆盖率波动
+    # 大于模型预测。
+    if white_ratio < MIN_WHITE_RATIO_FLOOR:
+        bump_diagnostic(diagnostics, "white_reject")
+        return None
+    if white_ratio < min_white_ratio:
+        bump_diagnostic(diagnostics, "white_low")
+
+    inner_edge_score = sample_inner_edge_score(
+        img, corners, profile["white_threshold"]
+    )
+    dark_border_ratio = inner_edge_score / 12.0
+    if inner_edge_score < MIN_INNER_EDGE_SCORE:
+        bump_diagnostic(diagnostics, "dark_border_low")
+
+    center_x, center_y = perspective_center_of_corners(corners)
+    is_inner = inner_edge_score >= MIN_INNER_EDGE_SCORE
+    distance_metrics = calculate_distance_metrics(width, height, is_inner)
+    distance_consistency = distance_metrics["distance_consistency"]
+
+    absolute_quality = (0.4 + 0.6 * min(1.0, white_ratio))
+    absolute_quality *= 0.75 + 0.25 * min(
+        1.0, white_ratio / max(MIN_WHITE_RATIO_FLOOR, min_white_ratio)
+    )
+    absolute_quality *= 0.4 + 0.6 * min(1.0, rectangularity)
+    absolute_quality *= 0.65 + 0.35 * distance_consistency
+    absolute_quality *= 0.55 + 0.45 * dark_border_ratio
+    score = area * absolute_quality
+
+    return {
+        "x": x,
+        "y": y,
+        "w": width,
+        "h": height,
+        "cx": center_x,
+        "cy": center_y,
+        "area": area,
+        "white": white_ratio,
+        "dark_border": dark_border_ratio,
+        "inner_edge_score": inner_edge_score,
+        "rect": rectangularity,
+        "distance_m": distance_metrics["distance_m"],
+        "distance_width_m": distance_metrics["distance_width_m"],
+        "distance_height_m": distance_metrics["distance_height_m"],
+        "distance_consistency": distance_consistency,
+        "base_score": score,
+        "score": score,
+        "corners": corners,
+        "source": source,
+        "layer": "inner" if is_inner else "unknown",
+        "alternate_layer": False,
+        "inner": is_inner,
+    }
+
+
+def mark_nested_candidates(candidates):
+    for index, candidate in enumerate(candidates):
+        for other in candidates:
+            if candidate is other:
+                continue
+
+            if other["area"] < candidate["area"] * 1.15:
+                continue
+
+            center_distance_x = abs(candidate["cx"] - other["cx"])
+            center_distance_y = abs(candidate["cy"] - other["cy"])
+            if (
+                center_distance_x < other["w"] * 0.2
+                and center_distance_y < other["h"] * 0.2
+            ):
+                candidate["inner"] = True
+                candidate["layer"] = "inner"
+                if other["layer"] == "unknown":
+                    other["layer"] = "outer"
+                refresh_candidate_distance(candidate)
+                break
+
+
+def candidate_in_distance_range(candidate):
+    return (
+        MIN_VALID_DISTANCE_M
+        <= candidate["distance_m"]
+        <= MAX_VALID_DISTANCE_M
+    )
+
+
+def candidate_center_in_roi(candidate, roi):
+    if roi is None:
         return True
 
-    def detect(self, img):
-        self.frame += 1
-        th_ad = scene_th(img, self.frame)
-        if (PAPER_TH_NEAR_FIXED > 0) and self.have and \
-                (self.lost < LOST_FULL) and \
-                (self.last_long >= QUAD_NEAR_LONG):
-            th_ad = PAPER_TH_NEAR_FIXED
-            _scene_cache[1] = float(th_ad)
-            _scene_cache[2] = 4.0
-        if (self.frame % 8) == 0:
-            th_alt = th_ad + 8
-            if th_alt > 84:
-                th_alt = 84
+    return (
+        roi[0] <= candidate["cx"] <= roi[0] + roi[2]
+        and roi[1] <= candidate["cy"] <= roi[1] + roi[3]
+    )
+
+
+def center_distance(candidate_a, candidate_b):
+    dx = candidate_a["cx"] - candidate_b["cx"]
+    dy = candidate_a["cy"] - candidate_b["cy"]
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def tracking_gate_limits(reference):
+    near_target = (
+        reference is not None
+        and max(reference["w"], reference["h"]) >= NEAR_GEOMETRY_MIN_LONG_PX
+    )
+    if near_target:
+        return (
+            NEAR_TRACK_AREA_RATIO_MIN,
+            NEAR_TRACK_AREA_RATIO_MAX,
+            NEAR_TRACK_AXIS_RATIO_MIN,
+            NEAR_TRACK_AXIS_RATIO_MAX,
+            NEAR_TRACK_CENTER_RADIUS_FACTOR,
+        )
+    return (
+        TRACK_AREA_RATIO_MIN,
+        TRACK_AREA_RATIO_MAX,
+        TRACK_AXIS_RATIO_MIN,
+        TRACK_AXIS_RATIO_MAX,
+        TRACK_CENTER_RADIUS_FACTOR,
+    )
+
+
+def set_best_observed_diagnostics(candidates, diagnostics):
+    if diagnostics is None:
+        return
+
+    if not candidates:
+        diagnostics["candidate_source"] = "none"
+        diagnostics["best_distance_cm"] = 0.0
+        diagnostics["lost_reason"] = "no_candidate"
+        return
+
+    observed = None
+    for candidate in candidates:
+        if observed is None or candidate["base_score"] > observed["base_score"]:
+            observed = candidate
+
+    diagnostics["candidate_source"] = observed["source"]
+    diagnostics["best_distance_cm"] = observed["distance_m"] * 100.0
+
+
+def select_best_candidate(candidates, state, last, diagnostics=None, roi=None):
+    mark_nested_candidates(candidates)
+    set_best_observed_diagnostics(candidates, diagnostics)
+
+    valid_distance_candidates = []
+    for candidate in candidates:
+        candidate["score"] = candidate["base_score"]
+
+        if not candidate_in_distance_range(candidate):
+            bump_diagnostic(diagnostics, "distance_reject")
+            continue
+
+        valid_distance_candidates.append(candidate)
+
+    if not valid_distance_candidates:
+        if diagnostics is not None and candidates:
+            diagnostics["lost_reason"] = "distance"
+        return None
+
+    # 当前靶面只稳定产生一个角点候选，且画面确认它贴着黑胶带内沿。
+    # 远距时边沿采样不足会让 inner_edge_score 偶发跌破阈值，若不强制
+    # 标记，几何计算会错误使用 300x210 外框尺寸。
+    if len(valid_distance_candidates) == 1:
+        candidate = valid_distance_candidates[0]
+        if not candidate["inner"]:
+            candidate["inner"] = True
+            candidate["layer"] = "inner"
+            refresh_candidate_distance(candidate)
+            bump_diagnostic(diagnostics, "forced_inner")
+
+    pool = []
+    for candidate in valid_distance_candidates:
+        if candidate["inner"]:
+            candidate["score"] *= INNER_CANDIDATE_SCORE_FACTOR
+        pool.append(candidate)
+    scored_candidates = []
+
+    if state in ("TRACK", "RECAPTURE_ROI"):
+        strict_candidates = []
+        alternate_candidates = []
+        area_min, area_max, axis_min, axis_max, center_factor = \
+            tracking_gate_limits(last)
+
+        for candidate in pool:
+            candidate["alternate_layer"] = False
+
+            if not candidate_center_in_roi(candidate, roi):
+                bump_diagnostic(diagnostics, "roi_reject")
+                continue
+
+            if last is None:
+                strict_candidates.append(candidate)
+                continue
+
+            # 一旦已经锁定内框，不允许因为远处少检到一帧就立即跳到外框。
+            # 内框连续丢失达到状态机重捕获阈值后，才会重新自由选层。
+            if last["layer"] == "inner" and not candidate["inner"]:
+                bump_diagnostic(diagnostics, "inner_hold_reject")
+                continue
+
+            max_center_distance = max(
+                25.0, last["w"] * center_factor
+            )
+            alternate_center_distance = max(
+                30.0, last["w"] * max(1.00, center_factor)
+            )
+            target_center_distance = center_distance(candidate, last)
+            if target_center_distance > alternate_center_distance:
+                bump_diagnostic(diagnostics, "center_reject")
+                continue
+
+            area_ratio = candidate["area"] / last["area"]
+            width_ratio = candidate["w"] / max(1.0, last["w"])
+            height_ratio = candidate["h"] / max(1.0, last["h"])
+            layer_mismatch = (
+                last["layer"] != "unknown"
+                and candidate["layer"] != "unknown"
+                and candidate["layer"] != last["layer"]
+            )
+            strict_size = (
+                area_min <= area_ratio <= area_max
+                and axis_min <= width_ratio <= axis_max
+                and axis_min <= height_ratio <= axis_max
+            )
+
+            if not layer_mismatch and strict_size:
+                center_quality = 1.0 - 0.35 * (
+                    target_center_distance / max_center_distance
+                )
+                size_error = abs(area_ratio - 1.0)
+                size_error += 0.5 * abs(width_ratio - 1.0)
+                size_error += 0.5 * abs(height_ratio - 1.0)
+                size_quality = 1.0 / (1.0 + size_error)
+                candidate["score"] = (
+                    candidate["base_score"]
+                    * max(0.35, center_quality)
+                    * size_quality
+                )
+                strict_candidates.append(candidate)
+                continue
+
+            alternate_size = (
+                LAYER_ALTERNATE_AREA_RATIO_MIN
+                <= area_ratio
+                <= LAYER_ALTERNATE_AREA_RATIO_MAX
+                and LAYER_ALTERNATE_AXIS_RATIO_MIN
+                <= width_ratio
+                <= LAYER_ALTERNATE_AXIS_RATIO_MAX
+                and LAYER_ALTERNATE_AXIS_RATIO_MIN
+                <= height_ratio
+                <= LAYER_ALTERNATE_AXIS_RATIO_MAX
+            )
+            if alternate_size:
+                candidate["alternate_layer"] = True
+                candidate["score"] = (
+                    candidate["base_score"] * LAYER_SWITCH_SCORE_FACTOR
+                )
+                alternate_candidates.append(candidate)
+                bump_diagnostic(diagnostics, "alternate_count")
+            elif layer_mismatch:
+                bump_diagnostic(diagnostics, "layer_reject")
+            else:
+                bump_diagnostic(diagnostics, "size_reject")
+
+        inner_alternates = [
+            candidate
+            for candidate in alternate_candidates
+            if candidate["inner"]
+        ]
+        if inner_alternates:
+            scored_candidates = inner_alternates
+        elif strict_candidates:
+            scored_candidates = strict_candidates
         else:
-            th_alt = th_ad - 6
-            if th_alt < 38:
-                th_alt = 38
-        cand = None
-        n = 0
-        dbg = ""
-        self.did_full = False
-        _stable = (self.lost == 0)
-        _seed_every = 24 if _stable else SEED_EVERY
-        _recheck_every = 60 if _stable else RE_CHECK_EVERY
-        try:
-            if self.have and self.lost < LOST_FULL:
-                if ((self.frame % _seed_every) == 0) or (self.meas is None):
-                    cand, n, dbg = self._find(img, self.roi(), th_ad)
+            scored_candidates = alternate_candidates
+
+        if not scored_candidates:
+            if diagnostics is not None:
+                if roi is not None and diagnostics.get("roi_reject", 0) > 0:
+                    diagnostics["lost_reason"] = "roi"
+                elif diagnostics.get("alternate_count", 0) > 0:
+                    diagnostics["lost_reason"] = "layer"
+                elif diagnostics.get("layer_reject", 0) > 0:
+                    diagnostics["lost_reason"] = "layer"
+                elif diagnostics.get("inner_hold_reject", 0) > 0:
+                    diagnostics["lost_reason"] = "inner_hold"
+                elif diagnostics.get("size_reject", 0) > 0:
+                    diagnostics["lost_reason"] = "size"
+                elif diagnostics.get("center_reject", 0) > 0:
+                    diagnostics["lost_reason"] = "center"
                 else:
-                    cand, n, dbg = self._find(img, self.roi(), th_ad,
-                                              self.meas)
-                    if cand is None:
-                        cand, n, dbg = self._find(img, self.roi(), th_ad)
-                    if cand is None:
-                        _roi2 = self.roi(1.6)
-                        cand, n, dbg = self._find(img, _roi2, th_ad)
-                if (cand is not None) and \
-                        (not self._size_ok(cand[5], cand[7],
-                                           cand[8] - cand[9])):
-                    dbg = "[尺寸闸门%.0fpx] " % cand[5] + dbg
-                    cand = None
-                if (self.frame % _recheck_every) == 0:
-                    cb, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H),
-                                            th_ad, prefer=False)
-                    self.did_full = True
-                    n += n2
-                    if cb is not None:
-                        old_s = 0.0
-                        if self.meas is not None:
-                            old_s = self.meas[0] * (0.5 + min(max(
-                                self.meas[8] - self.meas[9], 0), 80) / 80.0)
-                        new_s = cb[0] * (0.5 + min(max(
-                            cb[8] - cb[9], 0), 80) / 80.0)
-                        cur_l = self.last_long if self.last_long > 1.0 \
-                            else max(self.w, self.h)
-                        cbn = (abs(cb[11] - SPOT_UV[0]) +
-                               abs(cb[12] - SPOT_UV[1])) <= SPOT_PREF_PX
-                        cun = (abs(self.u - SPOT_UV[0]) +
-                               abs(self.v - SPOT_UV[1])) <= SPOT_PREF_PX
-                        old_con = 0.0
-                        if self.meas is not None:
-                            old_con = max(self.meas[8] - self.meas[9], 0.0)
-                        new_con = max(cb[8] - cb[9], 0.0)
-                        if ((cbn and not cun) or (new_s > 1.6 * old_s) or
-                                (new_con >= 60 and new_con >= 1.5 * old_con)) \
-                                and \
-                                (abs(cb[11] - self.u) +
-                                 abs(cb[12] - self.v) > 40) and \
-                                (0.35 * cur_l <= cb[5] <= 3.0 * cur_l):
-                            self.u, self.v = cb[11], cb[12]
-                            self.w, self.h = cb[3], cb[4]
-                            self.corners = cb[10]
-                            self.meas = cb
-                            self.last_long = cb[5]
-                            self.lost = 0
-                            self.state = "锁定"
-                            self.last_n = n
-                            self.last_dbg = ("[全图复查换目标 %.0f->%.0f] "
-                                             % (old_s, new_s)) + d2
-                            return {"center": (self.u, self.v),
-                                    "box": (cb[1], cb[2], cb[3], cb[4]),
-                                    "area": cb[0], "aspect": cb[6],
-                                    "density": cb[7], "long_side": cb[5],
-                                    "contrast": cb[8] - cb[9], "n": n,
-                                    "state": self.state,
-                                    "corners": self.corners}
-            else:
-                self.did_full = True
-                c2, n2, d2 = self._find(img, (0, 0, IMG_W, IMG_H), th_ad)
-                if c2 is None and ((self.frame % 4) == 0):
-                    c3, n3, d3 = self._find(img, (0, 0, IMG_W, IMG_H),
-                                            th_alt)
-                    c2, n2, d2 = c3, n2 + n3, d2 + d3
-                n += n2
-                dbg = d2
-                if self._confirm(c2):
-                    cand = c2
-        except Exception as e:
-            self.err += 1
-            if self.err_msg != str(e):
-                self.err_msg = str(e)
-                print("靶纸检测异常: %s" % e)
+                    diagnostics["lost_reason"] = "continuity"
             return None
-        self.last_n = n
-        self.last_dbg = dbg
-        if cand is not None:
-            if not self._accept(cand):
-                cand = None
-        if cand is None:
-            self.lost += 1
-            self.vel_u *= 0.5
-            self.vel_v *= 0.5
-            if self.pend is not None:
-                self.state = "确认%d/%d" % (self.pend[3], CONFIRM_N)
-            elif (not self.have) or (self.lost >= LOST_FULL):
-                self.state = "搜索"
-            else:
-                self.state = "搜索"
-        if cand is None:
-            return None
-        px, x, y, w, h, long_side, aspect, density, ins, outs = self.meas[:10]
-        return {"center": (self.u, self.v), "box": (x, y, w, h),
-                "area": px, "aspect": aspect, "density": density,
-                "long_side": long_side, "contrast": ins - outs, "n": n,
-                "state": self.state, "corners": self.corners}
-
-    def _find(self, img, roi, th, seed=None, prefer=None):
-        """在 roi 里找 A4 靶纸，返回 (best, 亮块数, 诊断字符串)。
-
-        seed=上次测量元组时走快速复测（只重扫四边形，不找亮块）。"""
-        if seed is not None:
-            return _requad(img, seed)
-        if prefer is None:
-            prefer = self.have and (self.lost == 0)
-        best = None
-        n = 0
-        dbg = ""
-        self.cands = []
-        if GRAY_DIRECT:
-            _gth = int(max(0, min(255, th * 255 / 100.0)))
-            _thresholds = [(_gth, 255)]
-        else:
-            _thresholds = [(th, 100, -PAPER_A_MAX, PAPER_A_MAX,
-                            -PAPER_B_MAX, PAPER_B_MAX)]
-        blobs = img.find_blobs(
-            _thresholds,
-            roi=roi, merge=False,
-            area_threshold=PAPER_MIN_AREA,
-            pixels_threshold=PAPER_MIN_AREA)
-        if not blobs:
-            return None, 0, ""
-        blobs = merge_fragments(blobs, roi)
-        if not blobs:
-            return None, 0, ""
-        for b in blobs:
-            n += 1
-            x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
-            x, y = norm_bbox(x, y, w, h, roi)
-            if w < 8 or h < 8:
-                continue
-            box_long = w if w > h else h
-            why = ""
-            corners = None
-            qa = 0.0
-            ins = 0
-            outs = 0
-            frac = 0.0
-            near_sides = 4
-            ctr = (x + w / 2.0, y + h / 2.0)
-            if box_long < PAPER_MIN_LONG * 0.8 or \
-                    box_long > PAPER_MAX_LONG * 1.3:
-                why = "框长"
-                long_side = box_long
-                short_side = w if w < h else h
-                density = px / float(w * h)
-            elif box_long > (PAPER_ASPECT_MAX * 1.3) * min(w, h):
-                why = "比例"
-                long_side = box_long
-                short_side = w if w < h else h
-                density = px / float(w * h)
-            else:
-                ins, outs, frac = paper_contrast(img, x, y, w, h)
-                q = quad_from_blob(img, x, y, w, h, _scan_th(ins))
-                if q is not None:
-                    corners, ctr, long_side, short_side, qa = q
-                    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
-                        corners = None
-                    elif (box_long >= QUAD_NEAR_LONG) and \
-                            ((long_side < QUAD_NEAR_SIDE_K * box_long) or
-                             (qa < QUAD_NEAR_FILL_K * w * h) or
-                             _quad_inside_bad(corners, x, y, w, h,
-                                              QUAD_NEAR_EDGE_K)):
-                        corners = None
-                    elif long_side < 0.70 * box_long:
-                        corners = None
-                    elif _quad_angle_bad(
-                            corners,
-                            QUAD_NEAR_COS_LIM
-                            if box_long >= QUAD_NEAR_LONG else 0.574):
-                        corners = None
-                    else:
-                        lim = QUAD_LIM_PAD + 8
-                        for p in corners:
-                            if (p[0] < x - lim) or (p[0] > x + w + lim) or \
-                                    (p[1] < y - lim) or (p[1] > y + h + lim):
-                                corners = None
-                                break
-                if corners is None:
-                    long_side = box_long
-                    short_side = w if w < h else h
-                    density = px / float(w * h)
-                    dens_min = PAPER_DENSITY_MIN
-                    if (ins - outs) >= PAPER_CONTRAST_STRONG:
-                        dens_min = PAPER_DENSITY_MIN_STRONG
-                    if (box_long >= QUAD_NEAR_LONG) and \
-                            (dens_min < PAPER_DENSITY_NEAR_MIN):
-                        dens_min = PAPER_DENSITY_NEAR_MIN
-                    ctr = (x + w / 2.0, y + h / 2.0)
-                    if box_long >= QUAD_NEAR_LONG:
-                        near_sides = paper_frame_sides(
-                            img, x, y, w, h, ins)
-                else:
-                    if box_long >= QUAD_NEAR_LONG:
-                        qx = qx2 = corners[0][0]
-                        qy = qy2 = corners[0][1]
-                        for p in corners:
-                            if p[0] < qx:
-                                qx = p[0]
-                            elif p[0] > qx2:
-                                qx2 = p[0]
-                            if p[1] < qy:
-                                qy = p[1]
-                            elif p[1] > qy2:
-                                qy2 = p[1]
-                        qins, qouts, qfrac = paper_contrast(
-                            img, qx, qy, qx2 - qx, qy2 - qy)
-                        if qins >= 0:
-                            ins, outs, frac = qins, qouts, qfrac
-                        near_sides = paper_frame_sides(
-                            img, qx, qy, qx2 - qx, qy2 - qy, ins)
-                    density = px / max(1.0, qa)
-                    dens_min = PAPER_DENSITY_QUAD_MIN
-                    if (box_long >= QUAD_NEAR_LONG) and \
-                            (dens_min < PAPER_DENSITY_NEAR_MIN):
-                        dens_min = PAPER_DENSITY_NEAR_MIN
-                aspect = long_side / max(1.0, short_side)
-                if px < PAPER_MIN_AREA:
-                    why = "面积"
-                elif px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
-                    why = "太大"
-                elif long_side < PAPER_MIN_LONG or \
-                        long_side > PAPER_MAX_LONG:
-                    why = "长边"
-                elif aspect < PAPER_ASPECT_MIN or \
-                        aspect > PAPER_ASPECT_MAX:
-                    why = "比例"
-                elif (density < dens_min) or \
-                        (density > (QUAD_NEAR_DENSITY_HI
-                                    if (corners is not None and
-                                        box_long >= QUAD_NEAR_LONG)
-                                    else 1.08)):
-                    why = "密度"
-                elif (box_long >= QUAD_NEAR_LONG) and (near_sides < 3):
-                    why = "黑框"
-                elif ((x <= 1) or (y <= 1) or
-                      ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1)) and \
-                        (corners is None) and (box_long < 90):
-                    why = "贴边"
-                elif ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
-                    why = "对比"
-                elif frac < PAPER_DARK_FRAC_MIN:
-                    why = "暗边"
-            if n <= 6:
-                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
-                    px, box_long, ins, outs, frac * 100.0, density,
-                    ("四" if corners is not None else "框"),
-                    (" ✗" + why) if why else " ✓")
-            if len(self.cands) < 8:
-                self.cands.append((x, y, w, h, 0 if why else 1))
-            if why:
-                continue
-            score = px * (0.5 + min(ins - outs, 80) / 80.0)
-            score *= 0.5 + 0.5 * (density if density < 1.0 else 1.0)
-            if prefer and self.have and self.last_long > 1.0:
-                d = abs(ctr[0] - self.u) + abs(ctr[1] - self.v)
-                ds = abs(long_side - self.last_long) / self.last_long
-                score *= 1.0 / (1.0 + d / 80.0 + ds * 2.0)
-            dc = abs(ctr[0] - SPOT_UV[0]) + abs(ctr[1] - SPOT_UV[1])
-            key = (1 if dc <= SPOT_PREF_PX else 0, score)
-            if best is None or key > best[0]:
-                best = (key, (px, x, y, w, h, long_side, aspect, density,
-                              ins, outs, corners, ctr[0], ctr[1]))
-        if best is None:
-            return None, n, dbg
-        bx, by, bw, bh = best[1][1], best[1][2], best[1][3], best[1][4]
-        keep = []
-        for cb in self.cands:
-            ccx = cb[0] + cb[2] * 0.5
-            ccy = cb[1] + cb[3] * 0.5
-            is_best = (cb[0] == bx and cb[1] == by and
-                       cb[2] == bw and cb[3] == bh)
-            if (not is_best) and (bx <= ccx <= bx + bw) and \
-                    (by <= ccy <= by + bh):
-                continue
-            keep.append((cb[0], cb[1], cb[2], cb[3],
-                         1 if is_best else 0))
-        self.cands = keep
-        return best[1], n, dbg
-
-
-class ClosePaperDetector(PaperDetector):
-    """全帧二值闭运算检测器。
-
-    二值化/闭运算负责生成白纸 mask；白块在 mask 上扫描四边，
-    原始 RGB888 图像只做内亮外暗和黑框校验。
-    """
-
-    def __init__(self):
-        PaperDetector.__init__(self)
-        self.close_hit = False
-        self.close_dbg = ""
-        self.err_printed = False
-        self.close_ms = 0
-        self.quad_ms = 0
-        self.close_view = None
-        self.close_data = None
-        self.close_roi = None
-        self.close_miss_n = 0
-        self.rgb_buf = None
-        self.rgb_shape = None
-        self.conv_logged = False
-        self.cand_why = ""
-        self.close_scale = 1
-        self.mask_logged = False
-        self.scan_dbg = ""
-        self.debug_quad = None
-        self.debug_score = 0.0
-
-    def _close_roi(self):
-        bw = bh = 0
-        if self.meas is not None:
-            bw = int(self.meas[3])
-            bh = int(self.meas[4])
-        if (bw < 20) or (bh < 20):
-            bw = bh = int(self.last_long)
-        rw = int(bw * CLOSE_ROI_K) + CLOSE_ROI_PAD
-        rh = int(bh * CLOSE_ROI_K) + CLOSE_ROI_PAD
-        x0 = int(self.u - rw)
-        y0 = int(self.v - rh)
-        if x0 < 0:
-            x0 = 0
-        if y0 < 0:
-            y0 = 0
-        x1 = int(self.u + rw)
-        y1 = int(self.v + rh)
-        if x1 > IMG_W:
-            x1 = IMG_W
-        if y1 > IMG_H:
-            y1 = IMG_H
-        return (x0, y0, x1 - x0, y1 - y0)
-
-    @staticmethod
-    def _order4(q):
-        """把四个角按左上 -> 右上 -> 右下 -> 左下排好。"""
-        cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) * 0.25
-        cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) * 0.25
-        s = sorted(q, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-        i0 = min(range(4), key=lambda i: s[i][0] + s[i][1])
-        return tuple(s[i0:] + s[:i0])
-
-    @staticmethod
-    def _mask_white(view, x, y):
-        """灰度闭运算图取点：只走单通道 get_pixel，不用 RGB 的 _PIXBUF。"""
-        try:
-            p = view.get_pixel(int(x), int(y))
-        except Exception:
-            return False
-        if p is None:
-            return False
-        try:
-            v = int(p)
-            return (v >= 128) or (v == 1)
-        except Exception:
-            pass
-        try:
-            v = int(p.item())
-            return (v >= 128) or (v == 1)
-        except Exception:
-            pass
-        try:
-            if len(p) == 1:
-                v = int(p[0])
-            else:
-                v = (int(p[0]) * 77 + int(p[1]) * 150 +
-                     int(p[2]) * 29) >> 8
-            return (v >= 128) or (v == 1)
-        except Exception:
-            return False
-
-    def _quad_metrics(self, q, strict=True):
-        """返回 (四角, 对角线交点, 长边, 短边, 四边形面积)。"""
-        c = self._order4(q)
-        if strict:
-            for p in c:
-                if (p[0] < 1) or (p[0] > IMG_W - 2) or \
-                        (p[1] < 1) or (p[1] > IMG_H - 2):
-                    self.scan_dbg = "metrics:角点越界 %r" % (c,)
-                    return None
-        qa = 0.0
-        for i in range(4):
-            x1, y1 = c[i]
-            x2, y2 = c[(i + 1) % 4]
-            qa += x1 * y2 - x2 * y1
-        qa = abs(qa) * 0.5
-        if strict and (qa < 1.0):
-            self.scan_dbg = "metrics:面积"
-            return None
-        d = []
-        for i in range(4):
-            x1, y1 = c[i]
-            x2, y2 = c[(i + 1) % 4]
-            d.append(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
-        dl1 = (d[0] + d[2]) * 0.5
-        dl2 = (d[1] + d[3]) * 0.5
-        if dl1 >= dl2:
-            long_side, short_side = dl1, dl2
-        else:
-            long_side, short_side = dl2, dl1
-        tl, tr, br, bl = c
-        d1x, d1y = br[0] - tl[0], br[1] - tl[1]
-        d2x, d2y = bl[0] - tr[0], bl[1] - tr[1]
-        den = d1x * d2y - d1y * d2x
-        if abs(den) < 1e-6:
-            ctr = ((tl[0] + br[0]) * 0.5, (tl[1] + br[1]) * 0.5)
-        else:
-            t = ((tr[0] - tl[0]) * d2y -
-                 (tr[1] - tl[1]) * d2x) / den
-            ctr = (tl[0] + t * d1x, tl[1] + t * d1y)
-        return c, ctr, long_side, max(1.0, short_side), qa
-
-    def _make_cand(self, img, bx, by, bw, bh, corners, ctr,
-                   long_side, short_side, qa, ins=None, outs=None, frac=None,
-                   sides_min=3):
-        """把一套四角过完整的近处闸门，变成 _find 的候选元组。"""
-        box_long = bw if bw > bh else bh
-        aspect = long_side / max(1.0, short_side)
-        if box_long >= QUAD_NEAR_LONG:
-            if (long_side < QUAD_NEAR_SIDE_K * box_long) or \
-                    (qa < QUAD_NEAR_FILL_K * bw * bh) or \
-                    _quad_inside_bad(corners, bx, by, bw, bh,
-                                     QUAD_NEAR_EDGE_K):
-                self.cand_why = "近边"
-                return None
-            cos_lim = CLOSE_FRAME_COS if FULL_FRAME_CLOSE \
-                else QUAD_NEAR_COS_LIM
-        else:
-            cos_lim = CLOSE_FRAME_COS if FULL_FRAME_CLOSE else 0.574
-        if _quad_angle_bad(corners, cos_lim):
-            self.cand_why = "角"
-            return None
-        if (long_side < PAPER_MIN_LONG) or \
-                (long_side > PAPER_MAX_LONG) or \
-                (aspect < PAPER_ASPECT_MIN) or \
-                (aspect > PAPER_ASPECT_MAX):
-            self.cand_why = "尺寸"
-            return None
-        if ins is None:
-            ins, outs, frac = paper_contrast(img, bx, by, bw, bh)
-        if (ins < 0) or ((ins - outs) < PAPER_CONTRAST_MIN) or \
-                (frac < PAPER_DARK_FRAC_MIN):
-            self.cand_why = "对比"
-            return None
-        sides = paper_frame_sides(img, bx, by, bw, bh, ins)
-        if sides < sides_min:
-            self.cand_why = "黑%d" % sides
-            return None
-        self.cand_why = ""
-        return (int(qa), bx, by, bw, bh, long_side, aspect,
-                1.0, ins, outs, corners, ctr[0], ctr[1])
-
-    def _scan_quad(self, view, bx, by, bw, bh, ox, oy):
-        """在闭运算白块 bbox 内扫四条外边，再拟合四边形。
-
-        bx/by/bw/bh 是闭运算 ROI 内的局部 bbox；ox/oy 是 ROI 在全图的偏移。
-        从左/右/上/下边界向里扫最外白像素，所以中心那个小黑点不会
-        像原来的“从中心出发”扫描那样把边扫描带偏。
-        """
-        self.scan_dbg = ""
-        self.debug_quad = None
-        left = []
-        right = []
-        top = []
-        bot = []
-        for k in range(1, QUAD_SCAN_N + 1):
-            yy = by + int(bh * k / float(QUAD_SCAN_N + 1))
-            xl = -1
-            xr = -1
-            for x in range(bx, bx + bw):
-                if self._mask_white(view, x, yy):
-                    xl = x
-                    break
-            for x in range(bx + bw - 1, bx - 1, -1):
-                if self._mask_white(view, x, yy):
-                    xr = x
-                    break
-            if (xl >= 0) and (xr > xl):
-                left.append((yy + oy, xl + ox))
-                right.append((yy + oy, xr + ox))
-            xx = bx + int(bw * k / float(QUAD_SCAN_N + 1))
-            yt = -1
-            yb = -1
-            for y in range(by, by + bh):
-                if self._mask_white(view, xx, y):
-                    yt = y
-                    break
-            for y in range(by + bh - 1, by - 1, -1):
-                if self._mask_white(view, xx, y):
-                    yb = y
-                    break
-            if (yt >= 0) and (yb > yt):
-                top.append((xx + ox, yt + oy))
-                bot.append((xx + ox, yb + oy))
-        if (len(left) < 3) or (len(right) < 3) or \
-                (len(top) < 3) or (len(bot) < 3):
-            self.scan_dbg = ("L%dR%dT%dB%d bbox=%d,%d,%dx%d"
-                             % (len(left), len(right), len(top), len(bot),
-                                bx, by, bw, bh))
-            return None
-        e_l = _lsq_robust(left)
-        e_r = _lsq_robust(right)
-        e_t = _lsq_robust(top)
-        e_b = _lsq_robust(bot)
-        if (e_l is None) or (e_r is None) or \
-                (e_t is None) or (e_b is None):
-            self.scan_dbg = "line"
-            return None
-        tl = _cross(e_l, e_t)
-        tr = _cross(e_r, e_t)
-        br = _cross(e_r, e_b)
-        bl = _cross(e_l, e_b)
-        if (tl is None) or (tr is None) or (br is None) or (bl is None):
-            self.scan_dbg = "cross"
-            return None
-        self.debug_quad = (tl, tr, br, bl)
-        m = self._quad_metrics((tl, tr, br, bl), strict=False)
-        if (m is None) and (not self.scan_dbg):
-            self.scan_dbg = "metrics"
-        return m
-
-    def _full_candidate(self, img):
-        """二值 mask 上按 10.13 的 _find 逻辑检测靶纸。"""
-        self.close_view = None
-        self.close_data = None
-        self.close_roi = None
-        self.close_ms = 0
-        self.quad_ms = 0
-        arr = None
-        try:
-            t0 = time.ticks_ms()
-            binary_np = None
-            try:
-                arr = img.to_numpy_ref()
-                if GRAY_DIRECT:
-                    binary_np = _cv_lite.grayscale_threshold_binary(
-                        [IMG_H, IMG_W], arr, CLOSE_BIN_TH, 255)
-                else:
-                    binary_np = _cv_lite.rgb888_threshold_binary(
-                        [IMG_H, IMG_W], arr, CLOSE_BIN_TH, 255)
-                view = image.Image(
-                    IMG_W, IMG_H, image.GRAYSCALE,
-                    alloc=image.ALLOC_REF, data=binary_np)
-            except Exception:
-                arr = None
-                try:
-                    view = img.to_grayscale(copy=True)
-                except Exception:
-                    view = img.to_grayscale()
-                view.binary([(CLOSE_BIN_TH, 255)])
-                try:
-                    view = view.to_grayscale()
-                except Exception:
-                    pass
-            view.close(CLOSE_MORPH_SIZE)
-            self.close_ms = time.ticks_diff(time.ticks_ms(), t0)
-            if (arr is not None) and (not self.mask_logged):
-                self.mask_logged = True
-                if GRAY_DIRECT:
-                    _v0 = px_luma(img, IMG_W // 2, IMG_H // 2)
-                    print("[CLOSE] 灰度直出 中心=%d" % _v0)
-                else:
-                    _v0 = px_luma_arr(arr, IMG_W // 2, IMG_H // 2)
-                    print("[CLOSE] ndarray取亮度 mode=%d 中心=%d"
-                          % (_ARR_MODE, _v0))
-            self.close_view = view
-            self.close_data = binary_np
-            self.close_roi = (0, 0, IMG_W, IMG_H)
-            self.close_scale = 1
-            t0 = time.ticks_ms()
-            blobs = view.find_blobs(
-                [(1, 255)], merge=False,
-                area_threshold=PAPER_MIN_AREA,
-                pixels_threshold=PAPER_MIN_AREA)
-        except Exception as e:
-            if not self.err_printed:
-                self.err_printed = True
-                print("全帧闭运算异常(%s)" % einfo(e))
-            return None, 0, ""
-        if not blobs:
-            self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
-            return None, 0, "[闭运算:无白块] "
-        self.cands = []
-        self.debug_quad = None
-        self.debug_score = 0.0
-        best = None
-        n = 0
-        dbg = ""
-        for b in blobs:
-            n += 1
-            x, y, w, h, px = b[0], b[1], b[2], b[3], b[4]
-            if w < 8 or h < 8:
-                continue
-            box_long = w if w > h else h
-            use_arr = (not GRAY_DIRECT) and (arr is not None)
-            ins, outs, frac = paper_contrast(
-                arr if use_arr else img, x, y, w, h, use_arr)
-            if (ins < 0) and use_arr:
-                ins, outs, frac = paper_contrast(img, x, y, w, h, False)
-            why = ""
-            corners = None
-            qa = 0.0
-            ctr = (x + w / 2.0, y + h / 2.0)
-            if self.have and (self.lost < 5):
-                _max_d = max(45.0, self.last_long * 0.55) + self.lost * 10.0
-                if abs(ctr[0] - self.u) + abs(ctr[1] - self.v) > _max_d:
-                    continue
-            if box_long < PAPER_MIN_LONG * 0.8 or \
-                    box_long > PAPER_MAX_LONG * 1.3:
-                why = "框长"
-                long_side = box_long
-                short_side = w if w < h else h
-                density = px / float(w * h)
-            else:
-                # 只扫本白块 bbox，不跨到旁边的亮块
-                q = quad_from_blob(view, x, y, w, h, 1, 0)
-                if q is not None:
-                    corners, ctr, long_side, short_side, qa = q
-                    if (qa < QUAD_AREA_LO * px) or (qa > QUAD_AREA_HI * px):
-                        corners = None
-                    elif long_side < 0.70 * box_long:
-                        corners = None
-                    elif _quad_angle_bad(corners):
-                        corners = None
-                    else:
-                        lim = 8
-                        for p in corners:
-                            if (p[0] < x - lim) or (p[0] > x + w + lim) or \
-                                    (p[1] < y - lim) or (p[1] > y + h + lim):
-                                corners = None
-                                break
-                if corners is None:
-                    long_side = box_long
-                    short_side = w if w < h else h
-                    density = px / float(w * h)
-                    dens_min = PAPER_DENSITY_MIN
-                    if (ins - outs) >= PAPER_CONTRAST_STRONG:
-                        dens_min = PAPER_DENSITY_MIN_STRONG
-                    ctr = (x + w / 2.0, y + h / 2.0)
-                else:
-                    density = px / max(1.0, qa)
-                    dens_min = PAPER_DENSITY_QUAD_MIN
-                aspect = long_side / max(1.0, short_side)
-                if px < PAPER_MIN_AREA:
-                    why = "面积"
-                elif px > PAPER_MAX_AREA_RATIO * IMG_W * IMG_H:
-                    why = "太大"
-                elif long_side < PAPER_MIN_LONG or \
-                        long_side > PAPER_MAX_LONG:
-                    why = "长边"
-                elif aspect < PAPER_ASPECT_MIN or \
-                        aspect > PAPER_ASPECT_MAX:
-                    why = "比例"
-                elif (density < dens_min) or (density > 1.08):
-                    why = "密度"
-                elif ((x <= 1) or (y <= 1) or
-                      ((x + w) >= IMG_W - 1) or ((y + h) >= IMG_H - 1)) and \
-                        (corners is None) and (box_long < 90):
-                    why = "贴边"
-                elif ins < 0 or (ins - outs) < PAPER_CONTRAST_MIN:
-                    why = "对比"
-                elif frac < PAPER_DARK_FRAC_MIN:
-                    why = "暗边"
-            if n <= 6:
-                dbg += "[%dpx 框%.0f 内%d 外%d 暗边%.0f%% 密%.2f%s%s] " % (
-                    px, box_long, ins, outs, frac * 100.0, density,
-                    ("四" if corners is not None else "框"),
-                    (" ✗" + why) if why else " ✓")
-            if len(self.cands) < 8:
-                self.cands.append((x, y, w, h, 0 if why else 1))
-            _dc = abs(ctr[0] - SPOT_UV[0]) + abs(ctr[1] - SPOT_UV[1])
-            dbg_score = px / (1.0 + _dc / 40.0)
-            if dbg_score > self.debug_score:
-                self.debug_score = dbg_score
-                if corners is not None:
-                    self.debug_quad = corners
-                else:
-                    self.debug_quad = ((x, y), (x + w, y),
-                                       (x + w, y + h), (x, y + h))
-            if why:
-                continue
-            score = px * (0.5 + min(ins - outs, 80) / 80.0)
-            score *= 0.5 + 0.5 * (density if density < 1.0 else 1.0)
-            if self.have and (self.lost < LOST_FULL) and \
-                    (self.last_long > 1.0):
-                _d = abs(ctr[0] - self.u) + abs(ctr[1] - self.v)
-                _ds = abs(long_side - self.last_long) / self.last_long
-                score *= 1.0 / (1.0 + _d / 80.0 + _ds * 2.0)
-            if self.have and (self.lost < LOST_FULL):
-                key = (0, score)
-            else:
-                key = (1 if _dc <= SPOT_PREF_PX else 0, score)
-            if best is None or key > best[0]:
-                best = (key, (px, x, y, w, h, long_side, aspect, density,
-                              ins, outs, corners, ctr[0], ctr[1]))
-        self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
-        if best is None:
-            return None, n, dbg
-        return best[1], n, dbg
-
-
-    def _near_candidate(self, img, roi):
-        """ROI 闭运算 -> 最大白块 -> 原来的四边扫描，返回候选元组。"""
-        x0, y0, rw, rh = roi
-        self.close_view = None
-        self.close_data = None
-        self.close_roi = None
-        self.close_ms = 0
-        self.quad_ms = 0
-        src = None
-        rgb = None
-        arr = None
-        closed = None
-        try:
-            t0 = time.ticks_ms()
-            src = img.crop(roi)
-            try:
-                rgb = src.to_rgb888()
-                arr = rgb.to_numpy_ref()
-                if not self.conv_logged:
-                    self.conv_logged = True
-                    print("[CLOSE] RGB888转换: to_rgb888")
-            except Exception:
-                if (self.rgb_buf is None) or (self.rgb_shape != (rw, rh)):
-                    self.rgb_buf = image.Image(rw, rh, image.RGB888)
-                    self.rgb_shape = (rw, rh)
-                src.copy_to(self.rgb_buf)
-                arr = self.rgb_buf.to_numpy_ref()
-                if not self.conv_logged:
-                    self.conv_logged = True
-                    print("[CLOSE] RGB888转换: copy_to 兜底")
-            closed = _cv_lite.rgb888_close(
-                [rh, rw], arr, CLOSE_ROI_KERNEL,
-                CLOSE_ROI_ITERS, CLOSE_ROI_TH)
-            self.close_ms = time.ticks_diff(time.ticks_ms(), t0)
-            self.close_view = image.Image(
-                rw, rh, image.GRAYSCALE,
-                alloc=image.ALLOC_REF, data=closed)
-            self.close_data = closed
-            self.close_roi = roi
-            t0 = time.ticks_ms()
-            blobs = self.close_view.find_blobs(
-                [(128, 255)], merge=False,
-                area_threshold=PAPER_MIN_AREA,
-                pixels_threshold=PAPER_MIN_AREA)
-            self.quad_ms = time.ticks_diff(time.ticks_ms(), t0)
-        except Exception as e:
-            if not self.err_printed:
-                self.err_printed = True
-                print("近处闭运算异常(%s) -> 本帧回退原检测"
-                      % einfo(e))
-            return None, 0, ""
-        if not blobs:
-            return None, 0, "[闭运算:无白块] "
-        big = []
-        lim = int(rw * rh * 0.05)
-        if lim < PAPER_MIN_AREA:
-            lim = PAPER_MIN_AREA
-        for b in blobs:
-            if int(b[4]) >= lim:
-                big.append(b)
-        if len(big) > 1:
-            return None, 0, "[闭运算:多块] "
-        blobs = big
-        if not blobs:
-            return None, 0, "[闭运算:无白块] "
-        best = None
-        n = 0
-        for b in blobs:
-            bx = int(b[0])
-            by = int(b[1])
-            bw = int(b[2])
-            bh = int(b[3])
-            if (bw < 8) or (bh < 8):
-                continue
-            q = self._scan_quad(self.close_view, bx, by, bw, bh, x0, y0)
-            if q is None:
-                continue
-            corners, ctr, long_side, short_side, qa = q
-            cand = self._make_cand(
-                img, x0 + bx, y0 + by, bw, bh, corners, ctr,
-                long_side, short_side, qa)
-            if cand is None:
-                continue
-            n += 1
-            score = qa * (0.5 + min(cand[8] - cand[9], 80) / 80.0)
-            if best is None or score > best[0]:
-                best = (score, cand)
-        if best is None:
-            return None, n, "[闭运算:四边] "
-        return best[1], n, "[闭运算+四边] "
-
-    def detect(self, img):
-        if FULL_FRAME_CLOSE:
-            self.frame += 1
-            cand, n, dbg = self._full_candidate(img)
-            self.close_dbg = dbg
-            self.last_n = n
-            self.last_dbg = dbg
-            self.did_full = True
-            if cand is None:
-                self.close_hit = False
-                self.lost += 1
-                self.state = "搜索"
-                self.close_miss_n += 1
-                if (self.close_miss_n % 20) == 1:
-                    print("[CLOSE] 全帧未命中 n=%d %s"
-                          % (n, dbg))
-                return None
-            self.close_miss_n = 0
-            if not self._size_ok(cand[5], cand[7], cand[8] - cand[9]):
-                self.last_dbg = "[全帧闭运算:尺寸闸门] "
-                self.lost += 1
-                self.state = "搜索"
-                return None
-            self.cands = [(cand[1], cand[2], cand[3], cand[4], 1)]
-            if self._accept(cand):
-                self.close_hit = True
-                return {"center": (self.u, self.v),
-                        "box": (cand[1], cand[2], cand[3], cand[4]),
-                        "area": cand[0], "aspect": cand[6],
-                        "density": cand[7], "long_side": cand[5],
-                        "contrast": cand[8] - cand[9], "n": n,
-                        "state": self.state,
-                        "corners": self.corners}
-            self.lost += 1
-            self.state = "搜索"
-            return None
-        near = USE_CLOSE_ROI and self.have and (self.lost == 0) and \
-            (self.last_long >= CLOSE_ROI_MIN_LONG)
-        if not near:
-            self.close_dbg = ""
-            self.close_view = None
-            self.close_data = None
-            self.close_roi = None
-            self.close_miss_n = 0
-        if near:
-            roi = self._close_roi()
-            cand, n, dbg = self._near_candidate(img, roi)
-            self.close_dbg = dbg
-            if cand is not None:
-                self.close_miss_n = 0
-                self.frame += 1
-                self.last_n = n
-                self.last_dbg = dbg
-                self.did_full = False
-                if not self._size_ok(cand[5], cand[7], cand[8] - cand[9]):
-                    self.last_dbg = "[近处闭运算:尺寸闸门] "
-                    self.lost += 1
-                    self.state = "搜索"
-                    return None
-                self.cands = [(cand[1], cand[2], cand[3], cand[4], 1)]
-                if self._accept(cand):
-                    self.close_hit = True
-                    return {"center": (self.u, self.v),
-                            "box": (cand[1], cand[2], cand[3], cand[4]),
-                            "area": cand[0], "aspect": cand[6],
-                            "density": cand[7], "long_side": cand[5],
-                            "contrast": cand[8] - cand[9], "n": n,
-                            "state": self.state,
-                            "corners": self.corners}
-                self.lost += 1
-                self.state = "搜索"
-                return None
-            self.close_miss_n += 1
-            if (self.close_miss_n % 20) == 1:
-                print("[CLOSE] 未命中 n=%d roi=%s %s"
-                      % (n, roi, dbg))
-            self.lost += 1
-            self.state = "搜索"
-            return None
-        self.close_hit = False
-        return PaperDetector.detect(self, img)
-
-# ============================================================================
-#  视觉：激光光斑
-# ============================================================================
-class SpotDetector(object):
-    def __init__(self):
-        self.u = IMG_W / 2.0
-        self.v = IMG_H / 2.0
-        self.learned = False
-        self.err = 0
-
-    def roi(self):
-        x0 = int(max(0, self.u - SPOT_ROI_HALF))
-        y0 = int(max(0, self.v - SPOT_ROI_HALF))
-        x1 = int(min(IMG_W, self.u + SPOT_ROI_HALF))
-        y1 = int(min(IMG_H, self.v + SPOT_ROI_HALF))
-        if x1 - x0 < 20 or y1 - y0 < 20:
-            x0, y0 = max(0, IMG_W // 2 - SPOT_ROI_HALF), \
-                max(0, IMG_H // 2 - SPOT_ROI_HALF)
-            x1, y1 = min(IMG_W, x0 + 2 * SPOT_ROI_HALF), \
-                min(IMG_H, y0 + 2 * SPOT_ROI_HALF)
-        return (x0, y0, x1 - x0, y1 - y0)
-
-    def detect(self, img):
-        try:
-            return self._detect_blobs(img)
-        except Exception as e:
-            self.err += 1
-            print("光斑检测异常: %s" % e)
-            return None
-
-    def _adapt(self, u, v):
-        if not self.learned:
-            self.u, self.v = u, v
-            self.learned = True
-            return
-        du = max(-SPOT_ADAPT_LIMIT,
-                 min(SPOT_ADAPT_LIMIT, (u - self.u) * SPOT_ADAPT_GAIN))
-        dv = max(-SPOT_ADAPT_LIMIT,
-                 min(SPOT_ADAPT_LIMIT, (v - self.v) * SPOT_ADAPT_GAIN))
-        self.u += du
-        self.v += dv
-
-    # ---- 原生 find_blobs 版（RGB565）----
-    def _detect_blobs(self, img):
-        x0, y0, w, h = self.roi()
-        best = None
-        # 两个阈值放一次调用（find_blobs 每次约 10ms 固定开销，能省则省）
-        for b in img.find_blobs(SPOT_THRESHOLDS, roi=(x0, y0, w, h),
-                                merge=True,
-                                pixels_threshold=SPOT_MIN_AREA,
-                                area_threshold=SPOT_MIN_AREA):
-            area = b[4]
-            if area < SPOT_MIN_AREA or area > SPOT_MAX_AREA:
-                continue
-            bw = b[2]
-            bh = b[3]
-            if bw < 1 or bh < 1:
-                continue
-            if max(bw, bh) * 1.0 / min(bw, bh) > SPOT_MAX_ASPECT:
-                continue
-            bx, by = norm_bbox(b[0], b[1], bw, bh, (x0, y0, w, h))
-            cx = bx + bw / 2.0
-            cy = by + bh / 2.0
-            if best is None or area > best[0]:
-                best = (area, cx, cy, (bx, by, bw, bh))
-        if best is None:
-            return None
-        area, cx, cy, rect = best
-        self._adapt(cx, cy)
-        return {"uv": (cx, cy), "area": area, "rect": rect}
-
-
-
-# ============================================================================
-#  显示 / 相机
-# ============================================================================
-def init_camera():
-    global GRAY_DIRECT
-    from media.sensor import Sensor, CAM_CHN_ID_0
-    sensor = Sensor(id=2, width=1280, height=960, fps=90)
-    sensor.reset()
-    time.sleep_ms(100)
-    apply_flip(sensor)
-    sensor.set_framesize(width=IMG_W, height=IMG_H, chn=CAM_CHN_ID_0)
-    if GRAY_DIRECT:
-        try:
-            sensor.set_pixformat(Sensor.GRAYSCALE, chn=CAM_CHN_ID_0)
-        except Exception as e:
-            GRAY_DIRECT = False
-            log("灰度直出不可用(%s) -> 回退RGB565" % einfo(e))
-            sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
     else:
-        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
-    apply_flip(sensor)
-    if EXPO_FIX:
-        # 固定曝光（关自动），和 tools/vision_check.py 里那个开关是一回事：
-        # 画面整体偏亮、纸面和白墙挤在同一个亮度带时，固定曝光能把对比度拉回来。
-        try:
-            sensor.set_auto_exposure(False, exposure_us=EXPO_US)
-            log("曝光: 固定 exposure_us=%d（自动曝光已关）" % EXPO_US)
-        except Exception as e:
-            log("固定曝光不支持(%s)，继续自动曝光" % e)
-    return sensor
+        scored_candidates = pool
+
+    best = None
+    for candidate in scored_candidates:
+        candidate_is_inner = candidate["inner"]
+        best_is_inner = best is not None and best["inner"]
+        if (
+            best is None
+            or (candidate_is_inner and not best_is_inner)
+            or (
+                candidate_is_inner == best_is_inner
+                and candidate["score"] > best["score"]
+            )
+        ):
+            best = candidate
+
+    # 最终选中的框如果仍只是 unknown，而本帧没有任何明确的 outer
+    # 候选，就按当前靶面实际检测到的内沿处理。这不改变候选选择和跟踪。
+    if best is not None and not best["inner"]:
+        has_explicit_outer = False
+        for candidate in valid_distance_candidates:
+            if candidate["layer"] == "outer":
+                has_explicit_outer = True
+                break
+        if not has_explicit_outer:
+            best["inner"] = True
+            best["layer"] = "inner"
+            refresh_candidate_distance(best)
+            bump_diagnostic(diagnostics, "forced_inner_final")
+
+    if best is not None and diagnostics is not None:
+        diagnostics["candidate_source"] = best["source"]
+        diagnostics["best_distance_cm"] = best["distance_m"] * 100.0
+
+    return best
 
 
-def apply_flip(sensor):
-    """上下/左右翻转尽量多试几种写法（不同固件的 set_vflip 签名/是否分通道不同，
-    现场实测 set_vflip(True) 有时不生效）。若最后还是倒的，就把摄像头模块整体
-    转 180° 装，并把 CAM_VFLIP 改回 False。"""
-    for kw in ({}, {"chn": 0}, {"chn": 1}):
-        try:
-            sensor.set_vflip(CAM_VFLIP, **kw)
-        except Exception:
-            pass
-        try:
-            sensor.set_hmirror(CAM_HMIRROR, **kw)
-        except Exception:
-            pass
+def _vec_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 
-def print_fpioa_state():
-    """启动时打印关键引脚功能，方便一眼确认串口引脚配对了。"""
+def _vec_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _vec_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vec_scale(a, scale):
+    return (a[0] * scale, a[1] * scale, a[2] * scale)
+
+
+def _vec_cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec_norm(a):
+    return math.sqrt(_vec_dot(a, a))
+
+
+def _vec_unit(a):
+    length = _vec_norm(a)
+    if length < 1e-10:
+        raise ValueError("degenerate vector")
+    return _vec_scale(a, 1.0 / length)
+
+
+def _solve_linear(matrix, rhs):
+    """Small Gaussian elimination used by the 8x8 target homography."""
+    count = len(rhs)
+    rows = [list(matrix[i]) + [rhs[i]] for i in range(count)]
+    for column in range(count):
+        pivot = column
+        for row in range(column + 1, count):
+            if abs(rows[row][column]) > abs(rows[pivot][column]):
+                pivot = row
+        if abs(rows[pivot][column]) < 1e-12:
+            raise ValueError("singular homography")
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        divisor = rows[column][column]
+        for index in range(column, count + 1):
+            rows[column][index] /= divisor
+        for row in range(count):
+            if row == column:
+                continue
+            factor = rows[row][column]
+            for index in range(column, count + 1):
+                rows[row][index] -= factor * rows[column][index]
+    return tuple(rows[index][count] for index in range(count))
+
+
+def _homography(source, destination):
+    matrix = []
+    rhs = []
+    for index in range(4):
+        x, y = source[index]
+        u, v = destination[index]
+        matrix.append((x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y))
+        rhs.append(u)
+        matrix.append((0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y))
+        rhs.append(v)
+    return _solve_linear(matrix, rhs) + (1.0,)
+
+
+def _transform_homography(matrix, point):
+    x, y = point
+    denominator = matrix[6] * x + matrix[7] * y + matrix[8]
+    if abs(denominator) < 1e-10:
+        raise ValueError("point at infinity")
+    return (
+        (matrix[0] * x + matrix[1] * y + matrix[2]) / denominator,
+        (matrix[3] * x + matrix[4] * y + matrix[5]) / denominator,
+    )
+
+
+def _geometry_order_quad(points):
+    if len(points) != 4:
+        raise ValueError("four corners required")
+    center_x, center_y = center_of_corners(points)
+    ordered = sorted(
+        [(float(p[0]), float(p[1])) for p in points],
+        key=lambda p: math.atan2(p[1] - center_y, p[0] - center_x),
+    )
+    start = min(
+        range(4),
+        key=lambda index: ordered[index][0] + ordered[index][1],
+    )
+    ordered = ordered[start:] + ordered[:start]
+    signs = []
+    for index in range(4):
+        a = ordered[index]
+        b = ordered[(index + 1) % 4]
+        c = ordered[(index + 2) % 4]
+        signs.append(
+            (b[0] - a[0]) * (c[1] - b[1]) -
+            (b[1] - a[1]) * (c[0] - b[0])
+        )
+    if min(signs) <= 1e-5:
+        raise ValueError("non-convex quad")
+    return tuple(ordered)
+
+
+class PoseCamera(object):
+    def __init__(self, width, height, fx, fy, cx, cy, distortion):
+        if fx <= 0.0 or fy <= 0.0 or len(distortion) != 5:
+            raise ValueError("invalid camera calibration")
+        self.width = width
+        self.height = height
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.distortion = tuple(float(value) for value in distortion)
+
+    def normalized(self, pixel):
+        xd = (pixel[0] - self.cx) / self.fx
+        yd = (pixel[1] - self.cy) / self.fy
+        x, y = xd, yd
+        k1, k2, p1, p2, k3 = self.distortion
+        for _ in range(12):
+            r2 = x * x + y * y
+            radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+            if abs(radial) < 1e-8:
+                raise ValueError("invalid distortion")
+            x = (xd - 2.0 * p1 * x * y - p2 * (r2 + 2.0 * x * x)) / radial
+            y = (yd - p1 * (r2 + 2.0 * y * y) - 2.0 * p2 * x * y) / radial
+        projected = self.project((x, y, 1.0))
+        error_x = projected[0] - pixel[0]
+        error_y = projected[1] - pixel[1]
+        if error_x * error_x + error_y * error_y > 0.0625:
+            raise ValueError("distortion did not converge")
+        return x, y
+
+    def project(self, point):
+        if point[2] <= 0.0:
+            raise ValueError("point behind camera")
+        x = point[0] / point[2]
+        y = point[1] / point[2]
+        r2 = x * x + y * y
+        k1, k2, p1, p2, k3 = self.distortion
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        return (
+            self.fx * (
+                x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+            ) + self.cx,
+            self.fy * (
+                y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+            ) + self.cy,
+        )
+
+
+class TargetPlanePose(object):
+    def __init__(self, r1, r2, translation):
+        self.r1 = r1
+        self.r2 = r2
+        self.translation = translation
+        self.normal = _vec_unit(_vec_cross(r1, r2))
+
+    def camera_point(self, plane_point):
+        return _vec_add(
+            self.translation,
+            _vec_add(
+                _vec_scale(self.r1, plane_point[0]),
+                _vec_scale(self.r2, plane_point[1]),
+            ),
+        )
+
+    def plane_point(self, camera_point):
+        relative = _vec_sub(camera_point, self.translation)
+        return (
+            _vec_dot(relative, self.r1),
+            _vec_dot(relative, self.r2),
+        )
+
+    def intersection(self, origin, direction):
+        denominator = _vec_dot(self.normal, direction)
+        if abs(denominator) < 1e-8:
+            raise ValueError("ray parallel to target")
+        distance = (
+            _vec_dot(self.normal, _vec_sub(self.translation, origin)) /
+            denominator
+        )
+        if distance <= 0.0:
+            raise ValueError("intersection behind ray")
+        return _vec_add(origin, _vec_scale(direction, distance))
+
+
+def _rotate_axis_angle(axis_angle, vector):
+    angle = _vec_norm(axis_angle)
+    if angle < 1e-12:
+        return _vec_add(vector, _vec_cross(axis_angle, vector))
+    axis = _vec_scale(axis_angle, 1.0 / angle)
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    return _vec_add(
+        _vec_add(
+            _vec_scale(vector, cosine),
+            _vec_scale(_vec_cross(axis, vector), sine),
+        ),
+        _vec_scale(axis, _vec_dot(axis, vector) * (1.0 - cosine)),
+    )
+
+
+def _pose_with_delta(pose, delta):
+    rotation = delta[:3]
+    translation_delta = delta[3:]
+    return TargetPlanePose(
+        _rotate_axis_angle(rotation, pose.r1),
+        _rotate_axis_angle(rotation, pose.r2),
+        _vec_add(pose.translation, translation_delta),
+    )
+
+
+def _pose_normalized_residuals(pose, plane, normalized, fx, fy):
+    residuals = []
+    for index in range(4):
+        plane_point = plane[index]
+        normalized_point = normalized[index]
+        camera_point = pose.camera_point(plane_point)
+        if camera_point[2] <= 0.0:
+            raise ValueError("point behind camera")
+        residuals.append(
+            fx * (
+                camera_point[0] / camera_point[2] -
+                normalized_point[0]
+            )
+        )
+        residuals.append(
+            fy * (
+                camera_point[1] / camera_point[2] -
+                normalized_point[1]
+            )
+        )
+    return residuals
+
+
+def _refine_target_pose(pose, plane, normalized, fx, fy, iterations):
+    """Reference-project Gauss-Newton refinement in undistorted coordinates."""
     try:
-        from machine import FPIOA
-        fp = FPIOA()
-        out = []
-        for pin in (9, 10, 32, 33):
+        residuals = _pose_normalized_residuals(
+            pose, plane, normalized, fx, fy
+        )
+    except ValueError:
+        return pose
+    cost = sum(value * value for value in residuals)
+
+    for _ in range(iterations):
+        jtj = [[0.0] * 6 for _ in range(6)]
+        jtr = [0.0] * 6
+        for index in range(4):
+            plane_x, plane_y = plane[index]
+            rotation_point = _vec_add(
+                _vec_scale(pose.r1, plane_x),
+                _vec_scale(pose.r2, plane_y),
+            )
+            camera_point = _vec_add(rotation_point, pose.translation)
+            x_value, y_value, z_value = camera_point
+            inverse_z = 1.0 / z_value
+            ax = inverse_z
+            az = -x_value * inverse_z * inverse_z
+            by = inverse_z
+            bz = -y_value * inverse_z * inverse_z
+
+            ju = (
+                fx * az * rotation_point[1],
+                fx * (ax * rotation_point[2] - az * rotation_point[0]),
+                -fx * ax * rotation_point[1],
+                fx * ax,
+                0.0,
+                fx * az,
+            )
+            jv = (
+                fy * (bz * rotation_point[1] - by * rotation_point[2]),
+                -fy * bz * rotation_point[0],
+                fy * by * rotation_point[0],
+                0.0,
+                fy * by,
+                fy * bz,
+            )
+            for row, residual in (
+                (ju, residuals[index * 2]),
+                (jv, residuals[index * 2 + 1]),
+            ):
+                for row_index in range(6):
+                    jtr[row_index] += row[row_index] * residual
+                    for column_index in range(row_index, 6):
+                        jtj[row_index][column_index] += (
+                            row[row_index] * row[column_index]
+                        )
+
+        for row_index in range(6):
+            for column_index in range(row_index):
+                jtj[row_index][column_index] = jtj[column_index][row_index]
+
+        improved = False
+        damping = 0.0
+        for _attempt in range(4):
+            system = []
+            for row_index in range(6):
+                row = []
+                for column_index in range(6):
+                    value = jtj[row_index][column_index]
+                    if row_index == column_index:
+                        value += damping * jtj[row_index][row_index]
+                    row.append(value)
+                system.append(row)
             try:
-                out.append("IO%d=%s" % (pin, fp.get_pin_func(pin)))
-            except Exception:
-                out.append("IO%d=?" % pin)
-        print("引脚功能: %s" % " ".join(out))
+                delta = _solve_linear(
+                    system,
+                    [-value for value in jtr],
+                )
+                candidate = _pose_with_delta(pose, delta)
+                candidate_residuals = _pose_normalized_residuals(
+                    candidate, plane, normalized, fx, fy
+                )
+            except ValueError:
+                damping = damping * 10.0 if damping else 1e-3
+                continue
+            candidate_cost = sum(
+                value * value for value in candidate_residuals
+            )
+            if candidate_cost < cost:
+                converged = candidate_cost > cost * 0.999
+                pose = candidate
+                residuals = candidate_residuals
+                cost = candidate_cost
+                improved = True
+                break
+            damping = damping * 10.0 if damping else 1e-3
+        if not improved or converged or cost < 1e-6:
+            break
+    return pose
+
+
+def _estimate_target_pose(corners, camera, width_mm, height_mm):
+    ordered = _geometry_order_quad(corners)
+    plane = (
+        (0.0, 0.0),
+        (width_mm, 0.0),
+        (width_mm, height_mm),
+        (0.0, height_mm),
+    )
+    normalized = [camera.normalized(point) for point in ordered]
+    matrix = _homography(plane, normalized)
+    column1 = (matrix[0], matrix[3], matrix[6])
+    column2 = (matrix[1], matrix[4], matrix[7])
+    column3 = (matrix[2], matrix[5], matrix[8])
+    norm1 = _vec_norm(column1)
+    norm2 = _vec_norm(column2)
+    if min(norm1, norm2) < 1e-10:
+        raise ValueError("degenerate target pose")
+    if abs(norm1 - norm2) / max(norm1, norm2) > 0.30:
+        raise ValueError("inconsistent target dimensions")
+    factor = 2.0 / (norm1 + norm2)
+    if column3[2] < 0.0:
+        factor = -factor
+    r1 = _vec_unit(_vec_scale(column1, factor))
+    raw2 = _vec_scale(column2, factor)
+    r2 = _vec_unit(_vec_sub(raw2, _vec_scale(r1, _vec_dot(r1, raw2))))
+    pose = TargetPlanePose(r1, r2, _vec_scale(column3, factor))
+    residual = 0.0
+    for plane_point, image_point in zip(plane, ordered):
+        projected = camera.project(pose.camera_point(plane_point))
+        dx = projected[0] - image_point[0]
+        dy = projected[1] - image_point[1]
+        residual = max(residual, math.sqrt(dx * dx + dy * dy))
+    diagonal = max(
+        math.sqrt(
+            (ordered[0][0] - ordered[2][0]) ** 2 +
+            (ordered[0][1] - ordered[2][1]) ** 2
+        ),
+        math.sqrt(
+            (ordered[1][0] - ordered[3][0]) ** 2 +
+            (ordered[1][1] - ordered[3][1]) ** 2
+        ),
+    )
+    refined = False
+    if residual > GEOMETRY_REFINE_TRIGGER_PX:
+        pose = _refine_target_pose(
+            pose,
+            plane,
+            normalized,
+            camera.fx,
+            camera.fy,
+            GEOMETRY_REFINE_ITERATIONS,
+        )
+        residual = 0.0
+        for plane_point, image_point in zip(plane, ordered):
+            projected = camera.project(pose.camera_point(plane_point))
+            dx = projected[0] - image_point[0]
+            dy = projected[1] - image_point[1]
+            residual = max(residual, math.sqrt(dx * dx + dy * dy))
+        refined = True
+    gate = min(
+        GEOMETRY_MAX_REPROJECTION_CAP_PX,
+        max(
+            GEOMETRY_MAX_REPROJECTION_PX,
+            GEOMETRY_REPROJECTION_FRACTION * diagonal,
+        ),
+    )
+    if residual > gate:
+        raise ValueError("pose residual {:.1f}px".format(residual))
+    return pose, residual, ordered, refined
+
+
+def _aim_solution(pose, laser_origin, laser_direction, target_mm):
+    direction = _vec_unit(laser_direction)
+    hit = pose.intersection(laser_origin, direction)
+    hit_mm = pose.plane_point(hit)
+    target_camera = pose.camera_point(target_mm)
+    desired = _vec_sub(target_camera, laser_origin)
+    if desired[2] <= 0.0 or direction[2] <= 0.0:
+        raise ValueError("target or laser behind camera")
+    yaw = (
+        math.atan2(desired[0], desired[2]) -
+        math.atan2(direction[0], direction[2])
+    )
+    pitch = (
+        math.atan2(
+            desired[1],
+            math.sqrt(desired[0] * desired[0] + desired[2] * desired[2]),
+        ) -
+        math.atan2(
+            direction[1],
+            math.sqrt(
+                direction[0] * direction[0] +
+                direction[2] * direction[2]
+            ),
+        )
+    )
+    return {
+        "yaw_deg": math.degrees(yaw),
+        "pitch_deg": math.degrees(pitch),
+        "hit_mm": hit_mm,
+        "target_mm": target_mm,
+        "error_mm": (target_mm[0] - hit_mm[0], target_mm[1] - hit_mm[1]),
+        "depth_mm": target_camera[2],
+    }
+
+
+def _geometry_reject_code(message):
+    message = str(message)
+    if "pose residual" in message:
+        return 4
+    if (
+        "inconsistent target dimensions" in message
+        or "degenerate target pose" in message
+        or "singular homography" in message
+        or "ray parallel" in message
+        or "intersection behind" in message
+        or "point behind camera" in message
+    ):
+        return 5
+    if "distortion" in message:
+        return 6
+    if "tilt" in message:
+        return 7
+    if "depth" in message:
+        return 8
+    if "angular error" in message or "target or laser behind" in message:
+        return 9
+    if "four corners" in message or "non-convex" in message:
+        return 10
+    return 3
+
+
+def _load_calibration():
+    camera_values = CAMERA_CALIBRATION
+    origin = LASER_ORIGIN_MM
+    direction = _vec_unit(LASER_DIRECTION)
+    if USE_CAMERA_JSON_CALIBRATION or USE_LASER_JSON_CALIBRATION:
+        try:
+            with open(CALIBRATION_JSON_PATH, "r") as stream:
+                data = json.load(stream)
+            camera = data["camera"]
+            laser = data["laser"]
+            if USE_CAMERA_JSON_CALIBRATION:
+                if camera.get("calibrated") is not True:
+                    raise ValueError("camera not calibrated")
+                if (camera.get("width"), camera.get("height")) != (
+                    FRAME_WIDTH, FRAME_HEIGHT
+                ):
+                    raise ValueError("calibration resolution mismatch")
+                camera_values = {
+                    "fx": float(camera["fx"]),
+                    "fy": float(camera["fy"]),
+                    "cx": float(camera["cx"]),
+                    "cy": float(camera["cy"]),
+                    "distortion": tuple(
+                        camera.get("distortion", (0,) * 5)
+                    ),
+                }
+            if (
+                USE_LASER_JSON_CALIBRATION
+                and laser.get("calibrated") is True
+            ):
+                origin = tuple(float(value) for value in laser["origin_mm"])
+                direction = _vec_unit(tuple(
+                    float(value) for value in laser["direction"]
+                ))
+            print("[GEOM] calibration.json loaded")
+        except Exception as exc:
+            print("[GEOM] calibration fallback:", exc)
+    camera = PoseCamera(
+        FRAME_WIDTH,
+        FRAME_HEIGHT,
+        camera_values["fx"],
+        camera_values["fy"],
+        camera_values["cx"],
+        camera_values["cy"],
+        camera_values["distortion"],
+    )
+    print(
+        "[GEOM] laser origin=%s direction=%s" % (origin, direction)
+    )
+    return camera, origin, direction
+
+
+def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
+    if np is None:
+        return None, "spot_disabled"
+    if hasattr(gray, "to_numpy_ref"):
+        gray = gray.to_numpy_ref()
+    height = gray.shape[0]
+    width = gray.shape[1]
+    to_image = _homography(
+        ((0.0, 0.0), (width_mm, 0.0),
+         (width_mm, height_mm), (0.0, height_mm)),
+        corners,
+    )
+    x_min = inset_mm
+    y_min = inset_mm
+    x_max = width_mm - inset_mm
+    y_max = height_mm - inset_mm
+    quad = [
+        _transform_homography(to_image, point)
+        for point in (
+            (x_min, y_min), (x_max, y_min),
+            (x_max, y_max), (x_min, y_max),
+        )
+    ]
+    x0 = max(0, int(min(point[0] for point in quad)) + 1)
+    x1 = min(width, int(max(point[0] for point in quad)))
+    y0 = max(0, int(min(point[1] for point in quad)) + 1)
+    y1 = min(height, int(max(point[1] for point in quad)))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None, "spot_roi_small"
+
+    roi = gray[y0:y1, x0:x1]
+    peak_index = int(np.argmax(roi))
+    peak_y = peak_index // (x1 - x0)
+    peak_x = peak_index % (x1 - x0)
+    peak = float(roi[peak_y, peak_x])
+    if peak < SPOT_MIN_PEAK or peak - float(np.mean(roi)) < SPOT_MIN_CONTRAST:
+        return None, "spot_dim"
+
+    radius = SPOT_WINDOW_PX
+    wy0 = max(0, peak_y - radius)
+    wy1 = min(y1 - y0, peak_y + radius + 1)
+    wx0 = max(0, peak_x - radius)
+    wx1 = min(x1 - x0, peak_x + radius + 1)
+    core = np.clip(
+        np.array(
+            roi[wy0:wy1, wx0:wx1],
+            dtype=np.float32,
+        ) - (peak - SPOT_CORE_DROP),
+        0,
+        255,
+    )
+    strongest = float(np.max(core))
+    border = max(
+        float(np.max(core[0, :])),
+        float(np.max(core[-1, :])),
+        float(np.max(core[:, 0])),
+        float(np.max(core[:, -1])),
+    )
+    if strongest <= 0.0 or border > SPOT_BORDER_FRACTION * strongest:
+        return None, "spot_too_large"
+    rows = np.sum(core, axis=1)
+    columns = np.sum(core, axis=0)
+    total = float(np.sum(rows))
+    if total <= 0.0:
+        return None, "spot_empty"
+    center_y = 0.0
+    center_x = 0.0
+    for index in range(len(rows)):
+        center_y += index * float(rows[index])
+    for index in range(len(columns)):
+        center_x += index * float(columns[index])
+    return (
+        (
+            x0 + wx0 + center_x / total,
+            y0 + wy0 + center_y / total,
+        ),
+        "spot_ok",
+    )
+
+
+def _fit_line_tls(points):
+    count = len(points)
+    if count < 3:
+        return None
+    mean_x = sum(point[0] for point in points) / count
+    mean_y = sum(point[1] for point in points) / count
+    sxx = sum((point[0] - mean_x) ** 2 for point in points)
+    syy = sum((point[1] - mean_y) ** 2 for point in points)
+    sxy = sum(
+        (point[0] - mean_x) * (point[1] - mean_y)
+        for point in points
+    )
+    if sxx + syy < 1e-9:
+        return None
+    angle = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+    return (mean_x, mean_y), (math.cos(angle), math.sin(angle))
+
+
+def _intersect_fitted_lines(first, second):
+    (px, py), (dx, dy) = first
+    (qx, qy), (ex, ey) = second
+    denominator = dx * ey - dy * ex
+    if abs(denominator) < 1e-6:
+        return None
+    distance = ((qx - px) * ey - (qy - py) * ex) / denominator
+    return (px + distance * dx, py + distance * dy)
+
+
+def refine_geometry_corners(img, corners):
+    """Refine only the final selected quad for pose input; tracker data stays unchanged."""
+    if not GEOMETRY_CORNER_REFINE_ENABLED:
+        return corners, False, 0.0
+    try:
+        ordered = _geometry_order_quad(corners)
     except Exception:
+        return corners, False, 0.0
+
+    fitted_sides = []
+    for side_index in range(4):
+        first = ordered[side_index]
+        second = ordered[(side_index + 1) % 4]
+        edge_x = second[0] - first[0]
+        edge_y = second[1] - first[1]
+        edge_length = math.sqrt(edge_x * edge_x + edge_y * edge_y)
+        if edge_length < 12.0:
+            return ordered, False, 0.0
+        unit_x = edge_x / edge_length
+        unit_y = edge_y / edge_length
+        normal_x = -unit_y
+        normal_y = unit_x
+        samples = []
+        for sample_index in range(1, GEOMETRY_CORNER_SAMPLES + 1):
+            fraction = sample_index / (GEOMETRY_CORNER_SAMPLES + 1.0)
+            base_x = first[0] + edge_x * fraction
+            base_y = first[1] + edge_y * fraction
+            best_offset = None
+            best_gradient = -1.0
+            for offset in range(
+                -GEOMETRY_CORNER_SEARCH_PX,
+                GEOMETRY_CORNER_SEARCH_PX + 1,
+            ):
+                center_x = int(round(base_x + normal_x * offset))
+                center_y = int(round(base_y + normal_y * offset))
+                before_x = int(round(
+                    base_x + normal_x * (offset - 1.0)
+                ))
+                before_y = int(round(
+                    base_y + normal_y * (offset - 1.0)
+                ))
+                after_x = int(round(
+                    base_x + normal_x * (offset + 1.0)
+                ))
+                after_y = int(round(
+                    base_y + normal_y * (offset + 1.0)
+                ))
+                if (
+                    center_x < 0 or center_x >= FRAME_WIDTH or
+                    center_y < 0 or center_y >= FRAME_HEIGHT or
+                    before_x < 0 or before_x >= FRAME_WIDTH or
+                    before_y < 0 or before_y >= FRAME_HEIGHT or
+                    after_x < 0 or after_x >= FRAME_WIDTH or
+                    after_y < 0 or after_y >= FRAME_HEIGHT
+                ):
+                    continue
+                gradient = abs(
+                    get_gray_value(img, after_x, after_y) -
+                    get_gray_value(img, before_x, before_y)
+                )
+                if gradient > best_gradient:
+                    best_gradient = gradient
+                    best_offset = offset
+            if best_offset is not None and best_gradient >= 8.0:
+                samples.append((
+                    base_x + normal_x * best_offset,
+                    base_y + normal_y * best_offset,
+                ))
+        line = _fit_line_tls(samples)
+        if line is None:
+            line = (first, (unit_x, unit_y))
+        fitted_sides.append(line)
+
+    refined = []
+    max_shift = 0.0
+    for corner_index in range(4):
+        corner = _intersect_fitted_lines(
+            fitted_sides[(corner_index - 1) % 4],
+            fitted_sides[corner_index],
+        )
+        original = ordered[corner_index]
+        if corner is None:
+            refined.append(original)
+            continue
+        shift = math.sqrt(
+            (corner[0] - original[0]) ** 2 +
+            (corner[1] - original[1]) ** 2
+        )
+        if shift > GEOMETRY_CORNER_MAX_SHIFT_PX:
+            refined.append(original)
+        else:
+            refined.append(corner)
+            max_shift = max(max_shift, shift)
+
+    # Keep the same winding and reject a refinement that made the quad concave.
+    signs = []
+    for index in range(4):
+        a = refined[index]
+        b = refined[(index + 1) % 4]
+        c = refined[(index + 2) % 4]
+        signs.append(
+            (b[0] - a[0]) * (c[1] - b[1]) -
+            (b[1] - a[1]) * (c[0] - b[0])
+        )
+    if min(signs) <= 1e-5 or max(signs) <= 1e-5:
+        return ordered, False, 0.0
+    return tuple(refined), True, max_shift
+
+
+class PlanarLaserAimer(object):
+    def __init__(self):
+        self.camera, self.origin, self.direction = _load_calibration()
+        self.correction = (0.0, 0.0, 0.0)
+        self.valid_frames = 0
+        self.spot_status = "spot_wait"
+
+    def corrected_direction(self):
+        if self.correction == (0.0, 0.0, 0.0):
+            return self.direction
+        return _vec_unit(_vec_add(self.direction, self.correction))
+
+    def correction_deg(self):
+        if self.correction == (0.0, 0.0, 0.0):
+            return 0.0, 0.0
+        corrected = self.corrected_direction()
+        return (
+            math.degrees(
+                math.atan2(corrected[0], corrected[2]) -
+                math.atan2(self.direction[0], self.direction[2])
+            ),
+            math.degrees(
+                math.atan2(corrected[1], corrected[2]) -
+                math.atan2(self.direction[1], self.direction[2])
+            ),
+        )
+
+    def _update_spot(self, gray, corners, pose, width_mm, height_mm, inset_mm):
+        point, status = _find_laser_spot(
+            gray, corners, width_mm, height_mm, inset_mm
+        )
+        if point is None:
+            self.spot_status = status
+            return
+        normalized = self.camera.normalized(point)
+        hit = pose.intersection(
+            (0.0, 0.0, 0.0),
+            (normalized[0], normalized[1], 1.0),
+        )
+        observed = _vec_unit(_vec_sub(hit, self.origin))
+        current = self.corrected_direction()
+        angle = math.degrees(math.acos(max(
+            -1.0, min(1.0, _vec_dot(observed, current))
+        )))
+        if angle > SPOT_GATE_DEG:
+            self.spot_status = "spot_gated"
+            return
+        wanted = _vec_sub(observed, self.direction)
+        step = _vec_scale(
+            _vec_sub(wanted, self.correction),
+            SPOT_CORRECTION_ALPHA,
+        )
+        correction = _vec_add(self.correction, step)
+        limit = math.radians(SPOT_MAX_CORRECTION_DEG)
+        size = _vec_norm(correction)
+        if size > limit:
+            correction = _vec_scale(correction, limit / size)
+        self.correction = correction
+        self.spot_status = "spot_ok"
+
+    def solve(self, target, gray):
+        corners = target.get("corners")
+        if corners is None or len(corners) != 4:
+            return None
+        is_inner = bool(target.get("inner"))
+        if is_inner:
+            width_mm = (
+                TARGET_OUTER_WIDTH_M - 2.0 * BLACK_BORDER_WIDTH_M
+            ) * 1000.0
+            height_mm = (
+                TARGET_OUTER_HEIGHT_M - 2.0 * BLACK_BORDER_WIDTH_M
+            ) * 1000.0
+            spot_inset_mm = SPOT_PAPER_MARGIN_MM
+        else:
+            width_mm = TARGET_OUTER_WIDTH_M * 1000.0
+            height_mm = TARGET_OUTER_HEIGHT_M * 1000.0
+            spot_inset_mm = BLACK_BORDER_WIDTH_M * 1000.0 + SPOT_PAPER_MARGIN_MM
+
+        pose, residual, ordered, pose_refined = _estimate_target_pose(
+            corners, self.camera, width_mm, height_mm
+        )
+        tilt = math.degrees(math.acos(max(
+            -1.0, min(1.0, pose.normal[2])
+        )))
+        if tilt > GEOMETRY_MAX_TILT_DEG:
+            raise ValueError("target tilt too large")
+        target_mm = (width_mm * 0.5, height_mm * 0.5)
+        solution = _aim_solution(
+            pose, self.origin, self.corrected_direction(), target_mm
+        )
+        if not (
+            GEOMETRY_MIN_DEPTH_MM <=
+            solution["depth_mm"] <=
+            GEOMETRY_MAX_DEPTH_MM
+        ):
+            raise ValueError("target depth out of range")
+        if max(
+            abs(solution["yaw_deg"]), abs(solution["pitch_deg"])
+        ) > GEOMETRY_MAX_COMMAND_DEG:
+            raise ValueError("angular error out of range")
+
+        hit_camera = pose.intersection(
+            self.origin, self.corrected_direction()
+        )
+        predicted_pixel = self.camera.project(hit_camera)
+        self.valid_frames += 1
+        if (
+            SPOT_CORRECTION_ENABLED
+            and self.valid_frames % SPOT_CORRECTION_EVERY == 0
+        ):
+            try:
+                self._update_spot(
+                    gray,
+                    ordered,
+                    pose,
+                    width_mm,
+                    height_mm,
+                    spot_inset_mm,
+                )
+            except Exception as exc:
+                self.spot_status = "spot_disabled:" + str(exc)
+
+        correction_yaw, correction_pitch = self.correction_deg()
+        solution.update({
+            "laser_uv": predicted_pixel,
+            "reprojection_px": residual,
+            "pose_refined": pose_refined,
+            "tilt_deg": tilt,
+            "spot_status": self.spot_status,
+            "correction_yaw_deg": correction_yaw,
+            "correction_pitch_deg": correction_pitch,
+        })
+        return solution
+
+
+# ---------------------------------------------------------------------------
+# 检测器。
+# ---------------------------------------------------------------------------
+
+
+def detect_with_cv_lite(
+    img,
+    profile,
+    diagnostics=None,
+    detection_roi=None,
+    min_white_ratio=ACQUIRE_MIN_WHITE_RATIO,
+    reference=None,
+    raw_rectangles=None,
+):
+    if not USE_CV_LITE or cv_lite is None:
+        return []
+
+    crop_start_ms = time.ticks_ms()
+    detection_img, offset_x, offset_y = crop_for_detection(img, detection_roi)
+    if detection_roi is None or detection_img is img:
+        detection_width = FRAME_WIDTH
+        detection_height = FRAME_HEIGHT
+    else:
+        detection_width = detection_roi[2]
+        detection_height = detection_roi[3]
+
+    try:
+        image_shape = [detection_height, detection_width]
+        image_np = detection_img.to_numpy_ref()
+        if diagnostics is not None:
+            diagnostics["crop_ms"] += float(
+                time.ticks_diff(time.ticks_ms(), crop_start_ms)
+            )
+        cv_start_ms = time.ticks_ms()
+        rectangles = cv_lite.grayscale_find_rectangles_with_corners(
+            image_shape,
+            image_np,
+            profile["canny_low"],
+            profile["canny_high"],
+            APPROX_EPSILON,
+            AREA_MIN_RATIO,
+            MAX_ANGLE_COS,
+            GAUSSIAN_BLUR,
+        )
+        if diagnostics is not None:
+            diagnostics["cv_ms"] += float(
+                time.ticks_diff(time.ticks_ms(), cv_start_ms)
+            )
+    except Exception:
+        return []
+
+    bump_diagnostic(diagnostics, "cv_lite_raw", len(rectangles))
+    candidates = []
+    cand_start_ms = time.ticks_ms()
+    for rect in rectangles:
+        if len(rect) < 12:
+            continue
+
+        corners = [
+            (rect[4] + offset_x, rect[5] + offset_y),
+            (rect[6] + offset_x, rect[7] + offset_y),
+            (rect[8] + offset_x, rect[9] + offset_y),
+            (rect[10] + offset_x, rect[11] + offset_y),
+        ]
+        if raw_rectangles is not None:
+            raw_rectangles.append(tuple(corners))
+        # 在开销较大的 build_candidate 之前先按中心距离筛选，
+        # 仅用于已经大致知道目标位置的跟踪模式。
+        if reference is not None:
+            gate = TRACK_CANDIDATE_GATE_FACTOR * max(
+                1.0, float(reference["w"]), float(reference["h"])
+            )
+            quad_cx = (corners[0][0] + corners[2][0]) * 0.5
+            quad_cy = (corners[0][1] + corners[2][1]) * 0.5
+            if (
+                abs(quad_cx - reference["cx"]) > gate
+                or abs(quad_cy - reference["cy"]) > gate
+            ):
+                bump_diagnostic(diagnostics, "candidate_gate")
+                continue
+        candidate = build_candidate(
+            img,
+            corners,
+            profile,
+            "cv_lite",
+            diagnostics,
+            min_white_ratio,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    if diagnostics is not None:
+        diagnostics["cand_ms"] += float(
+            time.ticks_diff(time.ticks_ms(), cand_start_ms)
+        )
+    bump_diagnostic(diagnostics, "cv_lite_count", len(candidates))
+    return candidates
+
+
+def detect_candidates(
+    img,
+    profile,
+    detection_mode,
+    diagnostics=None,
+    detection_roi=None,
+    high_res_img=None,
+    frame_count=0,
+    reference=None,
+    raw_rectangles=None,
+):
+    min_white_ratio = ACQUIRE_MIN_WHITE_RATIO
+    if detection_mode in ("track", "recapture_roi"):
+        min_white_ratio = TRACK_MIN_WHITE_RATIO
+
+    cv_lite_candidates = detect_with_cv_lite(
+        img,
+        profile,
+        diagnostics,
+        detection_roi,
+        min_white_ratio,
+        reference if detection_mode == "track" else None,
+        raw_rectangles,
+    )
+
+    candidates = cv_lite_candidates
+
+    # 所有检测状态统一使用 cv_lite。
+    if detection_mode in ("search", "recapture_full"):
+        if (
+            detection_mode == "recapture_full"
+            and not candidates
+            and LIGHT_FALLBACK_ENABLED
+        ):
+            bump_diagnostic(diagnostics, "light_fallback")
+            fallback_profile = make_light_fallback_profile(profile)
+            fallback_cv = detect_with_cv_lite(
+                img,
+                fallback_profile,
+                diagnostics,
+                detection_roi,
+                min_white_ratio,
+            )
+            for candidate in fallback_cv:
+                candidate["source"] = "cv_lite_fallback"
+            candidates = fallback_cv
+
+    if not candidates and detection_mode in ("search", "recapture_full"):
+    # 先执行远距离检测：在当前 640x480 画面上使用较低 Canny 阈值
+        # 成本较低，适合检测 2 到 3 像素宽的边框。
+        if frame_count % HIGH_RES_SEARCH_EVERY_N_FRAMES == 0:
+            bump_diagnostic(diagnostics, "long_range_search")
+            long_profile = make_long_range_profile(profile)
+            long_cv = detect_with_cv_lite(
+                img,
+                long_profile,
+                diagnostics,
+                detection_roi,
+                min_white_ratio,
+            )
+            for candidate in long_cv:
+                candidate["source"] = "cv_lite_long"
+            candidates = long_cv
+            if candidates:
+                bump_diagnostic(diagnostics, "long_range_hit")
+
+    if not candidates and detection_mode in ("search", "recapture_full"):
+        candidates = detect_high_res_search(
+            img,
+            high_res_img,
+            profile,
+            diagnostics,
+            frame_count,
+        )
+
+    if diagnostics is not None:
+        diagnostics["candidate_count"] = len(candidates)
+    return candidates
+
+
+def detect_high_res_search(
+    low_img,
+    high_res_img,
+    profile,
+    diagnostics=None,
+    frame_count=0,
+):
+    """在 640x480 通道上执行一次 cv_lite 全图检测。
+
+    这是全图搜索的最后手段。160 厘米处 2 厘米黑框在 640x480 画面中
+    约 4.8 像素宽；检测后会将角点换算回当前 640x480 检测坐标系再进行评分，
+    因此跟踪器、距离模型和显示缩放均保持不变。
+    """
+    if not HIGH_RES_SEARCH_ENABLED or cv_lite is None or high_res_img is None:
+        return []
+
+    if frame_count % HIGH_RES_SEARCH_EVERY_N_FRAMES != 0:
+        return []
+
+    bump_diagnostic(diagnostics, "hi_res_search")
+    scale_x = HIGH_RES_WIDTH / FRAME_WIDTH
+    scale_y = HIGH_RES_HEIGHT / FRAME_HEIGHT
+
+    try:
+        high_res_gray = high_res_img.to_grayscale()
+        rectangles = cv_lite.grayscale_find_rectangles_with_corners(
+            [HIGH_RES_HEIGHT, HIGH_RES_WIDTH],
+            high_res_gray.to_numpy_ref(),
+            profile["canny_low"],
+            profile["canny_high"],
+            APPROX_EPSILON,
+            AREA_MIN_RATIO,
+            MAX_ANGLE_COS,
+            GAUSSIAN_BLUR,
+        )
+    except Exception:
+        bump_diagnostic(diagnostics, "hi_res_error")
+        return []
+
+    bump_diagnostic(diagnostics, "hi_res_raw", len(rectangles))
+    candidates = []
+    for rect in rectangles:
+        if len(rect) < 12:
+            continue
+
+        corners = []
+        for index in range(4):
+            corner_index = 4 + index * 2
+            corners.append(
+                (
+                    rect[corner_index] / scale_x,
+                    rect[corner_index + 1] / scale_y,
+                )
+            )
+
+        # 此调用不记录诊断信息，使低分辨率筛选计数
+        # 在运行日志中保持单一且明确的含义。
+        candidate = build_candidate(
+            low_img,
+            corners,
+            profile,
+            "high_res_search",
+            None,
+            ACQUIRE_MIN_WHITE_RATIO,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    if candidates:
+        bump_diagnostic(diagnostics, "hi_res_hit")
+
+    return candidates
+
+
+def should_refine_high_res(candidate, detection_mode, frame_count):
+    if not HIGH_RES_VERIFY_ENABLED:
+        return False
+    if detection_mode == "track" and frame_count % HIGH_RES_VERIFY_EVERY_N_FRAMES != 0:
+        return False
+
+    return (
+        candidate["w"] < HIGH_RES_VERIFY_MIN_WIDTH
+        or candidate["distance_m"] > HIGH_RES_VERIFY_DISTANCE_M
+        or candidate["dark_border"] < MIN_DARK_BORDER_RATIO
+    )
+
+
+def refine_candidates_with_high_res(
+    low_img,
+    high_res_img,
+    candidates,
+    profile,
+    diagnostics,
+    detection_mode,
+    frame_count,
+):
+    if (
+        not HIGH_RES_VERIFY_ENABLED
+        or high_res_img is None
+        or cv_lite is None
+        or not candidates
+    ):
+        return candidates
+
+    scale_x = HIGH_RES_WIDTH / FRAME_WIDTH
+    scale_y = HIGH_RES_HEIGHT / FRAME_HEIGHT
+    min_white_ratio = ACQUIRE_MIN_WHITE_RATIO
+    if detection_mode in ("track", "recapture_roi"):
+        min_white_ratio = TRACK_MIN_WHITE_RATIO
+
+    refined = []
+    for candidate in candidates:
+        if not should_refine_high_res(candidate, detection_mode, frame_count):
+            refined.append(candidate)
+            continue
+
+        bump_diagnostic(diagnostics, "high_res_refine")
+        margin = max(12, int(candidate["w"] * 0.35 * scale_x))
+        roi_x = max(0, int(candidate["x"] * scale_x) - margin)
+        roi_y = max(0, int(candidate["y"] * scale_y) - margin)
+        roi_x1 = min(
+            HIGH_RES_WIDTH,
+            int((candidate["x"] + candidate["w"]) * scale_x) + margin,
+        )
+        roi_y1 = min(
+            HIGH_RES_HEIGHT,
+            int((candidate["y"] + candidate["h"]) * scale_y) + margin,
+        )
+        roi_w = roi_x1 - roi_x
+        roi_h = roi_y1 - roi_y
+        if roi_w < 32 or roi_h < 32:
+            refined.append(candidate)
+            continue
+
+        try:
+            roi_img = high_res_img.copy(roi=(roi_x, roi_y, roi_w, roi_h))
+            roi_gray = roi_img.to_grayscale()
+            rectangles = cv_lite.grayscale_find_rectangles_with_corners(
+                [roi_h, roi_w],
+                roi_gray.to_numpy_ref(),
+                profile["canny_low"],
+                profile["canny_high"],
+                APPROX_EPSILON,
+                AREA_MIN_RATIO,
+                MAX_ANGLE_COS,
+                GAUSSIAN_BLUR,
+            )
+        except Exception:
+            refined.append(candidate)
+            continue
+
+        best = None
+        for rect in rectangles:
+            if len(rect) < 12:
+                continue
+
+            corners = []
+            for index in range(4):
+                corner_index = 4 + index * 2
+                corner_x = (roi_x + rect[corner_index]) / scale_x
+                corner_y = (roi_y + rect[corner_index + 1]) / scale_y
+                corners.append((corner_x, corner_y))
+
+            high_res_candidate = build_candidate(
+                low_img,
+                corners,
+                profile,
+                "high_res",
+                diagnostics,
+                min_white_ratio,
+            )
+            if high_res_candidate is None:
+                continue
+
+            center_error = center_distance(high_res_candidate, candidate)
+            if center_error > max(20.0, candidate["w"] * 0.60):
+                continue
+
+            area_ratio = high_res_candidate["area"] / max(1.0, candidate["area"])
+            if area_ratio < 0.45 or area_ratio > 2.20:
+                continue
+
+            if best is None or high_res_candidate["score"] > best["score"]:
+                best = high_res_candidate
+
+        if best is not None:
+            refined.append(best)
+            bump_diagnostic(diagnostics, "high_res_accept")
+        else:
+            refined.append(candidate)
+
+    return refined
+
+
+# ---------------------------------------------------------------------------
+# 目标状态机。
+# ---------------------------------------------------------------------------
+
+
+class TargetTracker:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = "SEARCH"
+        self.last = None
+        self.output = None
+        self.confirm_hits = 0
+        self.confirm_age = 0
+        self.lost_count = 0
+        self.recapture_count = 0
+        self.layer_conflict_count = 0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.last_seen_ms = None
+        self.selected_candidate = None
+
+    def detection_mode(self):
+        if self.state == "TRACK":
+            return "track"
+        if self.state == "CONFIRM":
+            return "confirm"
+        if self.state == "RECAPTURE_ROI":
+            return "recapture_roi"
+        if self.state == "RECAPTURE_FULL":
+            return "recapture_full"
+        return "search"
+
+    def begin_recapture(self):
+        self.state = "RECAPTURE_ROI"
+        self.confirm_hits = 0
+        self.confirm_age = 0
+        self.lost_count = 0
+        self.recapture_count = 0
+        self.layer_conflict_count = 0
+
+    def detection_roi(self):
+        if self.state == "TRACK" and self.last is not None:
+            margin_factor = TRACK_DETECTION_ROI_MARGIN_FACTOR
+            if self.last.get("distance_m", NEAR_TRACK_DISTANCE_M + 1.0) <= \
+                    NEAR_TRACK_DISTANCE_M:
+                margin_factor = NEAR_TRACK_DETECTION_ROI_MARGIN_FACTOR
+            return make_tracking_roi(
+                self.last, margin_factor
+            )
+        if self.state == "RECAPTURE_ROI" and self.last is not None:
+            return make_tracking_roi(
+                self.last, RECAPTURE_ROI_MARGIN_FACTOR
+            )
+        return None
+
+    def copy_candidate(self, candidate):
+        copied = {}
+        for key in candidate:
+            copied[key] = candidate[key]
+        return copied
+
+    def predicted_reference(self, now_ms):
+        if self.last is None:
+            return None
+
+        reference = self.copy_candidate(self.last)
+        if self.state == "TRACK" and self.last_seen_ms is not None:
+            elapsed_s = time.ticks_diff(now_ms, self.last_seen_ms) / 1000.0
+            if 0.0 < elapsed_s < 0.5:
+                reference["cx"] += self.vx * elapsed_s
+                reference["cy"] += self.vy * elapsed_s
+        return reference
+
+    def predict_reference(self, now_ms):
+        """根据速度外推上一个目标框，不依赖当前跟踪状态。
+
+        用于在短暂丢靶期间继续向云台提供目标。跟踪器可能停留在确认或
+        重捕获状态数帧，若这段时间冻结目标，云台会产生滞后，并在重新
+        捕获时突然跳动。丢靶时间超过 PREDICT_SEND_MS 后返回 None。
+        """
+        if self.last is None or self.last_seen_ms is None:
+            return None
+
+        elapsed_s = time.ticks_diff(now_ms, self.last_seen_ms) / 1000.0
+        if elapsed_s <= 0.0 or elapsed_s > PREDICT_SEND_MS / 1000.0:
+            return None
+
+        predicted = self.copy_candidate(self.last)
+        predicted["cx"] += self.vx * elapsed_s
+        predicted["cy"] += self.vy * elapsed_s
+        predicted["x"] = int(predicted["cx"] - predicted["w"] * 0.5)
+        predicted["y"] = int(predicted["cy"] - predicted["h"] * 0.5)
+        predicted["predicted"] = True
+        return predicted
+
+    def fast_confirm_ok(self, candidate):
+        """候选落在预测框上，直接接受，无需继续投票。"""
+        reference = self.predicted_reference(time.ticks_ms())
+        if reference is None:
+            return False
+
+        if (
+            center_distance(candidate, reference)
+            > reference["w"] * CONFIRM_FAST_CENTER_FACTOR
+        ):
+            return False
+
+        area_ratio = candidate["area"] / max(1.0, reference["area"])
+        return CONFIRM_FAST_AREA_RATIO_MIN <= area_ratio <= CONFIRM_FAST_AREA_RATIO_MAX
+
+    def is_similar(self, candidate, reference=None):
+        if reference is None:
+            reference = self.last
+        if reference is None:
+            return False
+
+        if (
+            reference["layer"] != "unknown"
+            and candidate["layer"] != "unknown"
+            and candidate["layer"] != reference["layer"]
+        ):
+            return False
+
+        distance = center_distance(candidate, reference)
+        area_min, area_max, axis_min, axis_max, center_factor = \
+            tracking_gate_limits(reference)
+        max_distance = max(24.0, reference["w"] * center_factor)
+        area_ratio = candidate["area"] / reference["area"]
+        width_ratio = candidate["w"] / max(1.0, reference["w"])
+        height_ratio = candidate["h"] / max(1.0, reference["h"])
+
+        return (
+            distance <= max_distance
+            and area_min <= area_ratio <= area_max
+            and axis_min <= width_ratio <= axis_max
+            and axis_min <= height_ratio <= axis_max
+        )
+
+    def is_confirmation_candidate(self, candidate):
+        if self.last is None:
+            return True
+
+        reference = self.last
+        center_limit = max(30.0, reference["w"] * 1.00)
+        if center_distance(candidate, reference) > center_limit:
+            return False
+
+        area_ratio = candidate["area"] / max(1.0, reference["area"])
+        if (
+            CONFIRM_OUTER_AREA_RATIO_MIN
+            <= area_ratio
+            <= CONFIRM_OUTER_AREA_RATIO_MAX
+        ):
+            candidate["layer"] = "outer"
+            self.last = candidate
+            return True
+
+        if 0.65 <= area_ratio < 0.95:
+            if candidate["layer"] == "unknown":
+                candidate["layer"] = "inner"
+            return True
+
+        if 0.95 <= area_ratio < CONFIRM_OUTER_AREA_RATIO_MIN:
+            self.last = candidate
+            return True
+
+        return False
+
+    def update_velocity(self, candidate, now_ms):
+        if self.last is None or self.last_seen_ms is None:
+            self.vx = 0.0
+            self.vy = 0.0
+            return
+
+        elapsed_s = time.ticks_diff(now_ms, self.last_seen_ms) / 1000.0
+        if elapsed_s <= 0.0 or elapsed_s > 0.5:
+            return
+
+        measured_vx = (candidate["cx"] - self.last["cx"]) / elapsed_s
+        measured_vy = (candidate["cy"] - self.last["cy"]) / elapsed_s
+        self.vx = self.vx * 0.35 + measured_vx * 0.65
+        self.vy = self.vy * 0.35 + measured_vy * 0.65
+        self.vx = max(-MAX_TRACK_VELOCITY_PX_PER_S,
+                      min(MAX_TRACK_VELOCITY_PX_PER_S, self.vx))
+        self.vy = max(-MAX_TRACK_VELOCITY_PX_PER_S,
+                      min(MAX_TRACK_VELOCITY_PX_PER_S, self.vy))
+
+    def smooth_candidate(self, candidate):
+        if self.output is None:
+            self.output = self.copy_candidate(candidate)
+            return self.output
+
+        previous = self.output
+        smoothed = self.copy_candidate(candidate)
+        smoothed["cx"] = previous["cx"] + SMOOTH_CENTER_ALPHA * (
+            candidate["cx"] - previous["cx"]
+        )
+        smoothed["cy"] = previous["cy"] + SMOOTH_CENTER_ALPHA * (
+            candidate["cy"] - previous["cy"]
+        )
+        smoothed["w"] = previous["w"] + SMOOTH_SIZE_ALPHA * (
+            candidate["w"] - previous["w"]
+        )
+        smoothed["h"] = previous["h"] + SMOOTH_SIZE_ALPHA * (
+            candidate["h"] - previous["h"]
+        )
+        smoothed["x"] = int(smoothed["cx"] - smoothed["w"] * 0.5)
+        smoothed["y"] = int(smoothed["cy"] - smoothed["h"] * 0.5)
+        smoothed["area"] = smoothed["w"] * smoothed["h"] * smoothed["rect"]
+
+        metrics = calculate_distance_metrics(
+            smoothed["w"], smoothed["h"], smoothed["inner"]
+        )
+        smoothed["distance_m"] = metrics["distance_m"]
+        smoothed["distance_width_m"] = metrics["distance_width_m"]
+        smoothed["distance_height_m"] = metrics["distance_height_m"]
+        smoothed["distance_consistency"] = metrics["distance_consistency"]
+        self.output = smoothed
+        return smoothed
+
+    def accept_candidate(self, candidate, now_ms):
+        self.update_velocity(candidate, now_ms)
+        self.last = candidate
+        self.last_seen_ms = now_ms
+        return self.smooth_candidate(candidate)
+
+    def update(self, candidates, diagnostics=None):
+        now_ms = time.ticks_ms()
+        detection_mode = self.detection_mode()
+        if diagnostics is not None:
+            diagnostics["selected_mode"] = detection_mode
+            diagnostics["target_held"] = 0
+
+        reference = self.predicted_reference(now_ms)
+        candidate = select_best_candidate(
+            candidates,
+            self.state,
+            reference,
+            diagnostics,
+            self.detection_roi(),
+        )
+        self.selected_candidate = candidate
+
+        if self.state == "TRACK":
+            if candidate is not None and self.is_similar(candidate, reference):
+                self.lost_count = 0
+                self.layer_conflict_count = 0
+                return self.accept_candidate(candidate, now_ms)
+
+            if candidate is not None and candidate.get("alternate_layer"):
+                self.layer_conflict_count += 1
+                if self.layer_conflict_count >= LAYER_SWITCH_VOTES:
+                    previous = reference if reference is not None else self.last
+                    if previous is not None:
+                        area_ratio = candidate["area"] / max(
+                            1.0, previous["area"]
+                        )
+                        if area_ratio > 1.08:
+                            candidate["layer"] = "outer"
+                        elif area_ratio < 0.92:
+                            candidate["layer"] = "inner"
+                    self.layer_conflict_count = 0
+                    self.output = None
+                    return self.accept_candidate(candidate, now_ms)
+
+                if self.output is not None:
+                    if diagnostics is not None:
+                        diagnostics["target_held"] = 1
+                    return self.output
+                if self.last is not None:
+                    if diagnostics is not None:
+                        diagnostics["target_held"] = 1
+                    return self.last
+
+            self.layer_conflict_count = 0
+            self.lost_count += 1
+            if self.lost_count > HOLD_LOST_FRAMES:
+                self.begin_recapture()
+                return None
+
+            if self.output is not None:
+                if diagnostics is not None:
+                    diagnostics["target_held"] = 1
+                return self.output
+            if self.last is not None:
+                if diagnostics is not None:
+                    diagnostics["target_held"] = 1
+                return self.last
+            return None
+
+        if self.state == "SEARCH":
+            if candidate is None:
+                return None
+
+            self.state = "CONFIRM"
+            self.confirm_hits = 1
+            self.confirm_age = 1
+            self.last = candidate
+            self.last_seen_ms = now_ms
+            self.output = None
+            return None
+
+        if self.state == "CONFIRM":
+            self.confirm_age += 1
+            if candidate is not None:
+                if self.is_confirmation_candidate(candidate):
+                    self.confirm_hits += 1
+                else:
+                    self.confirm_hits = 1
+                    self.last = candidate
+                self.last_seen_ms = now_ms
+                if self.fast_confirm_ok(candidate):
+                    # 正好落在预测框上，说明是同一目标返回，
+                    # 跳过后续投票。
+                    self.confirm_hits = CONFIRM_HITS_REQUIRED
+
+            if self.confirm_hits >= CONFIRM_HITS_REQUIRED:
+                self.state = "TRACK"
+                self.lost_count = 0
+                self.layer_conflict_count = 0
+                self.vx = 0.0
+                self.vy = 0.0
+                self.output = None
+                if self.last is not None:
+                    return self.accept_candidate(self.last, now_ms)
+                return None
+
+            if self.confirm_age >= CONFIRM_WINDOW_FRAMES:
+                self.reset()
+            return None
+
+        if self.state in ("RECAPTURE_ROI", "RECAPTURE_FULL"):
+            if candidate is not None:
+                self.state = "CONFIRM"
+                self.confirm_hits = 1
+                self.confirm_age = 1
+                self.last = candidate
+                self.last_seen_ms = now_ms
+                self.recapture_count = 0
+                self.output = None
+                return None
+
+            self.recapture_count += 1
+            if (
+                self.state == "RECAPTURE_ROI"
+                and self.recapture_count > RECAPTURE_ROI_FRAMES
+            ):
+                self.state = "RECAPTURE_FULL"
+                self.recapture_count = 0
+            elif (
+                self.state == "RECAPTURE_FULL"
+                and self.recapture_count > RECAPTURE_FULL_FRAMES
+            ):
+                if diagnostics is not None:
+                    diagnostics["lost_reason"] = "recapture_timeout"
+                self.reset()
+            return None
+
+        self.reset()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 串口协议。
+# ---------------------------------------------------------------------------
+
+
+def configure_vision_uart():
+    fpioa = FPIOA()
+    fpioa.set_function(UART_TX_PIN, FPIOA.UART1_TXD, ie=0, oe=1)
+    fpioa.set_function(UART_RX_PIN, FPIOA.UART1_RXD, ie=1, oe=0)
+    return UART(UART.UART1, UART_BAUDRATE)
+
+
+def build_vision_frame(
+    yaw_deg,
+    pitch_deg,
+    target,
+    laser_point,
+    target_vx=0.0,
+    target_vy=0.0,
+    image_age_ms=0.0,
+    geometry_state=0,
+    reprojection_px=0.0,
+    pose_refined=0,
+    target_w=0.0,
+    target_h=0.0,
+    target_layer=0,
+):
+    # 末尾：1=成功；2=无新鲜靶框；3~11=具体几何拒绝原因。
+    # K230 只在状态 1 时发送本帧，其余状态发送视觉无效帧。
+    return "{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.1f},{:.1f},{:.2f},{},{:.1f},{},{:.1f},{:.1f},{:.2f}\n".format(
+        yaw_deg,
+        pitch_deg,
+        target["cx"],
+        target["cy"],
+        laser_point["x"],
+        laser_point["y"],
+        laser_point.get("distance_m", target["distance_m"]),
+        target_vx,
+        target_vy,
+        image_age_ms / 1000.0,
+        geometry_state,
+        reprojection_px,
+        1 if pose_refined else 0,
+        target_w,
+        target_h,
+        target_layer / 100.0,
+    )
+
+
+def build_vision_lost_frame():
+    return "{},{},0,0,0,0,0\n".format(
+        VISION_LOST_VALUE, VISION_LOST_VALUE
+    )
+
+
+def update_pitch_trim(trim_deg, gimbal_error, tracker):
+    """缓慢学习云台自身无法消除的俯仰残差。
+
+    仅在目标大致静止时学习，避免把跟踪滞后误认为固定偏移。
+    """
+    if not PITCH_TRIM_ENABLED or gimbal_error is None:
+        return trim_deg
+
+    speed_px_per_s = abs(tracker.vx) + abs(tracker.vy)
+    if speed_px_per_s > PITCH_TRIM_STATIC_PX_PER_S:
+        return trim_deg
+
+    trim_deg += PITCH_TRIM_GAIN * gimbal_error["pitch_deg"]
+    if trim_deg > PITCH_TRIM_LIMIT_DEG:
+        trim_deg = PITCH_TRIM_LIMIT_DEG
+    elif trim_deg < -PITCH_TRIM_LIMIT_DEG:
+        trim_deg = -PITCH_TRIM_LIMIT_DEG
+    return trim_deg
+
+
+def apply_pitch_trim(gimbal_error, trim_deg):
+    """返回发送给 H723 的误差，并叠加学习到的俯仰补偿。"""
+    if gimbal_error is None or trim_deg == 0.0:
+        return gimbal_error
+
+    return {
+        "yaw_deg": gimbal_error["yaw_deg"],
+        "pitch_deg": gimbal_error["pitch_deg"] + trim_deg,
+    }
+
+
+def send_vision_frame(
+    uart,
+    target,
+    laser_point,
+    gimbal_error,
+    diagnostics,
+    last_lost_send_ms,
+    target_vx=0.0,
+    target_vy=0.0,
+    image_age_ms=0.0,
+    geometry_state=0,
+    reprojection_px=0.0,
+    pose_refined=0,
+    target_w=0.0,
+    target_h=0.0,
+    target_layer=0,
+):
+    """发送一帧串口数据，并返回更新后的丢靶帧时间戳。
+
+    正式运行和抓图测试共用同一路径，包括目标丢失时的 404 帧。
+    """
+    if uart is None:
+        return last_lost_send_ms
+
+    # 没有新鲜三维解算时绝不使用固定点、方向投影点或上帧旧点。
+    # 404 会让 H723 进入已有的安全自稳路径。
+    if target is None or gimbal_error is None:
+        now_ms = time.ticks_ms()
+        if time.ticks_diff(now_ms, last_lost_send_ms) < (
+            VISION_LOST_SEND_INTERVAL_MS
+        ):
+            return last_lost_send_ms
+        frame = build_vision_lost_frame()
+        uart.write(frame.encode())
+        diagnostics["tx_frame"] = frame.strip()
+        return now_ms
+
+    frame = build_vision_frame(
+        gimbal_error["yaw_deg"],
+        gimbal_error["pitch_deg"],
+        target,
+        laser_point,
+        target_vx,
+        target_vy,
+        image_age_ms,
+        geometry_state,
+        reprojection_px,
+        pose_refined,
+        target_w,
+        target_h,
+        target_layer,
+    )
+    uart.write(frame.encode())
+    diagnostics["tx_frame"] = frame.strip()
+
+    return last_lost_send_ms
+
+
+# ---------------------------------------------------------------------------
+# 测试模式辅助函数。
+# ---------------------------------------------------------------------------
+
+
+def ensure_dir(path):
+    try:
+        uos.stat(path)
+        return
+    except OSError:
+        pass
+
+    parent = path[: path.rindex("/")]
+    if parent and parent != path:
+        ensure_dir(parent)
+
+    try:
+        uos.mkdir(path)
+    except OSError:
         pass
 
 
-# ============================================================================
-#  状态机
-# ============================================================================
-ST_WAIT_READY = 0
-ST_SET_ZERO = 1
-ST_TRACK = 2
-ST_NAME = {ST_WAIT_READY: "WAIT_READY", ST_SET_ZERO: "SET_ZERO",
-           ST_TRACK: "TRACK"}
+def append_capture_record(csv_path, record):
+    file_exists = True
+    try:
+        uos.stat(csv_path)
+    except OSError:
+        file_exists = False
+
+    try:
+        with open(csv_path, "a") as output:
+            if not file_exists:
+                output.write(
+                    "index,file,mean,detected,tracked,x,y,w,h,cx,cy,white,"
+                    "dark_border,area,distance_cm,laser_x,laser_y,fps,"
+                    "gimbal_yaw_deg,"
+                    "gimbal_pitch_deg,candidate_source,"
+                    "candidate_count,best_distance_cm,distance_reject,size_reject,"
+                    "center_reject,roi_reject,lost_reason,selected_mode,layer\n"
+                )
+            output.write(record)
+    except Exception as error:
+        print("CSV write failed:", error)
+
+
+def new_frame_diagnostics(selected_mode):
+    return {
+        "selected_mode": selected_mode,
+        "candidate_source": "none",
+        "candidate_count": 0,
+        "cv_lite_raw": 0,
+        "cv_lite_count": 0,
+        "best_distance_cm": 0.0,
+        "distance_reject": 0,
+        "size_reject": 0,
+        "center_reject": 0,
+        "roi_reject": 0,
+        "area_reject": 0,
+        "aspect_reject": 0,
+        "angle_reject": 0,
+        "rectangularity_reject": 0,
+        "layer_reject": 0,
+        "alternate_count": 0,
+        "dark_border_low": 0,
+        "high_res_refine": 0,
+        "high_res_accept": 0,
+        "absolute_reject": 0,
+        "white_reject": 0,
+        "candidate_gate": 0,
+        "inner_hold_reject": 0,
+        "light_fallback": 0,
+        "lost_reason": "-",
+        "target_held": 0,
+        "tx_frame": "-",
+        "detect_ms": 0.0,
+        "display_ms": 0.0,
+        "image_age_ms": 0.0,
+        # 用于定位耗时来源的分项计时，反映每帧时间实际
+        # 花在哪里；对应调试行中的 b= 字段。
+        "crop_ms": 0.0,
+        "cv_ms": 0.0,
+        "cand_ms": 0.0,
+        "profile_ms": 0.0,
+        "log_ms": 0.0,
+        "flush_ms": 0.0,
+        "tx_ms": 0.0,
+        "hi_res_search": 0,
+        "hi_res_raw": 0,
+        "hi_res_hit": 0,
+        "hi_res_error": 0,
+        "long_range_search": 0,
+        "long_range_hit": 0,
+        "white_low": 0,
+        "pitch_trim_deg": 0.0,
+        "geometry_valid": 0,
+        "geometry_state": 0,
+        "geometry_reject": "-",
+        "reprojection_px": 0.0,
+        "pose_refined": 0,
+        "corner_refined": 0,
+        "corner_shift": 0.0,
+        "spot_status": "-",
+        "spot_correction": (0.0, 0.0),
+    }
+
+
+def format_frame_log(
+    state,
+    target,
+    laser_point,
+    light_profile,
+    mean_brightness,
+    fps,
+    diagnostics,
+    frame_count,
+    win_fps,
+    period_ms,
+    snap_ms,
+    track_ms,
+    gc_ms,
+    pace_ms,
+    tracker,
+    sent_error,
+):
+    common = (
+        "frame={} state={} mode={} fps={:.1f} winfps={:.1f} "
+        "per={:.1f} snap={:.1f} det={:.1f} trk={:.1f} tx={:.1f} "
+        "gc={:.1f} pace={:.1f} img_age={:.1f}"
+    ).format(
+        frame_count,
+        state,
+        diagnostics["selected_mode"],
+        fps,
+        win_fps,
+        period_ms,
+        snap_ms,
+        diagnostics["detect_ms"],
+        track_ms,
+        diagnostics["tx_ms"],
+        gc_ms,
+        pace_ms,
+        diagnostics["image_age_ms"],
+    )
+    common += (
+        " source={} candidate_count={} cv_lite={}/{} best_distance_cm={:.1f} "
+        "distance_reject={} size_reject={} center_reject={} roi_reject={} "
+        "area_reject={} aspect_reject={} angle_reject={} rect_reject={} "
+        "layer_reject={} inner_hold={} alternate_count={} dark_border_low={} "
+        "high_res_refine={} high_res_accept={} "
+        "absolute_reject={} white_reject={} light_fallback={} "
+        "lost_reason={} tx={} profile={} mean={} disp_ms={:.1f} "
+        "hi_res_search={} hi_res_raw={} "
+        "hi_res_hit={} hi_res_error={} long_range={}/{} white_low={} trim={:+.1f} "
+        "geom={} reproj={:.1f} refine={} corner=({},{:.2f}) "
+        "spot={} corr=({:+.2f},{:+.2f}) "
+        "geom_reject={}"
+    ).format(
+        diagnostics["candidate_source"],
+        diagnostics["candidate_count"],
+        diagnostics["cv_lite_count"],
+        diagnostics["cv_lite_raw"],
+        diagnostics["best_distance_cm"],
+        diagnostics["distance_reject"],
+        diagnostics["size_reject"],
+        diagnostics["center_reject"],
+        diagnostics["roi_reject"],
+        diagnostics["area_reject"],
+        diagnostics["aspect_reject"],
+        diagnostics["angle_reject"],
+        diagnostics["rectangularity_reject"],
+        diagnostics["layer_reject"],
+        diagnostics["inner_hold_reject"],
+        diagnostics["alternate_count"],
+        diagnostics["dark_border_low"],
+        diagnostics["high_res_refine"],
+        diagnostics["high_res_accept"],
+        diagnostics["absolute_reject"],
+        diagnostics["white_reject"],
+        diagnostics["light_fallback"],
+        diagnostics["lost_reason"],
+        diagnostics["tx_frame"],
+        light_profile["level"],
+        mean_brightness,
+        diagnostics["display_ms"],
+        diagnostics["hi_res_search"],
+        diagnostics["hi_res_raw"],
+        diagnostics["hi_res_hit"],
+        diagnostics["hi_res_error"],
+        diagnostics["long_range_search"],
+        diagnostics["long_range_hit"],
+        diagnostics["white_low"],
+        diagnostics["pitch_trim_deg"],
+        diagnostics["geometry_state"],
+        diagnostics["reprojection_px"],
+        diagnostics["pose_refined"],
+        diagnostics["corner_refined"],
+        diagnostics["corner_shift"],
+        diagnostics["spot_status"],
+        diagnostics["spot_correction"][0],
+        diagnostics["spot_correction"][1],
+        diagnostics["geometry_reject"],
+    )
+
+    if target is None:
+        return common + " target=none held={} gimbal=({}, {})".format(
+            diagnostics["target_held"],
+            VISION_LOST_VALUE,
+            VISION_LOST_VALUE,
+        )
+
+    gimbal_error = sent_error
+    velocity_text = "-"
+    if tracker is not None:
+        velocity_text = "({:+.1f},{:+.1f})".format(tracker.vx, tracker.vy)
+    predicted_text = "1" if target.get("predicted") else "0"
+
+    return common + (
+        " target_held={} predicted={} layer={} bbox=({},{},{},{}) "
+        "center=({:.2f},{:.2f}) vel_px_s={} distance_cm={:.1f} "
+        "laser=({:.2f},{:.2f}) gimbal=({:+.2f},{:+.2f})"
+    ).format(
+        diagnostics["target_held"],
+        predicted_text,
+        target["layer"],
+        target["x"],
+        target["y"],
+        target["w"],
+        target["h"],
+        target["cx"],
+        target["cy"],
+        velocity_text,
+        target["distance_m"] * 100.0,
+        laser_point["x"] if laser_point is not None else VISION_LOST_VALUE,
+        laser_point["y"] if laser_point is not None else VISION_LOST_VALUE,
+        gimbal_error["yaw_deg"]
+        if gimbal_error is not None
+        else VISION_LOST_VALUE,
+        gimbal_error["pitch_deg"]
+        if gimbal_error is not None
+        else VISION_LOST_VALUE,
+    )
+
+
+class RunLogger:
+    def __init__(self, mode, case_name):
+        self.file = None
+        # 运行期不主动 flush，避免 eMMC 刷新阻塞主循环。
+        self.write_ms = 0.0
+        self.flush_ms = 0.0
+
+        if not RUN_LOG_ENABLED:
+            return
+
+        try:
+            ensure_dir(RUN_LOG_PATH[: RUN_LOG_PATH.rindex("/")])
+            self.file = open(RUN_LOG_PATH, "w")
+            self.file.write(
+                "boot version={} mode={} case={} frame={}x{} target={}x{}cm "
+                "border={}cm distance_gate={:.1f}-{:.1f}m "
+                "target_fps={} log_every_n={} "
+                "uart=UART1 tx={} rx={} baud={} "
+                "camera=({:.1f},{:.1f},{:.1f},{:.1f}) "
+                "laser_origin=({:.1f},{:.1f},{:.1f}) "
+                "laser_dir=({:.3f},{:.3f},{:.3f}) "
+                "pitch_trim_gain={:.3f} pitch_trim_limit={:.1f}\n".format(
+                    VISION_VERSION,
+                    mode,
+                    case_name if case_name is not None else "-",
+                    FRAME_WIDTH,
+                    FRAME_HEIGHT,
+                    int(TARGET_OUTER_WIDTH_M * 100),
+                    int(TARGET_OUTER_HEIGHT_M * 100),
+                    int(BLACK_BORDER_WIDTH_M * 100),
+                    MIN_VALID_DISTANCE_M,
+                    MAX_VALID_DISTANCE_M,
+                    TARGET_PROCESS_FPS,
+                    LOG_EVERY_N_FRAMES,
+                    UART_TX_PIN,
+                    UART_RX_PIN,
+                    UART_BAUDRATE,
+                    CAMERA_CALIBRATION["fx"],
+                    CAMERA_CALIBRATION["fy"],
+                    CAMERA_CALIBRATION["cx"],
+                    CAMERA_CALIBRATION["cy"],
+                    LASER_ORIGIN_MM[0],
+                    LASER_ORIGIN_MM[1],
+                    LASER_ORIGIN_MM[2],
+                    LASER_DIRECTION[0],
+                    LASER_DIRECTION[1],
+                    LASER_DIRECTION[2],
+                    PITCH_TRIM_GAIN if PITCH_TRIM_ENABLED else 0.0,
+                    PITCH_TRIM_LIMIT_DEG,
+                )
+            )
+        except Exception as error:
+            self.file = None
+            print("run log open failed:", error)
+
+    def log(self, message):
+        if self.file is None:
+            return
+
+        try:
+            write_start_ms = time.ticks_ms()
+            self.file.write("[{}] {}\n".format(time.ticks_ms(), message))
+            self.write_ms = float(time.ticks_diff(time.ticks_ms(), write_start_ms))
+            self.flush_ms = 0.0
+        except Exception:
+            pass
+
+    def trace(self, message):
+        """Synchronous startup trace; survives an IDE interrupt before frame 1."""
+        if self.file is None:
+            return
+
+        try:
+            self.file.write(
+                "[{}] STAGE {}\n".format(time.ticks_ms(), message)
+            )
+            self.file.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        if self.file is None:
+            return
+
+        try:
+            self.file.flush()
+            self.file.close()
+        except Exception:
+            pass
+        self.file = None
+
+
+# ---------------------------------------------------------------------------
+# 绘图与诊断。
+# ---------------------------------------------------------------------------
+
+
+def draw_candidate(img, candidate, valid, scale=1.0, color=None):
+    if candidate is None:
+        return
+
+    if color is None:
+        color = (0, 255, 0) if valid else (255, 0, 0)
+    corners = candidate.get("corners")
+    if corners is not None and len(corners) == 4:
+        center_x, center_y = perspective_center_of_corners(corners)
+    else:
+        center_x = candidate["cx"]
+        center_y = candidate["cy"]
+
+    if corners is not None and len(corners) == 4 and hasattr(img, "draw_line"):
+        # 所见即所得轮廓：当前帧的原始角点包含透视信息，
+        # 因此绘制边框跟随黑色框的透视形状，而不是只
+        # 在四点接触目标的轴对齐外接框。
+        points = []
+        for point in corners:
+            points.append(
+                (int(point[0] * scale + 0.5), int(point[1] * scale + 0.5))
+            )
+        for index in range(4):
+            x0, y0 = points[index]
+            x1, y1 = points[(index + 1) % 4]
+            img.draw_line(x0, y0, x1, y1, color=color, thickness=2)
+    else:
+        img.draw_rectangle(
+            int(candidate["x"] * scale + 0.5),
+            int(candidate["y"] * scale + 0.5),
+            int(candidate["w"] * scale + 0.5),
+            int(candidate["h"] * scale + 0.5),
+            color=color,
+            thickness=2,
+        )
+
+    img.draw_cross(
+        int(center_x * scale + 0.5),
+        int(center_y * scale + 0.5),
+        color=color,
+        size=5,
+        thickness=2,
+    )
+
+
+def draw_raw_rectangle(img, corners, scale=1.0, color=(255, 255, 255)):
+    if corners is None or len(corners) != 4:
+        return
+
+    points = []
+    for point in corners:
+        points.append(
+            (int(point[0] * scale + 0.5), int(point[1] * scale + 0.5))
+        )
+    for index in range(4):
+        x0, y0 = points[index]
+        x1, y1 = points[(index + 1) % 4]
+        img.draw_line(x0, y0, x1, y1, color=color, thickness=2)
+
+
+def draw_laser_prediction(img, laser_point, scale=1.0):
+    if laser_point is None:
+        return
+
+    x = int(laser_point["x"] * scale)
+    y = int(laser_point["y"] * scale)
+    img.draw_circle(x, y, 10, color=(0, 0, 255), thickness=2)
+    img.draw_cross(x, y, color=(0, 0, 255), size=7, thickness=2)
+
+
+# ---------------------------------------------------------------------------
+# 主程序。
+# ---------------------------------------------------------------------------
 
 
 def main():
-    link = Link()
-    parser = FrameParser()
-    print_fpioa_state()
-    sensor = init_camera()
-    from media.media import MediaManager
-    MediaManager.init()
-    sensor.run()
-    if not GRAY_DIRECT:
-        try:
-            print("取像素: %s" % ("就地填（省分配）"
-                                  if px_probe_fast(sensor.snapshot())
-                                  else "普通模式"))
-        except Exception:
-            pass
-    else:
-        print("取像素: 灰度直出（单通道）")
-
-    if USE_CLOSE_DETECTOR:
-        target_det = ClosePaperDetector()
-        _scene_cache[1] = float(CLOSE_BIN_TH)
-        _scene_cache[2] = 4.0
-    else:
-        target_det = PaperDetector()
-    spot_det = SpotDetector()
-    vis_ut = 0                 # 靶心像素（最近一次有效帧）
-    vis_vt = 0
-    vis_us = 0                 # 激光光斑像素
-    vis_vs = 0
-    vis_q = 0                  # 质量分（用对比度归一化，0~255）
-    vis_run = 0                # 连续"检测到目标+光斑"的帧数
-    vis_ok = False             # 本帧是否有效（>=2 连帧才算）
-    state = ST_WAIT_READY
-    state_t = time.ticks_ms()
-    gz = None
-    last_gz_t = 0
-    t_hb = time.ticks_ms()
-    t_aim = time.ticks_ms()
-    t_mode = time.ticks_ms()
-    t_print = time.ticks_ms()
-    t_diag = time.ticks_ms()
-    last_tgt = None
-    last_tgt_t = 0
-    last_spot = None
-    n_frames = 0
-    n_frames_prev = 0
-    n_hit = 0
-    n_spot = 0
-    sent_mode = None
-    # 分段耗时统计（给 [TRACK] 行打印用，用来盯"实时性"有没有变差）
-    sum_grab = 0
-    sum_tgt = 0
-    sum_spot = 0
-    sum_drop = 0               # 低延迟取图：平均每次丢了几帧（0 = 队列本来就浅）
-    sum_n = 0
-    t_h723 = 0
-    # 激光坐标开机自标定（见文件顶部 AUTO_CALIB_LASER 说明）
-    global LASER_UV            # 自标定会重绑这个标定常数
-    calib_n = 0
-    cal_u = []
-    cal_v = []
-    laser_calibrated = False
-    if GRAY_DIRECT:
-        laser_calibrated = True
-    spot_det.u, spot_det.v = LASER_UV[0], LASER_UV[1]   # 搜索窗先对准标称值
-    spot_det.learned = True                             # 标定期间别让它自己漂
-
-    print("=" * 60)
-    print("K230 瞄准程序启动  %dx%d (S=%.2f K=%.2fpx/°)  靶纸=白纸亮块+暗框"
-          % (IMG_W, IMG_H, S_SCALE, VIS_K))
-    log("[CFG] 检测=%s 显示=无 逐帧SD示踪=%s"
-        % ("灰度直出+连续白块/暗框" if GRAY_DIRECT
-           else "RGB+连续白块/暗框",
-           "开" if TRACE_EVERY > 0 else "关"))
-    print("=" * 60)
-    global _log_f
-    if LOG_TO_FILE:
-        try:
-            _log_f = open(LOG_PATH, "w")
-            log("(日志同时写入 %s；整机跑完把 SD 卡插回电脑看这个文件)" % LOG_PATH)
-            log("[CFG] 新架构：K230 只上报像素坐标(ut,vt,us,vs)；"
-                "偏置计算在 H723 500Hz 视觉外环（K=7.8px/°、限幅 yaw±120°/pitch±20°）"
-                "；激光坐标固定=(%d,%d)" % (LASER_UV[0], LASER_UV[1]))
-            log("[CFG] 处理分辨率 %dx%d (S=%.2f) -> 随帧下发 K=%.2fpx/°"
-                "（H723 侧没收到 K 就用默认 7.8）"
-                % (IMG_W, IMG_H, S_SCALE, VIS_K))
-        except Exception as e:
-            print("日志文件打不开(继续运行, 只是不写文件): %s" % e)
+    sensor = None
+    uart = None
+    logger = None
+    media_initialized = False
+    display_initialized = False
+    tracker = TargetTracker()
+    laser_aimer = None
+    snapshot_key = YbKey() if PRODUCTION_SNAPSHOT_ENABLED else None
+    snapshot_last_key = False
+    snapshot_dir = None
+    snapshot_index = 1
+    clock = time.clock()
+    frame_count = 0
+    light_profile = PROFILE_NORMAL
+    mean_brightness = 0
+    last_state = None
+    last_frame_ms = time.ticks_ms()
+    last_lost_send_ms = 0
+    pitch_trim_deg = 0.0
+    # 帧率使用真实测量：clock.fps() 是自启动以来的长窗口平均，
+    # 上升很慢且掩盖实际帧率；因此改为根据两次调试打印之间
+    # 处理的帧数和时间计算窗口帧率。
+    debug_print_tick = time.ticks_ms()
+    debug_print_frame = 0
+    log_fps_tick = time.ticks_ms()
+    log_fps_frame = 0
 
     try:
-        while True:
-            os.exitpoint()
-            now = time.ticks_ms()
-            err_u = 0.0            # 本地显示/日志用（偏置计算在 H723）
-            err_v = 0.0
-
-            # ---------- 1. 收 H723 遥测 ----------
-            data = link.read(256)
-            if data:
-                for msg_id, seq, payload in parser.feed(data):
-                    if msg_id == MSG_GIMBAL_STATE:
-                        s = unpack_state(payload)
-                        if s is not None:
-                            gz = s
-                            last_gz_t = now
-                    elif msg_id == MSG_TEXT:
-                        try:
-                            _txt = payload.decode("utf-8")
-                        except Exception:
-                            _txt = ""
-                        if _txt:
-                            _key = ("[MOTOR]" in _txt) or ("[WARN]" in _txt) or \
-                                   ("[PARAM]" in _txt) or ("[MOTO]" in _txt) or \
-                                   ("[CTRL]" in _txt) or ("[RAW]" in _txt)
-                            if _key or \
-                               (time.ticks_diff(now, t_h723) >= H723_TEXT_MIN_MS):
-                                t_h723 = now
-                                log("H723: %s" % _txt)
-                    elif msg_id == MSG_ACK:
-                        pass
-
-            # ---------- 2. 心跳 ----------
-            if time.ticks_diff(now, t_hb) >= HEARTBEAT_MS:
-                t_hb = now
-                link.send(build_frame(MSG_HEARTBEAT))
-
-            # ---------- 3. 安全：遥测断 -> STAB ----------
-            if (state != ST_WAIT_READY) and \
-                    (time.ticks_diff(now, last_gz_t) > TELEM_TIMEOUT_MS):
-                link.send(build_frame(MSG_MODE, pack_mode(MODE_STAB)))
-                sent_mode = MODE_STAB
-                print("!! 遥测断流 -> 发 STAB，回到 WAIT_READY")
-                state = ST_WAIT_READY
-                state_t = now
-
-            ready = bool(gz is not None and (gz["flags"] & ST_READY))
-
-            # ---------- 4. 状态机 ----------
-            if state == ST_WAIT_READY:
-                if ready:
-                    for _pid, _val in PARAM_SEND:
-                        link.send(build_frame(MSG_PARAM,
-                                              pack_param(_pid, _val)))
-                        time.sleep_ms(PARAM_SEND_DELAY_MS)
-                    if PARAM_SEND:
-                        log("已下发 %d 条现场参数（看下面的 H723: [PARAM] 回执）"
-                            % len(PARAM_SEND))
-                if ready and LOG_ONLY:
-                    # 只监听模式：不切模式、不发 SET_ZERO，H723 保持 STAB。
-                    # 电压/日志照收，SD 卡日志照写。
-                    state = ST_TRACK
-                    state_t = now
-                    log("LOG_ONLY=1 只监听：保持 H723 的 STAB，不发送 SET_ZERO/AIM")
-                elif ready:
-                    link.send(build_frame(MSG_MODE, pack_mode(MODE_STAB)))
-                    sent_mode = MODE_STAB
-                    link.send(build_frame(MSG_SET_ZERO))
-                    state = ST_SET_ZERO
-                    state_t = now
-                    print("H723 READY -> SET_ZERO，0.3s 后进 AIM")
-            elif state == ST_SET_ZERO:
-                if time.ticks_diff(now, state_t) >= 300:
-                    link.send(build_frame(MSG_MODE, pack_mode(MODE_AIM)))
-                    sent_mode = MODE_AIM
-                    state = ST_TRACK
-                    state_t = now
-                    print("进入 AIM，开始闭环瞄准")
-            elif state == ST_TRACK:
-                # 周期重发 MODE：H723 被看门狗切回 STAB 后自动拉回来
-                if (not LOG_ONLY) and \
-                        (time.ticks_diff(now, t_mode) >= MODE_REASSERT_MS):
-                    t_mode = now
-                    link.send(build_frame(MSG_MODE, pack_mode(MODE_AIM)))
-
-                t0 = time.ticks_ms()
-                img = sensor.snapshot()
-                t_grab = time.ticks_diff(time.ticks_ms(), t0)
-                if DRAIN_OLD_FRAMES:
-                    # 只处理"最新"那一帧（见文件顶部 DRAIN_OLD_FRAMES 说明）：
-                    # 拿到手太快 = 队列里还有旧帧 -> 再丢一帧。
-                    _drop = 0
-                    while (_drop < DRAIN_MAX) and (t_grab < DRAIN_FAST_MS):
-                        t0 = time.ticks_ms()
-                        img = sensor.snapshot()
-                        t_grab = time.ticks_diff(time.ticks_ms(), t0)
-                        _drop += 1
-                    sum_drop += _drop
-                n_frames += 1
-                if n_frames == 1:
-                    # 分辨率自检：ISP 没给到请求的尺寸时，下面所有"像素"判据
-                    # 都会按错的比例工作（缩放的常数 + 实际的图对不上）。
-                    # 一行日志就能排掉这种问题，别再靠猜。
-                    try:
-                        _aw, _ah = img.width(), img.height()
-                    except Exception:
-                        _aw, _ah = IMG_W, IMG_H
-                    log("[CAM] 实际输出 %dx%d（请求 %dx%d，S=%.2f K=%.2f）"
-                        % (_aw, _ah, IMG_W, IMG_H, S_SCALE, VIS_K))
-
-                # 每 5 秒打一次画面亮度：无靶时用它判断"是没看到靶还是判据问题"
-                if (target_det.lost > 0) and \
-                        (time.ticks_diff(now, t_diag) >= 5000):
-                    t_diag = now
-                    log_scene(img)
-
-                t0 = time.ticks_ms()
-                res = target_det.detect(img)
-                t_tgt = time.ticks_diff(time.ticks_ms(), t0)
-                t0 = time.ticks_ms()
-                if (not USE_FIXED_LASER) and ((n_frames % SPOT_EVERY) == 0):
-                    last_spot = spot_det.detect(img)
-                t_spot = time.ticks_diff(time.ticks_ms(), t0)
-                spot = last_spot
-                # ---- 激光坐标"开机自标定"（见文件顶部 AUTO_CALIB_LASER 说明）----
-                if AUTO_CALIB_LASER and (not GRAY_DIRECT) and \
-                        (not laser_calibrated):
-                    if calib_n < CALIB_FRAMES:
-                        _d = spot_det.detect(img)
-                        if _d is not None:
-                            cal_u.append(_d["uv"][0])
-                            cal_v.append(_d["uv"][1])
-                        calib_n += 1
-                    else:
-                        laser_calibrated = True
-                        _n0 = len(cal_u)
-                        if _n0 >= CALIB_MIN_N:
-                            _su = sorted(cal_u)[_n0 // 2]
-                            _sv = sorted(cal_v)[_n0 // 2]
-                            _du = sorted([abs(a - _su) for a in cal_u])[_n0 // 2]
-                            _dv = sorted([abs(a - _sv) for a in cal_v])[_n0 // 2]
-                            _spread = _du if _du > _dv else _dv
-                            if (abs(_su - LASER_UV[0]) > CALIB_SHIFT_MAX) or \
-                                    (abs(_sv - LASER_UV[1]) > CALIB_SHIFT_MAX):
-                                log("[CALIB] 光斑中位=(%.1f,%.1f) 离标称太远 -> "
-                                    "保持 (%d,%d)（检错了吧？）"
-                                    % (_su, _sv, LASER_UV[0], LASER_UV[1]))
-                            elif _spread > CALIB_SPREAD_MAX:
-                                log("[CALIB] 光斑散布 %.1fpx 太大 -> 保持 (%d,%d)"
-                                    % (_spread, LASER_UV[0], LASER_UV[1]))
-                            else:
-                                _old = LASER_UV
-                                LASER_UV = (int(_su + 0.5), int(_sv + 0.5))
-                                log("[CALIB] 激光坐标自标定: (%d,%d)->(%d,%d) "
-                                    "n=%d 散布%.1fpx"
-                                    % (_old[0], _old[1],
-                                       LASER_UV[0], LASER_UV[1],
-                                       _n0, _spread))
-                        else:
-                            log("[CALIB] 只检出 %d 帧光斑（< %d）-> 保持 (%d,%d)"
-                                % (_n0, CALIB_MIN_N,
-                                   LASER_UV[0], LASER_UV[1]))
-                sum_grab += t_grab
-                sum_tgt += t_tgt
-                sum_spot += t_spot
-                sum_n += 1
-
-                # 丢靶滑行：短时间内沿用最后一次目标位置（只用于本地显示/日志）
-                if res is not None:
-                    n_hit += 1
-                    tgt_uv = res["center"]
-                    last_tgt = tgt_uv
-                    last_tgt_t = now
-                else:
-                    if (time.ticks_diff(now, last_tgt_t) / 1000.0) > \
-                            LOST_COAST_S:
-                        tgt_uv = None
-                    else:
-                        tgt_uv = last_tgt
-
-                if USE_FIXED_LASER:
-                    # 固定激光坐标（标定常数）：不再检测光斑，少一层不确定
-                    spot = {"uv": LASER_UV}
-                if spot is not None:
-                    n_spot += 1
-                    su, sv = spot["uv"]
-                else:
-                    su, sv = spot_det.u, spot_det.v
-                SPOT_UV[0], SPOT_UV[1] = su, sv
-
-                if (res is not None) and (spot is not None) and \
-                        (target_det.lost == 0):
-                    if vis_run < 5:
-                        vis_run += 1
-                    vis_ut, vis_vt = res["center"]
-                    vis_us, vis_vs = su, sv
-                    vis_q = max(0, min(255, int(res.get("contrast", 0))))
-                else:
-                    vis_run = 0
-                vis_ok = (vis_run >= 2)
-
-                # 本地显示/日志用的像素误差（真正的偏置计算在 H723）
-                err_u = (tgt_uv[0] - su) if tgt_uv is not None else 0.0
-                err_v = (tgt_uv[1] - sv) if tgt_uv is not None else 0.0
-            # ---------- 5. 发 AIM（100Hz）：只发像素坐标（新架构）----------
-            if (not LOG_ONLY) and (state in (ST_SET_ZERO, ST_TRACK)) and \
-                    time.ticks_diff(now, t_aim) >= (1000 // AIM_HZ):
-                t_aim = now
-                flags = 0
-                if state == ST_TRACK and vis_ok:
-                    flags |= FLAG_AIM_VALID | FLAG_LOCKED
-                if state == ST_TRACK and LASER_ENABLE:
-                    flags |= FLAG_LASER_ON
-                link.send(build_frame(MSG_AIM,
-                                      pack_aim_px(vis_ut, vis_vt,
-                                                  vis_us, vis_vs,
-                                                  flags, vis_q,
-                                                  VIS_K * 100.0)))
-            # ---------- 6. 终端打印 ----------
-            # ---- 高速示踪（见 TRACE_EVERY 说明）：每 N 帧一条，只写文件 ----
-            if (TRACE_EVERY > 0) and ((n_frames % TRACE_EVERY) == 0):
-                if gz is not None:
-                    flog("T %d e=(%.0f,%.0f) yaw=%.1f pit=%.1f gz=%.1f "
-                         "ym=%.1f ok=%d t=%d"
-                         % (n_frames, err_u, err_v, gz["yaw"], gz["pitch"],
-                            gz["gyro_z"], gz["ymotor"],
-                            1 if vis_ok else 0, int(_scene_cache[1])))
-                else:
-                    flog("T %d e=(%.0f,%.0f) 等遥测"
-                         % (n_frames, err_u, err_v))
-            if time.ticks_diff(now, t_print) >= DEBUG_PRINT_MS:
-                fps = ((n_frames - n_frames_prev) * 1000.0 /
-                       max(1, time.ticks_diff(now, t_print)))
-                n_frames_prev = n_frames
-                t_print = now
-                tgt_s = "无靶"
-                if target_det.meas is not None and target_det.lost == 0:
-                    _m = target_det.meas
-                    tgt_s = "%s %.2fm 长%dpx 比%.2f 密%.2f 对比%d" % (
-                        target_det.state,
-                        FX_PX * PAPER_LONG_M / max(1.0, _m[5]),
-                        _m[5], _m[6], _m[7], _m[8] - _m[9])
-                else:
-                    # 没锁定时把"为什么没过闸门"一起写进日志（下次复盘要用）
-                    tgt_s = "无靶[%s 候选%d %s]" % (
-                        target_det.state, target_det.last_n,
-                        target_det.last_dbg)
-                if gz is not None:
-                    log("[%s] %.1ffps th=%d gz(state=%d fault=%d flags=0x%02X "
-                          "yaw=%.1f pit=%.1f roll=%.1f ymot=%.1f pmot=%.1f "
-                          "gz=%.1f/%.1f up=%dms) 靶=%s 命中%d/%d 光斑%d "
-                          "上报 u=(%d,%d) s=(%d,%d) q=%d ok=%d "
-                          "像素差=(%.0f,%.0f) "
-                          "ms 取图%.0f 目标%.0f 光斑%.0f 丢帧%.1f"
-                          % (ST_NAME[state], fps, int(_scene_cache[1]),
-                             gz["state"], gz["fault"],
-                             gz["flags"], gz["yaw"], gz["pitch"], gz["roll"],
-                             gz["ymotor"], gz["pmotor"], gz["gyro_y"],
-                             gz["gyro_z"], gz["up_ms"], tgt_s,
-                             n_hit, n_frames, n_spot,
-                             vis_ut, vis_vt, vis_us, vis_vs, vis_q,
-                             1 if vis_ok else 0, err_u, err_v,
-                             sum_grab / float(max(1, sum_n)),
-                             sum_tgt / float(max(1, sum_n)),
-                             sum_spot / float(max(1, sum_n)),
-                             sum_drop / float(max(1, sum_n))))
-                else:
-                    log("[%s] 等 H723 遥测... 靶=%s ok=%d crc=%d"
-                        % (ST_NAME[state], tgt_s,
-                           parser.ok, parser.crc_err))
-                sum_grab = 0
-                sum_tgt = 0
-                sum_spot = 0
-                sum_drop = 0
-                sum_n = 0
-            # gc.collect() 会卡 10~30ms：从"每 30 帧"放到"每 240 帧"（≈7s）。
-            # MicroPython 在内存不够时会自己回收，这里只是兜底。
-            if (n_frames % 240) == 0:
-                gc.collect()
-            time.sleep_ms(1)
-    except KeyboardInterrupt:
-        print("用户停止")
-    finally:
-        # 退出时务必让云台回到安全态并关激光
+        logger = RunLogger("PRODUCTION", None)
+        if logger is not None:
+            logger.trace("logger-ready")
         try:
-            link.send(build_frame(MSG_MODE, pack_mode(MODE_STAB)))
-            time.sleep_ms(50)
-        except Exception:
-            pass
-        link.close()
-        try:
-            sensor.stop()
-        except Exception:
-            pass
-        # 日志兜底刷盘（log() 现在每 8 条才 flush 一次，见其说明）
-        if _log_f is not None:
+            laser_aimer = PlanarLaserAimer()
+        except Exception as exc:
+            print("[GEOM] disabled:", exc)
+        if logger is not None:
+            logger.trace(
+                "aimer-ready={}".format(1 if laser_aimer is not None else 0)
+            )
+        uart = configure_vision_uart()
+        if logger is not None:
+            logger.trace("uart-ready")
+        if logger is not None:
+            logger.trace("sensor-config-begin")
+        sensor = Sensor(
+            id=SENSOR_ID,
+            width=SENSOR_SOURCE_WIDTH,
+            height=SENSOR_SOURCE_HEIGHT,
+            fps=SENSOR_FPS,
+        )
+        sensor.reset()
+        time.sleep_ms(100)
+
+        sensor.set_framesize(
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
+            chn=CAM_CHN_ID_0,
+        )
+        sensor.set_pixformat(Sensor.GRAYSCALE, chn=CAM_CHN_ID_0)
+        if (
+            DISPLAY_ENABLED
+            or HIGH_RES_VERIFY_ENABLED
+            or PRODUCTION_SNAPSHOT_ENABLED
+        ):
+            sensor.set_framesize(
+                width=HIGH_RES_WIDTH,
+                height=HIGH_RES_HEIGHT,
+                chn=CAM_CHN_ID_1,
+            )
+            sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+
+        if logger is not None:
+            logger.trace("sensor-config-done")
+
+        if SENSOR_GAIN is not None:
             try:
-                _log_f.flush()
+                gain = k_sensor_gain()
+                gain.gain[0] = SENSOR_GAIN
+                sensor.again(gain)
             except Exception:
                 pass
-        try:
+
+        if DISPLAY_ENABLED:
+            Display.init(
+                Display.ST7701,
+                width=DISPLAY_WIDTH,
+                height=DISPLAY_HEIGHT,
+                to_ide=True,
+            )
+            display_initialized = True
+
+        MediaManager.init()
+        media_initialized = True
+        if logger is not None:
+            logger.trace("media-ready")
+        sensor.run()
+        if logger is not None:
+            logger.trace("sensor-running")
+
+        # 周期调试行的耗时分解。循环按 TARGET_PROCESS_FPS 控制节拍，
+        # 关键是要知道每帧时间花在什么地方：等待两次取图、检测、跟踪，
+        # 还是向 IDE 推送画面。下面的每一项都会填入统计。
+        #
+        prev_loop_start_ms = None
+        # 垃圾回收和节拍休眠位于循环末尾，因此它们的读数会在
+        # 下一帧的调试行中显示。
+        prev_gc_ms = 0
+        prev_pace_ms = 0
+
+        while True:
+            os.exitpoint()
+            clock.tick()
+            loop_start_ms = time.ticks_ms()
+            period_ms = (
+                0
+                if prev_loop_start_ms is None
+                else time.ticks_diff(loop_start_ms, prev_loop_start_ms)
+            )
+            prev_loop_start_ms = loop_start_ms
+
+            # Age starts before snapshot: sensor wait/exposure/readout plus all
+            # later detection and formatting are part of the latency seen by H723.
+            image_capture_ms = time.ticks_ms()
+            if frame_count == 0 and logger is not None:
+                logger.trace("first-snapshot-begin")
+            img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            if frame_count == 0 and logger is not None:
+                logger.trace("first-snapshot-done")
+            high_res_img = None
+            # 通道 1 只用于屏幕预览，且高分辨率复核已关闭，
+            # 因此每帧取该通道是纯开销；每隔 N 帧取一次
+            # 已足够提供人眼可读的预览。
+            if (DISPLAY_ENABLED or HIGH_RES_VERIFY_ENABLED) and (
+                frame_count % DISPLAY_EVERY_N_FRAMES == 0
+            ):
+                high_res_img = sensor.snapshot(chn=CAM_CHN_ID_1)
+            snap_ms = time.ticks_diff(time.ticks_ms(), loop_start_ms)
+
+            if frame_count % PROFILE_EVERY_N_FRAMES == 0:
+                profile_start_ms = time.ticks_ms()
+                profile_roi = None
+                if tracker.state == "TRACK":
+                    profile_roi = make_tracking_roi(tracker.last)
+                near_profile = (
+                    tracker.last is not None
+                    and tracker.last.get("distance_m", 99.0) <=
+                    NEAR_FIXED_CANNY_DISTANCE_M
+                )
+                light_profile = make_dynamic_profile(
+                    img,
+                    profile_roi,
+                    near_profile,
+                    light_profile,
+                )
+                mean_brightness = light_profile["mean"]
+                profile_ms = time.ticks_diff(time.ticks_ms(), profile_start_ms)
+            else:
+                profile_ms = 0
+
+            detection_mode = tracker.detection_mode()
+            diagnostics = new_frame_diagnostics(detection_mode)
+            diagnostics["profile_ms"] = float(profile_ms)
+            raw_rectangles = [] if (
+                DISPLAY_ENABLED and DISPLAY_DRAW_RAW_RECTANGLES
+            ) else None
+            stage_ms = time.ticks_ms()
+            candidates = detect_candidates(
+                img,
+                light_profile,
+                detection_mode,
+                diagnostics,
+                tracker.detection_roi(),
+                high_res_img,
+                frame_count,
+                tracker.last,
+                raw_rectangles,
+            )
+            diagnostics["detect_ms"] = float(
+                time.ticks_diff(time.ticks_ms(), stage_ms)
+            )
+            track_start_ms = time.ticks_ms()
+            candidates = refine_candidates_with_high_res(
+                img,
+                high_res_img,
+                candidates,
+                light_profile,
+                diagnostics,
+                detection_mode,
+                frame_count,
+            )
+            target = tracker.update(candidates, diagnostics)
+            track_ms = time.ticks_diff(time.ticks_ms(), track_start_ms)
+            best_candidate = tracker.selected_candidate
+
+            # 跟踪器仍可短时预测框用于显示和重捕获；控制只接受本帧新鲜的
+            # 三维解算，不能拿预测框继续伪造激光控制量。
+            predicted_target = None
+            if target is None:
+                predicted_target = tracker.predict_reference(time.ticks_ms())
+            control_target = target if target is not None else predicted_target
+            geometry_state = 0
+            geometry_solution = None
+            reprojection_px = 0.0
+            pose_refined = 0
+            if target is not None:
+                if laser_aimer is not None:
+                    try:
+                        geometry_target = target
+                        refined_corners, corner_refined, corner_shift = (
+                            refine_geometry_corners(
+                                img, target.get("corners")
+                            )
+                        )
+                        if corner_refined:
+                            geometry_target = {}
+                            for key in target:
+                                geometry_target[key] = target[key]
+                            geometry_target["corners"] = refined_corners
+                        diagnostics["corner_refined"] = (
+                            1 if corner_refined else 0
+                        )
+                        diagnostics["corner_shift"] = corner_shift
+                        geometry_solution = laser_aimer.solve(
+                            geometry_target, img
+                        )
+                    except Exception as exc:
+                        diagnostics["geometry_reject"] = str(exc)
+                        geometry_state = _geometry_reject_code(
+                            diagnostics["geometry_reject"]
+                        )
+                        if geometry_state == 4:
+                            try:
+                                reprojection_px = float(
+                                    diagnostics["geometry_reject"]
+                                    .split(" ")[2]
+                                    .replace("px", "")
+                                )
+                                pose_refined = 1
+                            except Exception:
+                                reprojection_px = 0.0
+                    if (
+                        geometry_solution is None
+                        and geometry_state == 0
+                    ):
+                        geometry_state = 10
+                        diagnostics["geometry_reject"] = "invalid corners"
+                else:
+                    geometry_state = 11
+                    diagnostics["geometry_reject"] = "aimer unavailable"
+            elif control_target is not None:
+                geometry_state = 2
+                diagnostics["geometry_reject"] = "predicted target"
+            if geometry_solution is not None:
+                geometry_state = 1
+                laser_point = {
+                    "x": geometry_solution["laser_uv"][0],
+                    "y": (
+                        geometry_solution["laser_uv"][1] +
+                        LASER_POINT_Y_OFFSET_PX
+                    ),
+                    "distance_m": geometry_solution["depth_mm"] / 1000.0,
+                }
+                gimbal_error = {
+                    "yaw_deg": geometry_solution["yaw_deg"],
+                    "pitch_deg": (
+                        geometry_solution["pitch_deg"] +
+                        LASER_POINT_Y_OFFSET_DEG
+                    ),
+                }
+                diagnostics["geometry_valid"] = 1
+                diagnostics["geometry_state"] = 1
+                diagnostics["reprojection_px"] = geometry_solution[
+                    "reprojection_px"
+                ]
+                reprojection_px = geometry_solution["reprojection_px"]
+                diagnostics["pose_refined"] = (
+                    1 if geometry_solution["pose_refined"] else 0
+                )
+                pose_refined = diagnostics["pose_refined"]
+                diagnostics["spot_status"] = geometry_solution["spot_status"]
+                diagnostics["spot_correction"] = (
+                    geometry_solution["correction_yaw_deg"],
+                    geometry_solution["correction_pitch_deg"],
+                )
+            else:
+                diagnostics["geometry_valid"] = 0
+                diagnostics["geometry_state"] = geometry_state
+                laser_point = None
+                gimbal_error = None
+            pitch_trim_deg = update_pitch_trim(pitch_trim_deg, gimbal_error, tracker)
+            diagnostics["pitch_trim_deg"] = pitch_trim_deg
+            sent_error = apply_pitch_trim(gimbal_error, pitch_trim_deg)
+
+            tx_start_ms = time.ticks_ms()
+            image_age_ms = float(min(
+                1000,
+                max(0, time.ticks_diff(time.ticks_ms(), image_capture_ms)),
+            ))
+            diagnostics["image_age_ms"] = image_age_ms
+            last_lost_send_ms = send_vision_frame(
+                uart,
+                control_target,
+                laser_point,
+                sent_error,
+                diagnostics,
+                last_lost_send_ms,
+                tracker.vx,
+                tracker.vy,
+                image_age_ms,
+                geometry_state,
+                reprojection_px,
+                pose_refined,
+                control_target["w"] if control_target is not None else 0.0,
+                control_target["h"] if control_target is not None else 0.0,
+                (
+                    2 if control_target is not None and
+                    control_target.get("inner")
+                    else (
+                        1 if control_target is not None and
+                        control_target.get("layer") == "outer"
+                        else 0
+                    )
+                ),
+            )
+            diagnostics["tx_ms"] = float(
+                time.ticks_diff(time.ticks_ms(), tx_start_ms)
+            )
+
+            if snapshot_key is not None:
+                snapshot_pressed = snapshot_key.is_pressed() == 1
+                if snapshot_pressed and not snapshot_last_key:
+                    if snapshot_dir is None:
+                        snapshot_dir = "{}/laser_prod_{}".format(
+                            PRODUCTION_SNAPSHOT_ROOT,
+                            time.ticks_ms(),
+                        )
+                        ensure_dir(snapshot_dir)
+                    if high_res_img is None:
+                        high_res_img = sensor.snapshot(chn=CAM_CHN_ID_1)
+                    path = "{}/{}_mean{}.jpg".format(
+                        snapshot_dir,
+                        snapshot_index,
+                        mean_brightness,
+                    )
+                    high_res_img.save(path)
+                    print("production snapshot:", path)
+                    snapshot_index += 1
+                snapshot_last_key = snapshot_pressed
+
+            # 只有本帧实际获取了通道 1 图像时才绘制，
+            # 否则 high_res_img 为空，没有可绘制的画面。
+            if DISPLAY_ENABLED and high_res_img is not None:
+                stage_ms = time.ticks_ms()
+                display_scale = HIGH_RES_WIDTH / FRAME_WIDTH
+                # 绘制用于计算瞄准点的同一目标，使屏幕上的框中心
+                # 与瞄准点完全重合；当激光位于靶心时，
+                # 两者也应对应。
+                overlay_candidate = (
+                    target
+                    if target is not None
+                    else (
+                        predicted_target
+                        if predicted_target is not None
+                        else best_candidate
+                    )
+                )
+                if DISPLAY_DRAW_RAW_RECTANGLES and raw_rectangles:
+                    for corners in raw_rectangles:
+                        draw_raw_rectangle(
+                            high_res_img,
+                            corners,
+                            display_scale,
+                        )
+                if DISPLAY_DRAW_FINAL_TARGET and overlay_candidate is not None:
+                    if target is not None:
+                        outline_color = (0, 255, 0)      # 已锁定
+                    elif predicted_target is not None or tracker.state in (
+                        "CONFIRM",
+                        "RECAPTURE_ROI",
+                        "RECAPTURE_FULL",
+                    ):
+                        outline_color = (255, 255, 0)    # 确认中或使用预测位置
+                    else:
+                        outline_color = (255, 0, 0)      # 无候选
+                    draw_candidate(
+                        high_res_img,
+                        overlay_candidate,
+                        target is not None,
+                        display_scale,
+                        color=outline_color,
+                    )
+                if DISPLAY_DRAW_LASER_PREDICTION:
+                    draw_laser_prediction(
+                        high_res_img, laser_point, display_scale
+                    )
+                if DISPLAY_DRAW_TARGET_TEXT:
+                    try:
+                        if overlay_candidate is None:
+                            target_text = "target none"
+                        else:
+                            target_text = "target {} ({:.0f},{:.0f})".format(
+                                overlay_candidate["layer"],
+                                overlay_candidate["cx"],
+                                overlay_candidate["cy"],
+                            )
+                        high_res_img.draw_string(
+                            8,
+                            8,
+                            target_text,
+                            color=(255, 255, 255),
+                        )
+                    except Exception:
+                        pass
+                Display.show_image(high_res_img)
+                diagnostics["display_ms"] = float(
+                    time.ticks_diff(time.ticks_ms(), stage_ms)
+                )
+
+            if logger is not None and (
+                tracker.state != last_state
+                or frame_count % LOG_EVERY_N_FRAMES == 0
+            ):
+                log_start_ms = time.ticks_ms()
+                now_log_ms = time.ticks_ms()
+                log_span_ms = time.ticks_diff(now_log_ms, log_fps_tick)
+                log_span_frames = frame_count - log_fps_frame
+                win_fps = (
+                    log_span_frames * 1000.0 / log_span_ms
+                    if log_span_ms > 0
+                    else 0.0
+                )
+                logger.log(
+                    format_frame_log(
+                        tracker.state,
+                        control_target,
+                        laser_point,
+                        light_profile,
+                        mean_brightness,
+                        clock.fps(),
+                        diagnostics,
+                        frame_count,
+                        win_fps,
+                        period_ms,
+                        snap_ms,
+                        track_ms,
+                        prev_gc_ms,
+                        prev_pace_ms,
+                        tracker,
+                        sent_error,
+                    )
+                )
+                # 包含字符串格式化、文件写入以及本记录触发的刷新耗时。
+                #
+                diagnostics["log_ms"] = float(
+                    time.ticks_diff(time.ticks_ms(), log_start_ms)
+                )
+                diagnostics["flush_ms"] = logger.flush_ms
+                last_state = tracker.state
+                log_fps_tick = time.ticks_ms()
+                log_fps_frame = frame_count
+
+            if DEBUG_PRINT and frame_count % DEBUG_PRINT_EVERY_N_FRAMES == 0:
+                # 窗口帧率才是真实值：它等于实际产生帧数除以
+                # 两次打印之间的实际时间；clock.fps() 是自启动以来的平均值，
+                # 通常远低于瞬时帧率。
+                now_print_ms = time.ticks_ms()
+                span_ms = time.ticks_diff(now_print_ms, debug_print_tick)
+                span_frames = frame_count - debug_print_frame
+                win_fps = (span_frames * 1000.0 / span_ms) if span_ms > 0 else 0.0
+                debug_print_tick = now_print_ms
+                debug_print_frame = frame_count
+                if target is None:
+                    print(
+                        "frame={} state={} target=none fps={:.1f} winfps={:.1f} "
+                        "t={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}ms"
+                        "(per/snap/det/trk/dis) "
+                        "b={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/"
+                        "{:.0f}/{:.0f}/{:.0f}ms"
+                        "(crop/cv/cand/prof/log/flush/gc/tx/pace)".format(
+                            frame_count,
+                            tracker.state,
+                            clock.fps(),
+                            win_fps,
+                            period_ms,
+                            snap_ms,
+                            diagnostics["detect_ms"],
+                            track_ms,
+                            diagnostics["display_ms"],
+                            diagnostics["crop_ms"],
+                            diagnostics["cv_ms"],
+                            diagnostics["cand_ms"],
+                            diagnostics["profile_ms"],
+                            diagnostics["log_ms"],
+                            diagnostics["flush_ms"],
+                            prev_gc_ms,
+                            diagnostics["tx_ms"],
+                            prev_pace_ms,
+                        )
+                    )
+                else:
+                    print(
+                        "frame={} state={} target=({},{},{},{}) "
+                        "err=({:+.1f},{:+.1f})deg laser=({:.0f},{:.0f}) "
+                        "trim={:+.1f}deg det={}/{} area={} white={} wlow={} "
+                        "long={}/{} hi={}/{} d={:.0f}cm fps={:.1f} winfps={:.1f} "
+                        "geom={} reproj={:.1f} refine={} corner=({},{:.2f}) "
+                        "spot={} "
+                        "corr=({:+.2f},{:+.2f}) "
+                        "t={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}ms"
+                        "(per/snap/det/trk/dis) "
+                        "b={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/"
+                        "{:.0f}/{:.0f}/{:.0f}ms"
+                        "(crop/cv/cand/prof/log/flush/gc/tx/pace)".format(
+                            frame_count,
+                            tracker.state,
+                            target["x"],
+                            target["y"],
+                            target["w"],
+                            target["h"],
+                            gimbal_error["yaw_deg"] if gimbal_error else 0.0,
+                            gimbal_error["pitch_deg"] if gimbal_error else 0.0,
+                            laser_point["x"] if laser_point else 0.0,
+                            laser_point["y"] if laser_point else 0.0,
+                            pitch_trim_deg,
+                            diagnostics["cv_lite_count"],
+                            diagnostics["cv_lite_raw"],
+                            diagnostics["area_reject"],
+                            diagnostics["white_reject"],
+                            diagnostics["white_low"],
+                            diagnostics["long_range_search"],
+                            diagnostics["long_range_hit"],
+                            diagnostics["hi_res_search"],
+                            diagnostics["hi_res_hit"],
+                            target["distance_m"] * 100.0,
+                            clock.fps(),
+                            win_fps,
+                            diagnostics["geometry_state"],
+                            diagnostics["reprojection_px"],
+                            diagnostics["pose_refined"],
+                            diagnostics["corner_refined"],
+                            diagnostics["corner_shift"],
+                            diagnostics["spot_status"],
+                            diagnostics["spot_correction"][0],
+                            diagnostics["spot_correction"][1],
+                            period_ms,
+                            snap_ms,
+                            diagnostics["detect_ms"],
+                            track_ms,
+                            diagnostics["display_ms"],
+                            diagnostics["crop_ms"],
+                            diagnostics["cv_ms"],
+                            diagnostics["cand_ms"],
+                            diagnostics["profile_ms"],
+                            diagnostics["log_ms"],
+                            diagnostics["flush_ms"],
+                            prev_gc_ms,
+                            diagnostics["tx_ms"],
+                            prev_pace_ms,
+                        )
+                    )
+
+            frame_count += 1
+            if frame_count % GC_EVERY_N_FRAMES == 0:
+                gc_start_ms = time.ticks_ms()
+                gc.collect()
+                prev_gc_ms = time.ticks_diff(time.ticks_ms(), gc_start_ms)
+            pace_start_ms = time.ticks_ms()
+            last_frame_ms = pace_frame(last_frame_ms)
+            prev_pace_ms = time.ticks_diff(time.ticks_ms(), pace_start_ms)
+
+    except KeyboardInterrupt as error:
+        if logger is not None:
+            logger.log("K230 vision stopped reason={}".format(error))
+    except BaseException as error:
+        if logger is not None:
+            logger.log("K230 vision fatal reason={}".format(error))
+    finally:
+        if logger is not None:
+            logger.close()
+        if uart is not None:
+            uart.deinit()
+        if isinstance(sensor, Sensor):
+            sensor.stop()
+        if display_initialized:
+            Display.deinit()
+        if media_initialized:
+            os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+            time.sleep_ms(100)
             MediaManager.deinit()
-        except Exception:
-            pass
-        print("已退出")
 
 
-main()
+def run_test_mode():
+    sensor = None
+    uart = None
+    logger = None
+    media_initialized = False
+    display_initialized = False
+    key = YbKey()
+    tracker = TargetTracker()
+    clock = time.clock()
+    frame_count = 0
+    mean_brightness = 0
+    capture_index = 1
+    last_key_state = False
+    last_state = None
+    last_frame_ms = time.ticks_ms()
+    session_name = "{}_{}".format(TEST_CASE_NAME, time.ticks_ms())
+    save_dir = "{}/{}".format(TEST_SAVE_ROOT, session_name)
+    csv_path = "{}/captures.csv".format(save_dir)
+    light_profile = PROFILE_NORMAL
+    last_lost_send_ms = 0
+    pitch_trim_deg = 0.0
+
+    try:
+        ensure_dir(save_dir)
+        print("test mode save_dir:", save_dir)
+        logger = RunLogger("TEST", TEST_CASE_NAME)
+        if TEST_UART_ENABLED:
+            uart = configure_vision_uart()
+
+        sensor = Sensor(
+            id=SENSOR_ID,
+            width=SENSOR_SOURCE_WIDTH,
+            height=SENSOR_SOURCE_HEIGHT,
+            fps=SENSOR_FPS,
+        )
+        sensor.reset()
+        time.sleep_ms(100)
+        sensor.set_framesize(
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
+            chn=CAM_CHN_ID_0,
+        )
+        sensor.set_pixformat(Sensor.GRAYSCALE, chn=CAM_CHN_ID_0)
+        sensor.set_framesize(
+            width=HIGH_RES_WIDTH,
+            height=HIGH_RES_HEIGHT,
+            chn=CAM_CHN_ID_1,
+        )
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+
+        if TEST_DISPLAY_ENABLED:
+            Display.init(
+                Display.ST7701,
+                width=DISPLAY_WIDTH,
+                height=DISPLAY_HEIGHT,
+                to_ide=True,
+            )
+            display_initialized = True
+
+        MediaManager.init()
+        media_initialized = True
+        sensor.run()
+
+        while True:
+            os.exitpoint()
+            clock.tick()
+            img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            gray = img
+            high_res_img = None
+            if (TEST_DISPLAY_ENABLED or HIGH_RES_VERIFY_ENABLED) and (
+                frame_count % DISPLAY_EVERY_N_FRAMES == 0
+            ):
+                high_res_img = sensor.snapshot(chn=CAM_CHN_ID_1)
+
+            if frame_count % PROFILE_EVERY_N_FRAMES == 0:
+                profile_roi = None
+                if tracker.state == "TRACK":
+                    profile_roi = make_tracking_roi(tracker.last)
+                light_profile = make_dynamic_profile(gray, profile_roi)
+                mean_brightness = light_profile["mean"]
+
+            detection_mode = tracker.detection_mode()
+            diagnostics = new_frame_diagnostics(detection_mode)
+            stage_ms = time.ticks_ms()
+            candidates = detect_candidates(
+                gray,
+                light_profile,
+                detection_mode,
+                diagnostics,
+                tracker.detection_roi(),
+                high_res_img,
+                frame_count,
+                tracker.last,
+            )
+            diagnostics["detect_ms"] = float(
+                time.ticks_diff(time.ticks_ms(), stage_ms)
+            )
+            candidates = refine_candidates_with_high_res(
+                gray,
+                high_res_img,
+                candidates,
+                light_profile,
+                diagnostics,
+                detection_mode,
+                frame_count,
+            )
+            target = tracker.update(candidates, diagnostics)
+            best_candidate = tracker.selected_candidate
+            # 抓图测试不执行三维几何，因此不发送任何伪激光点。
+            laser_point = None
+            gimbal_error = None
+            pitch_trim_deg = update_pitch_trim(
+                pitch_trim_deg,
+                gimbal_error if target is not None else None,
+                tracker,
+            )
+            diagnostics["pitch_trim_deg"] = pitch_trim_deg
+
+            sent_error = apply_pitch_trim(gimbal_error, pitch_trim_deg)
+            last_lost_send_ms = send_vision_frame(
+                uart,
+                target,
+                laser_point,
+                sent_error,
+                diagnostics,
+                last_lost_send_ms,
+                tracker.vx,
+                tracker.vy,
+            )
+
+            key_pressed = key.is_pressed() == 1
+            if key_pressed and not last_key_state:
+                if high_res_img is None:
+                    high_res_img = sensor.snapshot(chn=CAM_CHN_ID_1)
+                path = "{}/{}_{}_mean{}.jpg".format(
+                    save_dir,
+                    session_name,
+                    capture_index,
+                    mean_brightness,
+                )
+                # Save the RGB preview channel: the direct grayscale channel can
+                # expose the sensor's padded stride as four tearing quadrants.
+                high_res_img.save(path)
+
+                record_target = target if target is not None else best_candidate
+                if record_target is None:
+                    x = y = width = height = 0
+                    center_x = center_y = 0
+                    white_ratio = 0.0
+                    dark_border_ratio = 0.0
+                    area = 0.0
+                    distance_cm = 0.0
+                    laser_x = 0.0
+                    laser_y = 0.0
+                    gimbal_yaw_deg = VISION_LOST_VALUE
+                    gimbal_pitch_deg = VISION_LOST_VALUE
+                    detected = 0
+                    tracked = 0
+                    record_layer = "-"
+                else:
+                    x = record_target["x"]
+                    y = record_target["y"]
+                    width = record_target["w"]
+                    height = record_target["h"]
+                    center_x = record_target["cx"]
+                    center_y = record_target["cy"]
+                    white_ratio = record_target["white"]
+                    dark_border_ratio = record_target["dark_border"]
+                    area = record_target["area"]
+                    record_layer = record_target["layer"]
+                    detected = 1
+                    tracked = 1 if target is not None else 0
+                    if laser_point is None:
+                        distance_cm = 0.0
+                        laser_x = 0.0
+                        laser_y = 0.0
+                    else:
+                        distance_cm = laser_point["distance_m"] * 100.0
+                        laser_x = laser_point["x"]
+                        laser_y = laser_point["y"]
+                    if gimbal_error is None:
+                        gimbal_yaw_deg = VISION_LOST_VALUE
+                        gimbal_pitch_deg = VISION_LOST_VALUE
+                    else:
+                        gimbal_yaw_deg = gimbal_error["yaw_deg"]
+                        gimbal_pitch_deg = gimbal_error["pitch_deg"]
+
+                record_values = [
+                    capture_index,
+                    path,
+                    mean_brightness,
+                    detected,
+                    tracked,
+                    x,
+                    y,
+                    width,
+                    height,
+                    int(center_x),
+                    int(center_y),
+                    white_ratio,
+                    dark_border_ratio,
+                    area,
+                    distance_cm,
+                    laser_x,
+                    laser_y,
+                    clock.fps(),
+                    gimbal_yaw_deg,
+                    gimbal_pitch_deg,
+                    diagnostics["candidate_source"],
+                    diagnostics["candidate_count"],
+                    diagnostics["best_distance_cm"],
+                    diagnostics["distance_reject"],
+                    diagnostics["size_reject"],
+                    diagnostics["center_reject"],
+                    diagnostics["roi_reject"],
+                    diagnostics["lost_reason"],
+                    diagnostics["selected_mode"],
+                    record_layer,
+                ]
+                record = ",".join([str(value) for value in record_values]) + "\n"
+                append_capture_record(csv_path, record)
+                if logger is not None:
+                    logger.log(
+                        "capture={} detected={} tracked={} distance_cm={:.1f} "
+                        "laser=({:.1f},{:.1f})".format(
+                            capture_index,
+                            detected,
+                            tracked,
+                            distance_cm,
+                            laser_x,
+                            laser_y,
+                        )
+                    )
+                print("captured:", path, "detected:", detected)
+
+                capture_index += 1
+                time.sleep_ms(200)
+
+            # 未获取通道 1 图像的帧不绘制叠加层。
+            if TEST_DISPLAY_ENABLED and high_res_img is not None:
+                # 仅当按键已将图片保存后才绘制叠加层，
+                # 这样抓拍图片中不会带绿色框、绿色十字或蓝色
+                # 瞄准点，可以直接从原图测量靶心和
+                # 实际激光光斑，不受叠加层干扰。
+                stage_ms = time.ticks_ms()
+                display_scale = HIGH_RES_WIDTH / FRAME_WIDTH
+                overlay_candidate = target if target is not None else best_candidate
+                if overlay_candidate is not None:
+                    draw_candidate(
+                        high_res_img,
+                        overlay_candidate,
+                        target is not None,
+                        display_scale,
+                    )
+                draw_laser_prediction(high_res_img, laser_point, display_scale)
+                Display.show_image(high_res_img)
+                diagnostics["display_ms"] = float(
+                    time.ticks_diff(time.ticks_ms(), stage_ms)
+                )
+
+            last_key_state = key_pressed
+            frame_count += 1
+
+            if logger is not None and (
+                tracker.state != last_state
+                or frame_count % LOG_EVERY_N_FRAMES == 0
+            ):
+                logger.log(
+                    format_frame_log(
+                        tracker.state,
+                        target,
+                        laser_point,
+                        light_profile,
+                        mean_brightness,
+                        clock.fps(),
+                        diagnostics,
+                        frame_count,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        tracker,
+                        sent_error if target is not None else None,
+                    )
+                )
+                last_state = tracker.state
+
+            if DEBUG_PRINT and frame_count % DEBUG_PRINT_EVERY_N_FRAMES == 0:
+                if target is None:
+                    print(
+                        "test frame={} state={} target=none fps={:.1f}".format(
+                            frame_count,
+                            tracker.state,
+                            clock.fps(),
+                        )
+                    )
+                else:
+                    print(
+                        "test frame={} state={} target=({},{},{},{}) fps={:.1f}".format(
+                            frame_count,
+                            tracker.state,
+                            target["x"],
+                            target["y"],
+                            target["w"],
+                            target["h"],
+                            clock.fps(),
+                        )
+                    )
+
+            if frame_count % GC_EVERY_N_FRAMES == 0:
+                gc.collect()
+            last_frame_ms = pace_frame(last_frame_ms)
+
+    except KeyboardInterrupt as error:
+        if logger is not None:
+            logger.log("K230 test mode stopped reason={}".format(error))
+    except BaseException as error:
+        if logger is not None:
+            logger.log("K230 test mode fatal reason={}".format(error))
+    finally:
+        if logger is not None:
+            logger.close()
+        if uart is not None:
+            uart.deinit()
+        if isinstance(sensor, Sensor):
+            sensor.stop()
+        if display_initialized:
+            Display.deinit()
+        if media_initialized:
+            os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+            time.sleep_ms(100)
+            MediaManager.deinit()
+
+
+if __name__ == "__main__":
+    if RUN_MODE == "TEST":
+        run_test_mode()
+    else:
+        main()
