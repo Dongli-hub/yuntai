@@ -42,7 +42,7 @@ except Exception:
 
 # 每次修改本文件时更新版本号，使启动日志能确认
 # 板端实际运行的版本。
-VISION_VERSION = "v114-20261108-display-off"
+VISION_VERSION = "v115-20261108-near-distance-020"
 RUN_MODE = "PRODUCTION"  # 测试或生产模式
 
 FRAME_WIDTH = 640
@@ -129,7 +129,9 @@ TARGET_OUTER_WIDTH_M = 0.30
 TARGET_OUTER_HEIGHT_M = 0.21
 BLACK_BORDER_WIDTH_M = 0.020
 FOCAL_LENGTH_PX = REFERENCE_FOCAL_LENGTH_PX * FRAME_WIDTH / REFERENCE_FRAME_WIDTH
-MIN_VALID_DISTANCE_M = 0.30
+# 近距离正对时内框会长到 310 px 以上，尺寸估算距离会短暂掉到
+# 0.30 m 以下。下限过低会丢靶，但不能继续卡在 0.30 m。
+MIN_VALID_DISTANCE_M = 0.20
 MAX_VALID_DISTANCE_M = 1.60
 
 # 相机内参、畸变和激光相对相机的位姿。
