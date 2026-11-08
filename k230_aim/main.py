@@ -42,7 +42,7 @@ except Exception:
 
 # 每次修改本文件时更新版本号，使启动日志能确认
 # 板端实际运行的版本。
-VISION_VERSION = "v113-20261108-final-target-preview"
+VISION_VERSION = "v114-20261108-display-off"
 RUN_MODE = "PRODUCTION"  # 测试或生产模式
 
 FRAME_WIDTH = 640
@@ -79,7 +79,7 @@ GC_EVERY_N_FRAMES = 150
 # 每个距离分别改成 laser_050 / laser_100 / laser_150。
 TEST_CASE_NAME = "laser_150"
 TEST_SAVE_ROOT = "/data/snapshot"
-TEST_DISPLAY_ENABLED = True
+TEST_DISPLAY_ENABLED = False
 # 标定抓图时关闭视觉指令发送，避免云台运动改变拍摄视角。
 TEST_UART_ENABLED = False
 
@@ -103,13 +103,13 @@ HIGH_RES_VERIFY_DISTANCE_M = 1.2
 HIGH_RES_SEARCH_ENABLED = False
 HIGH_RES_SEARCH_EVERY_N_FRAMES = 3
 
-# 联调显示通道：查看经过判据筛选后的最终目标框和靶心。
-DISPLAY_ENABLED = True
+# 联调显示通道全部关闭。
+DISPLAY_ENABLED = False
 DISPLAY_DRAW_RAW_RECTANGLES = False
-DISPLAY_DRAW_FINAL_TARGET = True
+DISPLAY_DRAW_FINAL_TARGET = False
 DISPLAY_DRAW_LASER_PREDICTION = False
 DISPLAY_DRAW_TARGET_TEXT = False
-DISPLAY_USE_GRAYSCALE_PREVIEW = True
+DISPLAY_USE_GRAYSCALE_PREVIEW = False
 
 UART_BAUDRATE = 921600
 UART_TX_PIN = 9
