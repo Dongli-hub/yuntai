@@ -17,12 +17,12 @@
 #define LINK_BAUDRATE            115200u
 
 /* H723底盘状态帧: 50Hz固定16字节二进制. */
-#define LINK_BINARY_TELEMETRY    1
+#define LINK_BINARY_TELEMETRY    0
 #define LINK_BINARY_PERIOD_MS    20u
 
 /* 1 = 周期性输出CSV文本遥测(蓝牙调试用), 0 = 关闭.
  * 默认关闭, 避免和H723二进制协议混在同一串口. */
-#define LINK_DEBUG_TELEMETRY     0
+#define LINK_DEBUG_TELEMETRY     1
 #define LINK_TELEMETRY_PERIOD_MS 50u
 
 #define LINK_TX_BUF_SIZE         320u
