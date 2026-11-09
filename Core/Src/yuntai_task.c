@@ -1246,6 +1246,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TURN_EXIT_RAMP_MS       400u
 #define VIS_TURN_EXIT_SETTLE_MS     300u
 #define VIS_TURN_YAW_ERROR_LIMIT_DEG 1.0f
+#define VIS_TURN_TARGET_RATE_LIMIT_DPS 30.0f
 
 typedef struct
 {
@@ -1301,7 +1302,7 @@ static uint16_t g_vis_history_count;
 static VisAlphaBeta_t g_vis_track_yaw = {.wrap360 = 1u};
 static VisAlphaBeta_t g_vis_track_pitch;
 static float   g_vis_turn_yaw_scale = 1.0f;
-static uint8_t g_vis_turn_learning_frozen;
+static uint8_t g_vis_turn_active;
 static uint8_t g_chassis_turn_phase;
 static uint8_t g_chassis_prev_phase;
 static int8_t  g_chassis_turn_dir;
@@ -1461,16 +1462,6 @@ static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
     }
 }
 
-static void vis_track_update_position_only(VisAlphaBeta_t *tracker,
-                                           float measured,
-                                           uint32_t capture_ms)
-{
-    tracker->value = tracker->wrap360 ? vis_wrap_deg(measured) : measured;
-    tracker->rate = 0.0f;
-    tracker->ms = capture_ms;
-    tracker->active = 1u;
-}
-
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
     float k = 0.0f;
@@ -1594,7 +1585,7 @@ static void vis_turn_authority_update(uint32_t now)
     uint8_t turn_low_authority;
     uint8_t turn_exit_hold;
     uint8_t turn_exit_ramp;
-    uint8_t learning_frozen;
+    uint8_t turn_active;
     uint32_t turn_exit_elapsed;
     float target;
     float step;
@@ -1627,7 +1618,7 @@ static void vis_turn_authority_update(uint32_t now)
         g_chassis_status_age_ms = 0xFFFFFFFFu;
     }
 
-    learning_frozen = (uint8_t)(
+    turn_active = (uint8_t)(
         link_valid &&
         ((chassis.flags & 0x04u) != 0u) &&
         (
@@ -1640,7 +1631,7 @@ static void vis_turn_authority_update(uint32_t now)
             )
         )
     );
-    g_vis_turn_learning_frozen = learning_frozen;
+    g_vis_turn_active = turn_active;
 
     turn_exit_elapsed = now - g_chassis_turn_exit_ms;
     turn_exit_hold = (uint8_t)(
@@ -1803,16 +1794,10 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             }
         }
 
-        if (g_vis_turn_learning_frozen != 0u)
-        {
-            vis_track_update_position_only(
-                yaw_tracker, yaw_measure_deg, capture_ms
-            );
-        }
-        else
-        {
-            vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
-        }
+        /* Keep learning the target's world-bearing rate through a turn. The
+         * chassis state lowers the visual position authority, but the target
+         * still moves because the car keeps advancing around the arc. */
+        vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
         vis_track_update(pitch_tracker, pitch_measure_deg, capture_ms);
         {
             float predicted_yaw = vis_track_predict(
@@ -1833,9 +1818,16 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             );
             (void)predicted_pitch_rate;
         }
-        if (g_vis_turn_learning_frozen != 0u)
+        if (g_vis_turn_active != 0u)
         {
-            g_vis_yaw_applied_rate_dps = 0.0f;
+            /* This is the known motion of the target in the world, not the
+             * yaw position-loop gain. Keep it as inner-loop feed-forward while
+             * bounding turn-time estimator noise. */
+            g_vis_yaw_applied_rate_dps = clampf(
+                g_vis_yaw_applied_rate_dps,
+                -VIS_TURN_TARGET_RATE_LIMIT_DPS,
+                VIS_TURN_TARGET_RATE_LIMIT_DPS
+            );
         }
         yaw_deg = clampf(yaw_deg,
                          -VIS_ERROR_YAW_LIMIT_DEG,
@@ -1847,7 +1839,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         {
             yaw_deg = 0.0f;
         }
-        if ((g_vis_turn_learning_frozen != 0u) &&
+        if ((g_vis_turn_active != 0u) &&
             (fabsf(yaw_deg) > VIS_TURN_YAW_ERROR_LIMIT_DEG))
         {
             yaw_deg = (yaw_deg > 0.0f) ?
