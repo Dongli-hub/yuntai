@@ -7,18 +7,35 @@
 /* ==========================================================================
  *  通信口 (USART1: PA9 = TX, PA10 = RX)
  * --------------------------------------------------------------------------
- *  这个口今后用来和 H723 主控通信。当前阶段把它当作调试 / 遥测口:
- *  默认每 LINK_TELEMETRY_PERIOD_MS 打一行文本, 便于看状态、调参数。
- *
- *  > 以后接上 H723 之后, 把 LINK_DEBUG_TELEMETRY 改成 0 关掉文本输出,
- *    再把二进制协议写在 Link_SendBytes() / Link_Poll() 里即可。
+ *  周期遥测使用 16 字节固定二进制帧, 50 Hz 发送给 H723。
+ *  启动阶段仍保留少量文本诊断; 接收端按 AA 55 帧头重同步即可。
  * ========================================================================== */
 
 #define LINK_BAUDRATE            115200u
 
-/* 1 = 周期性输出文本遥测(调试用), 0 = 关闭 */
-#define LINK_DEBUG_TELEMETRY     1
-#define LINK_TELEMETRY_PERIOD_MS 50u
+/* 1 = 周期性发送底盘二进制状态帧, 0 = 关闭 */
+#define LINK_CHASSIS_TELEMETRY          1
+#define LINK_CHASSIS_TELEMETRY_PERIOD_MS 20u
+
+/* 1 = 保留 2 秒一次的文本寄存器诊断, 正常联调时关闭 */
+#define LINK_DEBUG_TEXT_TELEMETRY       0
+
+#define LINK_CHASSIS_FRAME_SIZE   16u
+#define LINK_CHASSIS_VERSION      1u
+#define LINK_CHASSIS_TYPE         0x31u
+
+/* phase 字段 */
+#define LINK_PHASE_STRAIGHT       0u
+#define LINK_PHASE_PRE_TURN       1u
+#define LINK_PHASE_TURNING        2u
+#define LINK_PHASE_TURN_EXIT      3u
+#define LINK_PHASE_FAULT          4u
+
+/* flags 字段 */
+#define LINK_FLAG_CONTROL_VALID   0x01u
+#define LINK_FLAG_TURN_DIR_VALID  0x02u
+#define LINK_FLAG_AUTO_TRACKING   0x04u
+#define LINK_FLAG_FAULT           0x08u
 
 #define LINK_TX_BUF_SIZE         320u
 #define LINK_TX_TIMEOUT_MS       20u
@@ -27,6 +44,16 @@ void Link_Init(void);
 
 /* 直接发送一段字节 */
 void Link_SendBytes(const uint8_t *data, uint16_t len);
+
+/* CRC16-CCITT-FALSE: init=0xFFFF, poly=0x1021, refin=false, refout=false */
+uint16_t Link_Crc16CcittFalse(const uint8_t *data, uint16_t len);
+
+/* 组装并发送一帧 16 字节底盘状态 */
+void Link_SendChassisFrame(uint16_t seq,
+                           uint8_t phase,
+                           int8_t turn_dir,
+                           uint8_t flags,
+                           uint32_t chassis_ms);
 
 /* 格式化输出(只用整数和字符串格式, 不依赖 printf 浮点支持) */
 void Link_Printf(const char *fmt, ...);

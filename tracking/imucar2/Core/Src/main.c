@@ -65,7 +65,7 @@ extern TIM_HandleTypeDef htim3;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void Track_Telemetry(void);
+static void Chassis_Telemetry(void);
 #if MOTOR_DEADZONE_SWEEP
 static void Motor_DeadzoneSweep(void);
 #endif
@@ -194,15 +194,22 @@ int main(void)
     /* 上电阶段如果模块还没回数据, 周期性重发使能命令 */
     LineSensor_Maintenance();
 
-#if LINK_DEBUG_TELEMETRY
+#if LINK_CHASSIS_TELEMETRY
     {
         static uint32_t tlm_tick = 0u;
-        if ((HAL_GetTick() - tlm_tick) >= LINK_TELEMETRY_PERIOD_MS) {
-            tlm_tick = HAL_GetTick();
-            Track_Telemetry();
+        uint32_t now = HAL_GetTick();
+
+        if ((now - tlm_tick) >= LINK_CHASSIS_TELEMETRY_PERIOD_MS) {
+            tlm_tick += LINK_CHASSIS_TELEMETRY_PERIOD_MS;
+            if ((now - tlm_tick) >= LINK_CHASSIS_TELEMETRY_PERIOD_MS) {
+                tlm_tick = now;
+            }
+            Chassis_Telemetry();
         }
     }
+#endif
 
+#if LINK_DEBUG_TEXT_TELEMETRY
     /* 每 2 秒打一次底层寄存器: 用来确认 PWM 是真的发出去了, 以及编码器有没有计数 */
     {
         static uint32_t diag_tick = 0u;
@@ -332,71 +339,66 @@ static void Motor_DeadzoneSweep(void)
 }
 #endif
 
-/* 20Hz CSV遥测: 适合 USB-TTL / 蓝牙串口直接保存和分析。 */
-static void Track_Telemetry(void)
+/* 50Hz 底盘状态帧: 16 字节固定长度, 小端字段, CRC16-CCITT-FALSE。 */
+static void Chassis_Telemetry(void)
 {
-    static uint8_t header_sent = 0u;
-    const float mps_per_pct =
-        MOTOR_RPM_AT_FULL / 60.0f * 6.2831853f *
-        (MOTOR_WHEEL_RADIUS_CM / 100.0f) / 100.0f;
-    uint8_t mask = LineSensor_GetMask();
-    int32_t err_x10 = (int32_t)(Track_GetError() * 10.0f);
-    int32_t turn_x10 = (int32_t)(Track_GetTurnAngleDeg() * 10.0f);
-    int32_t yaw_x10 = (int32_t)(Track_GetHeadingDeg() * 10.0f);
-    int32_t gz_x10 = (int32_t)(IMU_GetGyroZDps() * 10.0f);
-    int32_t vt_mm_s = (int32_t)(Track_GetBodyTargetMps() * 1000.0f);
-    int32_t vm_mm_s = (int32_t)(Track_GetBodyMeasuredMps() * 1000.0f);
-    int32_t wt_mrad_s = (int32_t)(Track_GetBodyTargetRadps() * 1000.0f);
-    int32_t lt_mm_s = (int32_t)(Track_GetLeftTargetMps() * 1000.0f);
-    int32_t rt_mm_s = (int32_t)(Track_GetRightTargetMps() * 1000.0f);
-    int32_t lr_mm_s = (int32_t)(Motor_GetRampedTargetPercent(MOTOR_LEFT) *
-                               mps_per_pct * 1000.0f);
-    int32_t rr_mm_s = (int32_t)(Motor_GetRampedTargetPercent(MOTOR_RIGHT) *
-                               mps_per_pct * 1000.0f);
-    int32_t lm_mm_s = (int32_t)(Motor_GetMeasuredPercent(MOTOR_LEFT) *
-                               mps_per_pct * 1000.0f);
-    int32_t rm_mm_s = (int32_t)(Motor_GetMeasuredPercent(MOTOR_RIGHT) *
-                               mps_per_pct * 1000.0f);
+    static uint16_t seq = 0u;
+    TrackState state = Track_GetState();
+    int8_t     raw_turn_dir = Track_GetTurnDir();
+    int8_t     turn_dir = 0;
+    uint8_t    phase;
+    uint8_t    flags = 0u;
+    uint8_t    fault;
+    uint8_t    direction_valid;
 
-    if (header_sent == 0u) {
-        header_sent = 1u;
-        Link_Printf("D,ms,st,mask,err_x10,turn_x10,yaw_x10,gz_x10,"
-                    "vt_mm_s,vm_mm_s,wt_mrad_s,lt_mm_s,rt_mm_s,"
-                    "lr_mm_s,rr_mm_s,lm_mm_s,rm_mm_s,"
-                    "lp_x10,rp_x10,li_x10,ri_x10,lb_x10,rb_x10,"
-                    "dlcnt,drcnt,imu,en,flt\r\n");
+    switch (state) {
+    case TRACK_LINE:
+        phase = (Track_IsTurnExitActive() != 0u) ?
+                LINK_PHASE_TURN_EXIT : LINK_PHASE_STRAIGHT;
+        break;
+    case TRACK_PRE_TURN:
+        phase = LINK_PHASE_PRE_TURN;
+        break;
+    case TRACK_TURN:
+        phase = LINK_PHASE_TURNING;
+        break;
+    case TRACK_LOST:
+    case TRACK_STOP:
+    default:
+        phase = LINK_PHASE_FAULT;
+        break;
     }
 
-    Link_Printf("D,%lu,%u,%02X,%ld,%ld,%ld,%ld,"
-                "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,"
-                "%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%u,%u,%u\r\n",
-                (unsigned long)HAL_GetTick(),
-                (unsigned int)Track_GetState(),
-                (unsigned int)mask,
-                (long)err_x10,
-                (long)turn_x10,
-                (long)yaw_x10,
-                (long)gz_x10,
-                (long)vt_mm_s,
-                (long)vm_mm_s,
-                (long)wt_mrad_s,
-                (long)lt_mm_s,
-                (long)rt_mm_s,
-                (long)lr_mm_s,
-                (long)rr_mm_s,
-                (long)lm_mm_s,
-                (long)rm_mm_s,
-                (long)(Motor_GetOutputPercent(MOTOR_LEFT) * 10.0f),
-                (long)(Motor_GetOutputPercent(MOTOR_RIGHT) * 10.0f),
-                (long)(Motor_GetIntegralPercent(MOTOR_LEFT) * 10.0f),
-                (long)(Motor_GetIntegralPercent(MOTOR_RIGHT) * 10.0f),
-                (long)(Motor_GetBrakePercent(MOTOR_LEFT) * 10.0f),
-                (long)(Motor_GetBrakePercent(MOTOR_RIGHT) * 10.0f),
-                (int)Motor_GetDeltaCounts(MOTOR_LEFT),
-                (int)Motor_GetDeltaCounts(MOTOR_RIGHT),
-                (unsigned int)IMU_IsOnline(),
-                (unsigned int)Motor_IsEnabled(),
-                (unsigned int)Motor_GetStallFlag());
+    direction_valid =
+        ((phase == LINK_PHASE_PRE_TURN) ||
+         (phase == LINK_PHASE_TURNING) ||
+         (phase == LINK_PHASE_TURN_EXIT)) &&
+        ((raw_turn_dir == 1) || (raw_turn_dir == -1));
+    if (direction_valid != 0u) {
+        turn_dir = raw_turn_dir;
+        flags |= LINK_FLAG_TURN_DIR_VALID;
+    }
+
+    fault = (uint8_t)((phase == LINK_PHASE_FAULT) ||
+                      (Motor_GetStallFlag() != 0u) ||
+                      (IMU_IsOnline() == 0u) ||
+                      (((phase == LINK_PHASE_PRE_TURN) ||
+                        (phase == LINK_PHASE_TURNING) ||
+                        (phase == LINK_PHASE_TURN_EXIT)) &&
+                       (direction_valid == 0u)));
+    if ((Motor_IsEnabled() != 0u) && (fault == 0u)) {
+        flags |= LINK_FLAG_CONTROL_VALID;
+    }
+    if (state != TRACK_STOP) {
+        flags |= LINK_FLAG_AUTO_TRACKING;
+    }
+    if (fault != 0u) {
+        phase = LINK_PHASE_FAULT;
+        flags |= LINK_FLAG_FAULT;
+    }
+
+    Link_SendChassisFrame(seq, phase, turn_dir, flags, HAL_GetTick());
+    seq++;
 }
 
 /* USER CODE END 4 */

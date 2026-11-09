@@ -17,6 +17,67 @@ void Link_SendBytes(const uint8_t *data, uint16_t len)
     (void)HAL_UART_Transmit(&huart1, (uint8_t *)data, len, LINK_TX_TIMEOUT_MS);
 }
 
+uint16_t Link_Crc16CcittFalse(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    uint16_t i;
+
+    if (data == NULL) {
+        return crc;
+    }
+
+    while (len-- != 0u) {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (i = 0u; i < 8u; i++) {
+            if ((crc & 0x8000u) != 0u) {
+                crc = (uint16_t)((crc << 1) ^ 0x1021u);
+            } else {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void link_store_le16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void link_store_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFu);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+void Link_SendChassisFrame(uint16_t seq,
+                           uint8_t phase,
+                           int8_t turn_dir,
+                           uint8_t flags,
+                           uint32_t chassis_ms)
+{
+    uint8_t  frame[LINK_CHASSIS_FRAME_SIZE];
+    uint16_t crc;
+
+    frame[0]  = 0xAAu;
+    frame[1]  = 0x55u;
+    frame[2]  = LINK_CHASSIS_VERSION;
+    frame[3]  = LINK_CHASSIS_TYPE;
+    link_store_le16(&frame[4], seq);
+    frame[6]  = phase;
+    frame[7]  = (uint8_t)turn_dir;
+    frame[8]  = flags;
+    frame[9]  = 0u;
+    link_store_le32(&frame[10], chassis_ms);
+
+    crc = Link_Crc16CcittFalse(frame, 14u);
+    link_store_le16(&frame[14], crc);
+    Link_SendBytes(frame, LINK_CHASSIS_FRAME_SIZE);
+}
+
 void Link_Printf(const char *fmt, ...)
 {
     char    buf[LINK_TX_BUF_SIZE];
