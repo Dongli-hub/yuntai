@@ -1238,6 +1238,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TURN_YAW_SCALE          0.20f
 #define VIS_TURN_ENTRY_RAMP_MS      100.0f
 #define VIS_TURN_EXIT_RAMP_MS       200.0f
+#define VIS_TURN_EXIT_SETTLE_MS     300u
 #define VIS_TURN_YAW_ERROR_LIMIT_DEG 1.0f
 
 typedef struct
@@ -1296,7 +1297,9 @@ static VisAlphaBeta_t g_vis_track_pitch;
 static float   g_vis_turn_yaw_scale = 1.0f;
 static uint8_t g_vis_turn_learning_frozen;
 static uint8_t g_chassis_turn_phase;
+static uint8_t g_chassis_prev_phase;
 static uint32_t g_chassis_status_age_ms;
+static uint32_t g_chassis_turn_exit_ms;
 
 static float vis_wrap_deg(float deg)
 {
@@ -1580,7 +1583,7 @@ static void vis_turn_authority_update(uint32_t now)
     ChassisStatus_t chassis;
     uint8_t link_valid;
     uint8_t turn_low_authority;
-    uint8_t turn_phase_active;
+    uint8_t learning_frozen;
     float target;
     float step;
 
@@ -1589,23 +1592,36 @@ static void vis_turn_authority_update(uint32_t now)
         link_valid &&
         ((chassis.phase == 1u) || (chassis.phase == 2u))
     );
-    turn_phase_active = (uint8_t)(
-        link_valid &&
-        ((chassis.phase == 1u) || (chassis.phase == 2u) ||
-         (chassis.phase == 3u))
-    );
-
-    g_vis_turn_learning_frozen = turn_phase_active;
     if (link_valid)
     {
+        if ((chassis.phase == 3u) && (g_chassis_prev_phase != 3u))
+        {
+            g_chassis_turn_exit_ms = now;
+        }
         g_chassis_turn_phase = chassis.phase;
+        g_chassis_prev_phase = chassis.phase;
         g_chassis_status_age_ms = now - chassis.rx_ms;
     }
     else
     {
         g_chassis_turn_phase = 0u;
+        g_chassis_prev_phase = 0u;
         g_chassis_status_age_ms = 0xFFFFFFFFu;
     }
+
+    learning_frozen = (uint8_t)(
+        link_valid &&
+        (
+            (chassis.phase == 1u) ||
+            (chassis.phase == 2u) ||
+            (
+                (chassis.phase == 3u) &&
+                ((uint32_t)(now - g_chassis_turn_exit_ms) <
+                 VIS_TURN_EXIT_SETTLE_MS)
+            )
+        )
+    );
+    g_vis_turn_learning_frozen = learning_frozen;
 
     target = turn_low_authority ? VIS_TURN_YAW_SCALE : 1.0f;
     step = (float)g_ctrl_period_ms /
