@@ -35,6 +35,7 @@ float      Track_GetTurnAngleDeg(void);
 float      Track_GetHeadingDeg(void);
 float      Track_GetLeftTargetMps(void);
 float      Track_GetRightTargetMps(void);
+uint8_t    Track_IsTurnExitActive(void);
 
 /*
  * 打印最近一次转弯的实测数据(弧长 / 转过的角度 / 耗时)。

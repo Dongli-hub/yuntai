@@ -4,9 +4,12 @@
 #include <stdio.h>
 #include <string.h>
 
+static uint16_t chassis_sequence;
+
 void Link_Init(void)
 {
     /* USART1 的初始化在 MX_USART1_UART_Init() 里完成, 这里不用额外动作 */
+    chassis_sequence = 0u;
 }
 
 void Link_SendBytes(const uint8_t *data, uint16_t len)
@@ -19,6 +22,7 @@ void Link_SendBytes(const uint8_t *data, uint16_t len)
 
 void Link_Printf(const char *fmt, ...)
 {
+#if LINK_DEBUG_TELEMETRY
     char    buf[LINK_TX_BUF_SIZE];
     va_list ap;
     int     n;
@@ -34,6 +38,55 @@ void Link_Printf(const char *fmt, ...)
         n = (int)(sizeof(buf) - 1u);
     }
     Link_SendBytes((const uint8_t *)buf, (uint16_t)n);
+#else
+    (void)fmt;
+#endif
+}
+
+/* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, refin/refout false. */
+static uint16_t link_crc16_ccitt_false(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    uint16_t i;
+    uint8_t bit;
+
+    for (i = 0u; i < len; i++) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+        for (bit = 0u; bit < 8u; bit++) {
+            crc = (crc & 0x8000u) ?
+                  (uint16_t)((crc << 1) ^ 0x1021u) :
+                  (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+void Link_SendChassisState(uint8_t phase, int8_t turn_dir,
+                           uint8_t flags, uint32_t chassis_ms)
+{
+    uint8_t frame[16];
+    uint16_t crc;
+
+    frame[0] = 0xAAu;
+    frame[1] = 0x55u;
+    frame[2] = 0x01u;                  /* version */
+    frame[3] = 0x31u;                  /* chassis state */
+    frame[4] = (uint8_t)(chassis_sequence & 0xFFu);
+    frame[5] = (uint8_t)(chassis_sequence >> 8);
+    frame[6] = phase;
+    frame[7] = (uint8_t)turn_dir;
+    frame[8] = flags;
+    frame[9] = 0u;
+    frame[10] = (uint8_t)(chassis_ms & 0xFFu);
+    frame[11] = (uint8_t)((chassis_ms >> 8) & 0xFFu);
+    frame[12] = (uint8_t)((chassis_ms >> 16) & 0xFFu);
+    frame[13] = (uint8_t)((chassis_ms >> 24) & 0xFFu);
+    crc = link_crc16_ccitt_false(frame, 14u);
+    frame[14] = (uint8_t)(crc & 0xFFu);
+    frame[15] = (uint8_t)(crc >> 8);
+
+    chassis_sequence++;
+    Link_SendBytes(frame, (uint16_t)sizeof(frame));
 }
 
 uint8_t Link_FloatToStr(char *out, float value, uint8_t decimals)

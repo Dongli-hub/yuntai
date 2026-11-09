@@ -65,7 +65,12 @@ extern TIM_HandleTypeDef htim3;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+#if LINK_BINARY_TELEMETRY
+static void Track_BinaryTelemetry(void);
+#endif
+#if LINK_DEBUG_TELEMETRY
 static void Track_Telemetry(void);
+#endif
 #if MOTOR_DEADZONE_SWEEP
 static void Motor_DeadzoneSweep(void);
 #endif
@@ -193,6 +198,16 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* 上电阶段如果模块还没回数据, 周期性重发使能命令 */
     LineSensor_Maintenance();
+
+#if LINK_BINARY_TELEMETRY
+    {
+        static uint32_t frame_tick = 0u;
+        if ((HAL_GetTick() - frame_tick) >= LINK_BINARY_PERIOD_MS) {
+            frame_tick = HAL_GetTick();
+            Track_BinaryTelemetry();
+        }
+    }
+#endif
 
 #if LINK_DEBUG_TELEMETRY
     {
@@ -332,7 +347,79 @@ static void Motor_DeadzoneSweep(void)
 }
 #endif
 
-/* 20Hz CSV遥测: 适合 USB-TTL / 蓝牙串口直接保存和分析。 */
+#if LINK_BINARY_TELEMETRY
+/* 50Hz底盘二进制状态帧, 供H723扫描0xAA55和CRC后解析。 */
+static void Track_BinaryTelemetry(void)
+{
+    TrackState chassis_state = Track_GetState();
+    uint8_t enabled = Motor_IsEnabled();
+    uint8_t line_ok = LineSensor_IsOnline();
+    uint8_t imu_ok = IMU_IsOnline();
+    uint8_t stall = Motor_GetStallFlag();
+    uint8_t hardware_fault =
+        ((line_ok == 0u) || (imu_ok == 0u) || (stall != 0u)) ? 1u : 0u;
+    uint8_t state_fault =
+        ((chassis_state == TRACK_LOST) ||
+         ((chassis_state == TRACK_STOP) && (enabled != 0u))) ? 1u : 0u;
+    uint8_t fault = ((hardware_fault != 0u) || (state_fault != 0u)) ? 1u : 0u;
+    uint8_t control_valid =
+        ((enabled != 0u) && (hardware_fault == 0u) &&
+         (chassis_state != TRACK_STOP)) ? 1u : 0u;
+    uint8_t auto_tracking =
+        ((enabled != 0u) && (line_ok != 0u) &&
+         (chassis_state != TRACK_STOP)) ? 1u : 0u;
+    uint8_t phase = LINK_PHASE_STRAIGHT;
+    uint8_t flags = 0u;
+    int8_t turn_dir = 0;
+
+    if (fault != 0u) {
+        phase = LINK_PHASE_FAULT;
+    } else {
+        switch (chassis_state) {
+        case TRACK_LINE:
+            phase = (Track_IsTurnExitActive() != 0u) ?
+                    LINK_PHASE_TURN_EXIT : LINK_PHASE_STRAIGHT;
+            break;
+        case TRACK_PRE_TURN:
+            phase = LINK_PHASE_PRE_TURN;
+            break;
+        case TRACK_TURN:
+            phase = LINK_PHASE_TURNING;
+            break;
+        default:
+            phase = LINK_PHASE_STRAIGHT;
+            break;
+        }
+    }
+
+    if ((phase == LINK_PHASE_PRE_TURN) ||
+        (phase == LINK_PHASE_TURNING) ||
+        (phase == LINK_PHASE_TURN_EXIT)) {
+        turn_dir = Track_GetTurnDir();
+    }
+
+    if (control_valid != 0u) {
+        flags |= LINK_FLAG_CONTROL_VALID;
+    }
+    if ((turn_dir != 0) &&
+        ((phase == LINK_PHASE_PRE_TURN) ||
+         (phase == LINK_PHASE_TURNING) ||
+         (phase == LINK_PHASE_TURN_EXIT))) {
+        flags |= LINK_FLAG_DIR_VALID;
+    }
+    if (auto_tracking != 0u) {
+        flags |= LINK_FLAG_AUTO_TRACKING;
+    }
+    if (fault != 0u) {
+        flags |= LINK_FLAG_FAULT;
+    }
+
+    Link_SendChassisState(phase, turn_dir, flags, HAL_GetTick());
+}
+#endif
+
+#if LINK_DEBUG_TELEMETRY
+/* CSV遥测: 适合 USB-TTL / 蓝牙串口直接保存和分析。 */
 static void Track_Telemetry(void)
 {
     static uint8_t header_sent = 0u;
@@ -398,6 +485,7 @@ static void Track_Telemetry(void)
                 (unsigned int)Motor_IsEnabled(),
                 (unsigned int)Motor_GetStallFlag());
 }
+#endif
 
 /* USER CODE END 4 */
 

@@ -16,17 +16,38 @@
 
 #define LINK_BAUDRATE            115200u
 
-/* 1 = 周期性输出文本遥测(调试用), 0 = 关闭 */
-#define LINK_DEBUG_TELEMETRY     1
+/* H723底盘状态帧: 50Hz固定16字节二进制. */
+#define LINK_BINARY_TELEMETRY    1
+#define LINK_BINARY_PERIOD_MS    20u
+
+/* 1 = 周期性输出CSV文本遥测(蓝牙调试用), 0 = 关闭.
+ * 默认关闭, 避免和H723二进制协议混在同一串口. */
+#define LINK_DEBUG_TELEMETRY     0
 #define LINK_TELEMETRY_PERIOD_MS 50u
 
 #define LINK_TX_BUF_SIZE         320u
 #define LINK_TX_TIMEOUT_MS       20u
 
+/* Chassis state protocol, type 0x31. */
+#define LINK_PHASE_STRAIGHT      0u
+#define LINK_PHASE_PRE_TURN      1u
+#define LINK_PHASE_TURNING       2u
+#define LINK_PHASE_TURN_EXIT     3u
+#define LINK_PHASE_FAULT         4u
+
+#define LINK_FLAG_CONTROL_VALID  (1u << 0)
+#define LINK_FLAG_DIR_VALID      (1u << 1)
+#define LINK_FLAG_AUTO_TRACKING  (1u << 2)
+#define LINK_FLAG_FAULT          (1u << 3)
+
 void Link_Init(void);
 
 /* 直接发送一段字节 */
 void Link_SendBytes(const uint8_t *data, uint16_t len);
+
+/* 发送底盘状态帧 type=0x31, version=1. */
+void Link_SendChassisState(uint8_t phase, int8_t turn_dir,
+                           uint8_t flags, uint32_t chassis_ms);
 
 /* 格式化输出(只用整数和字符串格式, 不依赖 printf 浮点支持) */
 void Link_Printf(const char *fmt, ...);
