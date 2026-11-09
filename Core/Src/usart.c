@@ -157,7 +157,7 @@ uint8_t UART7_CurrentPins(void)
 void MX_UART7_UART_Init(void)
 {
   huart7.Instance = UART7;
-  huart7.Init.BaudRate = 921600;
+  huart7.Init.BaudRate = 115200;
   huart7.Init.WordLength = UART_WORDLENGTH_8B;
   huart7.Init.StopBits = UART_STOPBITS_1;
   huart7.Init.Parity = UART_PARITY_NONE;
