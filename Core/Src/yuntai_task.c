@@ -1232,6 +1232,14 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TRACK_COAST_MS          450u
 #define VIS_TRACK_LOST_MS           500u
 
+/* Chassis turn handling: keep a small position correction while the
+ * chassis-reported turn cancels most of the motion through the existing
+ * yaw feed-forward and inertial damping. */
+#define VIS_TURN_YAW_SCALE          0.20f
+#define VIS_TURN_ENTRY_RAMP_MS      100.0f
+#define VIS_TURN_EXIT_RAMP_MS       200.0f
+#define VIS_TURN_YAW_ERROR_LIMIT_DEG 1.0f
+
 typedef struct
 {
     uint32_t ms;
@@ -1285,6 +1293,10 @@ static uint16_t g_vis_history_head;
 static uint16_t g_vis_history_count;
 static VisAlphaBeta_t g_vis_track_yaw = {.wrap360 = 1u};
 static VisAlphaBeta_t g_vis_track_pitch;
+static float   g_vis_turn_yaw_scale = 1.0f;
+static uint8_t g_vis_turn_learning_frozen;
+static uint8_t g_chassis_turn_phase;
+static uint32_t g_chassis_status_age_ms;
 
 static float vis_wrap_deg(float deg)
 {
@@ -1437,6 +1449,16 @@ static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
     }
 }
 
+static void vis_track_update_position_only(VisAlphaBeta_t *tracker,
+                                           float measured,
+                                           uint32_t capture_ms)
+{
+    tracker->value = tracker->wrap360 ? vis_wrap_deg(measured) : measured;
+    tracker->rate = 0.0f;
+    tracker->ms = capture_ms;
+    tracker->active = 1u;
+}
+
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
 {
     float k = 0.0f;
@@ -1551,6 +1573,60 @@ static float vis_total_age_ms(const GimbalCmd_t *cmd, uint32_t now)
         age_ms += (float)(now - cmd->px_ms);
     }
     return clampf(age_ms, 0.0f, 9999.0f);
+}
+
+static void vis_turn_authority_update(uint32_t now)
+{
+    ChassisStatus_t chassis;
+    uint8_t link_valid;
+    uint8_t turn_low_authority;
+    uint8_t turn_phase_active;
+    float target;
+    float step;
+
+    link_valid = chassis_link_get_status(&chassis, now);
+    turn_low_authority = (uint8_t)(
+        link_valid &&
+        ((chassis.phase == 1u) || (chassis.phase == 2u))
+    );
+    turn_phase_active = (uint8_t)(
+        link_valid &&
+        ((chassis.phase == 1u) || (chassis.phase == 2u) ||
+         (chassis.phase == 3u))
+    );
+
+    g_vis_turn_learning_frozen = turn_phase_active;
+    if (link_valid)
+    {
+        g_chassis_turn_phase = chassis.phase;
+        g_chassis_status_age_ms = now - chassis.rx_ms;
+    }
+    else
+    {
+        g_chassis_turn_phase = 0u;
+        g_chassis_status_age_ms = 0xFFFFFFFFu;
+    }
+
+    target = turn_low_authority ? VIS_TURN_YAW_SCALE : 1.0f;
+    step = (float)g_ctrl_period_ms /
+        (turn_low_authority ?
+         VIS_TURN_ENTRY_RAMP_MS : VIS_TURN_EXIT_RAMP_MS);
+    if (g_vis_turn_yaw_scale < target)
+    {
+        g_vis_turn_yaw_scale += step;
+        if (g_vis_turn_yaw_scale > target)
+        {
+            g_vis_turn_yaw_scale = target;
+        }
+    }
+    else if (g_vis_turn_yaw_scale > target)
+    {
+        g_vis_turn_yaw_scale -= step;
+        if (g_vis_turn_yaw_scale < target)
+        {
+            g_vis_turn_yaw_scale = target;
+        }
+    }
 }
 
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
@@ -1668,7 +1744,16 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             }
         }
 
-        vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
+        if (g_vis_turn_learning_frozen != 0u)
+        {
+            vis_track_update_position_only(
+                yaw_tracker, yaw_measure_deg, capture_ms
+            );
+        }
+        else
+        {
+            vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
+        }
         vis_track_update(pitch_tracker, pitch_measure_deg, capture_ms);
         {
             float predicted_yaw = vis_track_predict(
@@ -1689,6 +1774,10 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             );
             (void)predicted_pitch_rate;
         }
+        if (g_vis_turn_learning_frozen != 0u)
+        {
+            g_vis_yaw_applied_rate_dps = 0.0f;
+        }
         yaw_deg = clampf(yaw_deg,
                          -VIS_ERROR_YAW_LIMIT_DEG,
                          VIS_ERROR_YAW_LIMIT_DEG);
@@ -1698,6 +1787,13 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         if (fabsf(yaw_deg) < VIS_DEADBAND_YAW_DEG)
         {
             yaw_deg = 0.0f;
+        }
+        if ((g_vis_turn_learning_frozen != 0u) &&
+            (fabsf(yaw_deg) > VIS_TURN_YAW_ERROR_LIMIT_DEG))
+        {
+            yaw_deg = (yaw_deg > 0.0f) ?
+                VIS_TURN_YAW_ERROR_LIMIT_DEG :
+                -VIS_TURN_YAW_ERROR_LIMIT_DEG;
         }
         if (fabsf(pitch_deg) < VIS_DEADBAND_PITCH_DEG)
         {
@@ -1717,6 +1813,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             yaw_rate = clampf(
                 yaw_rate, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS
             );
+            yaw_rate *= g_vis_turn_yaw_scale;
             float pitch_rate = vis_pid_step(&g_vis_pid_pitch, pitch_deg,
                                              frame_dt, g_vis_kp_pitch,
                                              g_vis_ki_pitch, g_vis_kd_pitch,
@@ -2080,6 +2177,7 @@ static void yuntai_control(uint32_t now)
 
     /* ---- 视觉外环：角度误差 -> 视觉目标角 ---- */
     yuntai_mark_stage(32u);
+    vis_turn_authority_update(now);
     vis_outer_step(cmd, mode, now);
 
     /* ======================================================================
@@ -2659,7 +2757,7 @@ static void uart10_append_float(char *buf, size_t cap, size_t *pos,
 static void yuntai_uart10_debug(uint32_t now)
 {
     const GimbalCmd_t *cmd = gimbal_link_cmd();
-    char line[240];
+    char line[280];
     size_t pos = 0u;
     uint32_t vis_age;
     float yaw_rel_deg;
@@ -2778,8 +2876,20 @@ static void yuntai_uart10_debug(uint32_t now)
                         (float)cmd->vis_target_w_x100 / 100.0f, 1);
     uart10_append_float(line, sizeof(line), &pos,
                         (float)cmd->vis_target_h_x100 / 100.0f, 1);
-    snprintf(line + pos, sizeof(line) - pos, ",%u\r\n",
-             (unsigned)cmd->vis_target_layer);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u,%u,%lu",
+                 (unsigned)cmd->vis_target_layer,
+                 (unsigned)g_chassis_turn_phase,
+                 (unsigned long)(
+                     (g_chassis_status_age_ms == 0xFFFFFFFFu) ?
+                     9999u : g_chassis_status_age_ms
+                 ));
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_vis_turn_yaw_scale, 2);
+    snprintf(line + pos, sizeof(line) - pos, "\r\n");
     (void)debug_uart10_send(line);
 }
 

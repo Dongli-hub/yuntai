@@ -87,6 +87,8 @@ typedef struct
 #define GPIO_PIN_0    0x0001u
 #define GPIO_PIN_3    0x0008u
 #define GPIO_PIN_4    0x0010u
+#define GPIO_PIN_7    0x0080u
+#define GPIO_PIN_8    0x0100u
 #define GPIO_PIN_10   0x0400u
 #define GPIO_PIN_12   0x1000u
 #define GPIO_PIN_RESET 0u
@@ -95,7 +97,9 @@ typedef struct
 #define GPIO_NOPULL 0u
 #define GPIO_SPEED_FREQ_LOW 0u
 #define GPIOA ((GPIO_TypeDef *)0x1000)
+#define GPIOE ((GPIO_TypeDef *)0x5000)
 #define GPIOC ((GPIO_TypeDef *)0x2000)
+#define UART7_IRQn 70
 #define USART1_IRQn 37
 #define USART10_IRQn 156
 
@@ -125,6 +129,9 @@ void HAL_NVIC_SetPriority(int32_t irq, uint32_t pre, uint32_t sub);
 void HAL_NVIC_EnableIRQ(int32_t irq);
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *h);
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *h);
+uint32_t __get_PRIMASK(void);
+void __disable_irq(void);
+void __enable_irq(void);
 
 /* 5) 用到的 HAL 宏 */
 #define __HAL_RCC_GPIOC_CLK_ENABLE()  do { } while (0)
@@ -165,6 +172,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *h);
 
 /* 6) 真实头文件里被屏蔽掉、但业务代码要用的 extern */
 extern UART_HandleTypeDef  huart1;
+extern UART_HandleTypeDef  huart7;
 extern UART_HandleTypeDef  huart10;
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
@@ -176,8 +184,12 @@ extern SPI_HandleTypeDef   hspi2;
 void MX_GPIO_Init(void);
 void MX_SPI2_Init(void);
 void MX_USART1_UART_Init(void);
+void MX_UART7_UART_Init(void);
 void MX_FDCAN1_Init(void);
 void MX_FDCAN2_Init(void);
 void SystemClock_Config(void);
+
+#define UART7_PAIR_PE 0u
+void UART7_BindPins(uint8_t pair);
 
 #endif /* __HOST_SYNTAX_STUB_PRE_H__ */

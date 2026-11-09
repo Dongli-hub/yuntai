@@ -81,7 +81,7 @@ void MX_USART10_UART_Init(void)
 }
 
 /* ---------------------------------------------------------------------------
- * UART7 引脚对管理（K230 链路用）
+ * UART7 引脚对管理（底盘状态链路用）
  *
  * 为什么需要这个：板子上 UART7 接插件只标了 "UART7"，
  * 而 STM32H723VGT6(LQFP100) 上 UART7 有两组可用引脚（都是 AF11）：
@@ -157,7 +157,7 @@ uint8_t UART7_CurrentPins(void)
 void MX_UART7_UART_Init(void)
 {
   huart7.Instance = UART7;
-  huart7.Init.BaudRate = 115200;
+  huart7.Init.BaudRate = 921600;
   huart7.Init.WordLength = UART_WORDLENGTH_8B;
   huart7.Init.StopBits = UART_STOPBITS_1;
   huart7.Init.Parity = UART_PARITY_NONE;

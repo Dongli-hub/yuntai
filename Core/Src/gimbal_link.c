@@ -96,6 +96,8 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 #define GL_TEXT_BUF_SIZE     128u
 #define GL_RX_DRAIN_MAX      256u    /* 单次最多直接从 UART 取出的字节数 */
 #define GL_RX_PARSE_MAX      256u    /* 单次最多解析的环形缓冲字节数 */
+#define CHASSIS_FRAME_LEN    16u
+#define CHASSIS_LINK_TIMEOUT_MS 200u
 
 /* K230 sends 0.14 deg/px at 640x480 (480x360 was 0.186667 deg/px).
  * H723's proven calibration is 7.8 px/deg = 0.128205 deg/px. */
@@ -143,7 +145,195 @@ static uint8_t           s_rx_any_logged;   /* 是否已经打过"收到第一�
 static char              s_text_line[GL_TEXT_BUF_SIZE];
 static uint8_t           s_text_len;
 
+/* UART7 chassis status: fixed 16-byte binary frame at 50 Hz. */
+static uint8_t            s_chassis_frame[CHASSIS_FRAME_LEN];
+static uint8_t            s_chassis_index;
+static volatile ChassisStatus_t s_chassis_status;
+static volatile uint32_t  s_chassis_crc_errors;
+static volatile uint32_t  s_chassis_sequence_errors;
+static volatile uint8_t   s_chassis_have_status;
+
 /* ========================== TX 环形缓冲 ========================== */
+
+static uint16_t chassis_crc16_ccitt_false(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    uint8_t bit;
+
+    while (len-- != 0u)
+    {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (bit = 0u; bit < 8u; bit++)
+        {
+            if ((crc & 0x8000u) != 0u)
+            {
+                crc = (uint16_t)((crc << 1) ^ 0x1021u);
+            }
+            else
+            {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void chassis_parse_frame(void)
+{
+    uint16_t received_crc;
+    uint16_t calculated_crc;
+    uint16_t seq;
+    uint8_t phase;
+    int8_t turn_dir;
+    uint8_t flags;
+    uint32_t chassis_ms;
+
+    if ((s_chassis_frame[0] != 0xAAu) ||
+        (s_chassis_frame[1] != 0x55u) ||
+        (s_chassis_frame[2] != 1u) ||
+        (s_chassis_frame[3] != 0x31u))
+    {
+        return;
+    }
+
+    received_crc = (uint16_t)s_chassis_frame[14] |
+                   ((uint16_t)s_chassis_frame[15] << 8);
+    calculated_crc = chassis_crc16_ccitt_false(
+        s_chassis_frame, CHASSIS_FRAME_LEN - 2u
+    );
+    if (received_crc != calculated_crc)
+    {
+        s_chassis_crc_errors++;
+        return;
+    }
+
+    seq = (uint16_t)s_chassis_frame[4] |
+          ((uint16_t)s_chassis_frame[5] << 8);
+    phase = s_chassis_frame[6];
+    turn_dir = (int8_t)s_chassis_frame[7];
+    flags = s_chassis_frame[8];
+    chassis_ms = (uint32_t)s_chassis_frame[10] |
+                 ((uint32_t)s_chassis_frame[11] << 8) |
+                 ((uint32_t)s_chassis_frame[12] << 16) |
+                 ((uint32_t)s_chassis_frame[13] << 24);
+    if ((phase > 4u) || (turn_dir < -1) || (turn_dir > 1))
+    {
+        return;
+    }
+
+    if ((s_chassis_have_status != 0u) &&
+        (seq != (uint16_t)(s_chassis_status.seq + 1u)))
+    {
+        s_chassis_sequence_errors++;
+    }
+    s_chassis_status.seq = seq;
+    s_chassis_status.chassis_ms = chassis_ms;
+    s_chassis_status.rx_ms = HAL_GetTick();
+    s_chassis_status.phase = phase;
+    s_chassis_status.turn_dir = turn_dir;
+    s_chassis_status.flags = flags;
+    s_chassis_status.valid =
+        (uint8_t)(((flags & 0x01u) != 0u) && ((flags & 0x08u) == 0u));
+    s_chassis_have_status = 1u;
+}
+
+void chassis_link_init(void)
+{
+    s_chassis_index = 0u;
+    s_chassis_have_status = 0u;
+    s_chassis_crc_errors = 0u;
+    s_chassis_sequence_errors = 0u;
+    memset((void *)&s_chassis_status, 0, sizeof(s_chassis_status));
+
+    UART7_BindPins(UART7_PAIR_PE);
+    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
+    __HAL_UART_ENABLE_IT(&huart7, UART_IT_RXNE);
+    HAL_NVIC_SetPriority(UART7_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(UART7_IRQn);
+}
+
+void chassis_link_rx_isr(void)
+{
+    uint8_t byte = (uint8_t)(huart7.Instance->RDR & 0xFFu);
+
+    if (s_chassis_index == 0u)
+    {
+        if (byte == 0xAAu)
+        {
+            s_chassis_frame[0] = byte;
+            s_chassis_index = 1u;
+        }
+        return;
+    }
+    if (s_chassis_index == 1u)
+    {
+        if (byte == 0x55u)
+        {
+            s_chassis_frame[1] = byte;
+            s_chassis_index = 2u;
+        }
+        else if (byte == 0xAAu)
+        {
+            s_chassis_frame[0] = byte;
+            s_chassis_index = 1u;
+        }
+        else
+        {
+            s_chassis_index = 0u;
+        }
+        return;
+    }
+
+    s_chassis_frame[s_chassis_index++] = byte;
+    if (s_chassis_index >= CHASSIS_FRAME_LEN)
+    {
+        chassis_parse_frame();
+        s_chassis_index = 0u;
+    }
+}
+
+void chassis_link_on_uart_error(void)
+{
+    s_chassis_index = 0u;
+    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
+}
+
+uint8_t chassis_link_get_status(ChassisStatus_t *status, uint32_t now_ms)
+{
+    uint32_t primask;
+    uint8_t valid;
+
+    if (status == NULL)
+    {
+        return 0u;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    *status = s_chassis_status;
+    valid = (uint8_t)(
+        (s_chassis_have_status != 0u) &&
+        (s_chassis_status.valid != 0u) &&
+        ((uint32_t)(now_ms - s_chassis_status.rx_ms) <=
+         CHASSIS_LINK_TIMEOUT_MS)
+    );
+    if (primask == 0u)
+    {
+        __enable_irq();
+    }
+    return valid;
+}
+
+uint32_t chassis_link_crc_error_count(void)
+{
+    return s_chassis_crc_errors;
+}
+
+uint32_t chassis_link_sequence_error_count(void)
+{
+    return s_chassis_sequence_errors;
+}
 
 static uint16_t gl_tx_free(void)
 {
@@ -259,6 +449,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     if (huart == &huart10)
     {
         debug_uart10_tx_complete();
+        return;
+    }
+    if (huart == &huart7)
+    {
+        chassis_link_on_uart_error();
         return;
     }
     if ((huart != &GL_TX_HUART) && (huart != &GL_RX_HUART))

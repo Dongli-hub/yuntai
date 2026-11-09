@@ -313,6 +313,10 @@ void UART7_IRQHandler(void)
   {
     gimbal_link_rx_isr();
   }
+  else if (__HAL_UART_GET_FLAG(&huart7, UART_FLAG_RXNE) != RESET)
+  {
+    chassis_link_rx_isr();
+  }
   HAL_UART_IRQHandler(&huart7);
 }
 

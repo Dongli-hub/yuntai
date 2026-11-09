@@ -61,6 +61,18 @@ typedef struct
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */
 } GimbalCmd_t;
 
+/* Chassis -> H723: UART7 fixed 16-byte frame, 50 Hz. */
+typedef struct
+{
+    uint16_t seq;
+    uint32_t chassis_ms;
+    uint32_t rx_ms;
+    uint8_t phase;
+    int8_t turn_dir;
+    uint8_t flags;
+    uint8_t valid;
+} ChassisStatus_t;
+
 /* 上报给上位机的状态（由 yuntai_task 填充） */
 typedef struct
 {
@@ -80,6 +92,13 @@ typedef struct
 void               gimbal_link_init(void);
 void               gimbal_link_poll(uint32_t now_ms);
 void               gimbal_link_rx_isr(void);          /* 在 UART7_IRQHandler 里调用 */
+void               chassis_link_init(void);
+void               chassis_link_rx_isr(void);
+void               chassis_link_on_uart_error(void);
+uint8_t            chassis_link_get_status(ChassisStatus_t *status,
+                                           uint32_t now_ms);
+uint32_t           chassis_link_crc_error_count(void);
+uint32_t           chassis_link_sequence_error_count(void);
 /* 判断某个串口是不是"当前接收串口"（拆分模式下 TX/RX 可能是两个串口） */
 uint8_t            gimbal_link_is_rx_uart(UART_HandleTypeDef *huart);
 void               gimbal_link_set_telem(const GimbalTelem_t *t);
