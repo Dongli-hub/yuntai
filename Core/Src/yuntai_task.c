@@ -1298,6 +1298,8 @@ static float   g_vis_turn_yaw_scale = 1.0f;
 static uint8_t g_vis_turn_learning_frozen;
 static uint8_t g_chassis_turn_phase;
 static uint8_t g_chassis_prev_phase;
+static int8_t  g_chassis_turn_dir;
+static uint8_t g_chassis_link_valid;
 static uint32_t g_chassis_status_age_ms;
 static uint32_t g_chassis_turn_exit_ms;
 
@@ -1592,6 +1594,7 @@ static void vis_turn_authority_update(uint32_t now)
         link_valid &&
         ((chassis.phase == 1u) || (chassis.phase == 2u))
     );
+    g_chassis_link_valid = link_valid;
     if (link_valid)
     {
         if ((chassis.phase == 3u) && (g_chassis_prev_phase != 3u))
@@ -1599,12 +1602,14 @@ static void vis_turn_authority_update(uint32_t now)
             g_chassis_turn_exit_ms = now;
         }
         g_chassis_turn_phase = chassis.phase;
+        g_chassis_turn_dir = chassis.turn_dir;
         g_chassis_prev_phase = chassis.phase;
         g_chassis_status_age_ms = now - chassis.rx_ms;
     }
     else
     {
         g_chassis_turn_phase = 0u;
+        g_chassis_turn_dir = 0;
         g_chassis_prev_phase = 0u;
         g_chassis_status_age_ms = 0xFFFFFFFFu;
     }
@@ -2306,6 +2311,18 @@ static void yuntai_control(uint32_t now)
                     -YAW_BASE_RATE_LIMIT_RADS, YAW_BASE_RATE_LIMIT_RADS);
                 /* 静止时陀螺/位置差分的残差不应变成周期性电流脉冲。 */
                 if (fabsf(g_yaw_base_rate) < 0.03f)  /* ≈1.7°/s */
+                {
+                    g_yaw_base_rate = 0.0f;
+                }
+                /* During a confirmed turn the chassis direction is known.
+                 * The indirect gyro-minus-motor estimate can briefly reverse
+                 * at turn entry/exit; never let that wrong-sign term drive the
+                 * yaw feed-forward in the opposite direction. */
+                if ((g_chassis_link_valid != 0u) &&
+                    (g_chassis_turn_dir != 0) &&
+                    ((g_chassis_turn_phase == 2u) ||
+                     (g_chassis_turn_phase == 3u)) &&
+                    ((g_yaw_base_rate * (float)g_chassis_turn_dir) < 0.0f))
                 {
                     g_yaw_base_rate = 0.0f;
                 }
