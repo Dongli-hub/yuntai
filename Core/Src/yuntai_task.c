@@ -1237,15 +1237,11 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TRACK_COAST_MS          450u
 #define VIS_TRACK_LOST_MS           500u
 
-/* Chassis turn handling: keep a small position correction while the
- * chassis-reported turn cancels most of the motion through the existing
- * yaw feed-forward and inertial damping. */
-#define VIS_TURN_YAW_SCALE          0.20f
-#define VIS_TURN_ENTRY_RAMP_MS      100.0f
-#define VIS_TURN_EXIT_HOLD_MS       300u
-#define VIS_TURN_EXIT_RAMP_MS       400u
+/* Chassis turn handling: keep the normal visual position loop and preserve
+ * the target's world-bearing rate as feed-forward while the car advances
+ * around the corner. */
+#define VIS_TURN_YAW_SCALE          1.00f
 #define VIS_TURN_EXIT_SETTLE_MS     300u
-#define VIS_TURN_YAW_ERROR_LIMIT_DEG 1.0f
 #define VIS_TURN_TARGET_RATE_LIMIT_DPS 30.0f
 
 typedef struct
@@ -1578,24 +1574,13 @@ static float vis_total_age_ms(const GimbalCmd_t *cmd, uint32_t now)
     return clampf(age_ms, 0.0f, 9999.0f);
 }
 
-static void vis_turn_authority_update(uint32_t now)
+static void vis_turn_state_update(uint32_t now)
 {
     ChassisStatus_t chassis;
     uint8_t link_valid;
-    uint8_t turn_low_authority;
-    uint8_t turn_exit_hold;
-    uint8_t turn_exit_ramp;
     uint8_t turn_active;
-    uint32_t turn_exit_elapsed;
-    float target;
-    float step;
 
     link_valid = chassis_link_get_status(&chassis, now);
-    turn_low_authority = (uint8_t)(
-        link_valid &&
-        ((chassis.flags & 0x04u) != 0u) &&
-        ((chassis.phase == 1u) || (chassis.phase == 2u))
-    );
     g_chassis_link_valid = link_valid;
     if (link_valid)
     {
@@ -1632,51 +1617,7 @@ static void vis_turn_authority_update(uint32_t now)
         )
     );
     g_vis_turn_active = turn_active;
-
-    turn_exit_elapsed = now - g_chassis_turn_exit_ms;
-    turn_exit_hold = (uint8_t)(
-        link_valid &&
-        ((chassis.flags & 0x04u) != 0u) &&
-        (chassis.phase == 3u) &&
-        (turn_exit_elapsed < VIS_TURN_EXIT_HOLD_MS)
-    );
-    turn_exit_ramp = (uint8_t)(
-        link_valid &&
-        ((chassis.flags & 0x04u) != 0u) &&
-        (chassis.phase == 3u) &&
-        (turn_exit_elapsed >= VIS_TURN_EXIT_HOLD_MS) &&
-        (turn_exit_elapsed <
-         (VIS_TURN_EXIT_HOLD_MS + VIS_TURN_EXIT_RAMP_MS))
-    );
-
-    target = (turn_low_authority || turn_exit_hold) ?
-             VIS_TURN_YAW_SCALE : 1.0f;
-    if (turn_exit_ramp != 0u)
-    {
-        target = VIS_TURN_YAW_SCALE +
-                 (1.0f - VIS_TURN_YAW_SCALE) *
-                 (float)(turn_exit_elapsed - VIS_TURN_EXIT_HOLD_MS) /
-                 (float)VIS_TURN_EXIT_RAMP_MS;
-    }
-    step = (float)g_ctrl_period_ms /
-        (turn_low_authority ?
-         VIS_TURN_ENTRY_RAMP_MS : VIS_TURN_EXIT_RAMP_MS);
-    if (g_vis_turn_yaw_scale < target)
-    {
-        g_vis_turn_yaw_scale += step;
-        if (g_vis_turn_yaw_scale > target)
-        {
-            g_vis_turn_yaw_scale = target;
-        }
-    }
-    else if (g_vis_turn_yaw_scale > target)
-    {
-        g_vis_turn_yaw_scale -= step;
-        if (g_vis_turn_yaw_scale < target)
-        {
-            g_vis_turn_yaw_scale = target;
-        }
-    }
+    g_vis_turn_yaw_scale = VIS_TURN_YAW_SCALE;
 }
 
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
@@ -1838,13 +1779,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         if (fabsf(yaw_deg) < VIS_DEADBAND_YAW_DEG)
         {
             yaw_deg = 0.0f;
-        }
-        if ((g_vis_turn_active != 0u) &&
-            (fabsf(yaw_deg) > VIS_TURN_YAW_ERROR_LIMIT_DEG))
-        {
-            yaw_deg = (yaw_deg > 0.0f) ?
-                VIS_TURN_YAW_ERROR_LIMIT_DEG :
-                -VIS_TURN_YAW_ERROR_LIMIT_DEG;
         }
         if (fabsf(pitch_deg) < VIS_DEADBAND_PITCH_DEG)
         {
@@ -2228,7 +2162,7 @@ static void yuntai_control(uint32_t now)
 
     /* ---- 视觉外环：角度误差 -> 视觉目标角 ---- */
     yuntai_mark_stage(32u);
-    vis_turn_authority_update(now);
+    vis_turn_state_update(now);
     vis_outer_step(cmd, mode, now);
 
     /* ======================================================================
