@@ -305,7 +305,13 @@
  *       (0x12, 955)  = 反符号试试（若陀螺/编码器方向约定与上面不符）*/
 #define YAW_BASE_FF_RPM_PER_RADS (-9.55f)
 #define YAW_FF_SIGN            (-1.0f)
-#define YAW_BASE_RATE_LIMIT_RADS  0.60f
+/* The chassis turn is V/R = 0.14/0.062 = 2.26 rad/s. Keep enough
+ * range for the local gyro/encoder estimate to represent that motion
+ * without flattening the feed-forward for most of the turn. */
+#define YAW_BASE_RATE_LIMIT_RADS  3.00f
+#define YAW_BASE_RATE_FILTER_ALPHA_NORMAL 0.02f
+#define YAW_BASE_RATE_FILTER_ALPHA_TURN   0.10f
+#define YAW_BASE_FF_LIMIT_MA      1200.0f
 
 /* ---- 偏航静摩擦补偿（2026-09-30 新增）----
  * 现场逐帧实测：视觉环给出 1.5° 的目标变化时，平台 0.7 秒只走了 0.34° ——
@@ -704,9 +710,8 @@ static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x1
  *   有延迟，两者相减就冒出一个假的"底盘转速"，前馈于是**变成正反馈**，越喂越振。
  *   ⇒ 想再启用必须把估计器做得更慢（现在 τ≈50ms）并现场验证 wb= 静止时不翻。
  *   默认 0 = 关；想试 (0x12, 50)；符号反了就发负值。*/
-/* 2026-10-27: small chassis feedforward for the near->far start transient.
- * Keep it conservative because the base estimate still contains some
- * platform self-motion. */
+/* Chassis feed-forward gain in A/(rad/s). It is proportional to the
+ * locally estimated base rate and has a separate final current limit. */
 static float g_yaw_base_ff    = 0.4f;
 static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
 static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
@@ -1237,7 +1242,8 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * yaw feed-forward and inertial damping. */
 #define VIS_TURN_YAW_SCALE          0.20f
 #define VIS_TURN_ENTRY_RAMP_MS      100.0f
-#define VIS_TURN_EXIT_RAMP_MS       200.0f
+#define VIS_TURN_EXIT_HOLD_MS       300u
+#define VIS_TURN_EXIT_RAMP_MS       400u
 #define VIS_TURN_EXIT_SETTLE_MS     300u
 #define VIS_TURN_YAW_ERROR_LIMIT_DEG 1.0f
 
@@ -1299,6 +1305,7 @@ static uint8_t g_vis_turn_learning_frozen;
 static uint8_t g_chassis_turn_phase;
 static uint8_t g_chassis_prev_phase;
 static int8_t  g_chassis_turn_dir;
+static uint8_t g_chassis_flags;
 static uint8_t g_chassis_link_valid;
 static uint32_t g_chassis_status_age_ms;
 static uint32_t g_chassis_turn_exit_ms;
@@ -1585,13 +1592,17 @@ static void vis_turn_authority_update(uint32_t now)
     ChassisStatus_t chassis;
     uint8_t link_valid;
     uint8_t turn_low_authority;
+    uint8_t turn_exit_hold;
+    uint8_t turn_exit_ramp;
     uint8_t learning_frozen;
+    uint32_t turn_exit_elapsed;
     float target;
     float step;
 
     link_valid = chassis_link_get_status(&chassis, now);
     turn_low_authority = (uint8_t)(
         link_valid &&
+        ((chassis.flags & 0x04u) != 0u) &&
         ((chassis.phase == 1u) || (chassis.phase == 2u))
     );
     g_chassis_link_valid = link_valid;
@@ -1603,6 +1614,7 @@ static void vis_turn_authority_update(uint32_t now)
         }
         g_chassis_turn_phase = chassis.phase;
         g_chassis_turn_dir = chassis.turn_dir;
+        g_chassis_flags = chassis.flags;
         g_chassis_prev_phase = chassis.phase;
         g_chassis_status_age_ms = now - chassis.rx_ms;
     }
@@ -1610,12 +1622,14 @@ static void vis_turn_authority_update(uint32_t now)
     {
         g_chassis_turn_phase = 0u;
         g_chassis_turn_dir = 0;
+        g_chassis_flags = 0u;
         g_chassis_prev_phase = 0u;
         g_chassis_status_age_ms = 0xFFFFFFFFu;
     }
 
     learning_frozen = (uint8_t)(
         link_valid &&
+        ((chassis.flags & 0x04u) != 0u) &&
         (
             (chassis.phase == 1u) ||
             (chassis.phase == 2u) ||
@@ -1628,7 +1642,31 @@ static void vis_turn_authority_update(uint32_t now)
     );
     g_vis_turn_learning_frozen = learning_frozen;
 
-    target = turn_low_authority ? VIS_TURN_YAW_SCALE : 1.0f;
+    turn_exit_elapsed = now - g_chassis_turn_exit_ms;
+    turn_exit_hold = (uint8_t)(
+        link_valid &&
+        ((chassis.flags & 0x04u) != 0u) &&
+        (chassis.phase == 3u) &&
+        (turn_exit_elapsed < VIS_TURN_EXIT_HOLD_MS)
+    );
+    turn_exit_ramp = (uint8_t)(
+        link_valid &&
+        ((chassis.flags & 0x04u) != 0u) &&
+        (chassis.phase == 3u) &&
+        (turn_exit_elapsed >= VIS_TURN_EXIT_HOLD_MS) &&
+        (turn_exit_elapsed <
+         (VIS_TURN_EXIT_HOLD_MS + VIS_TURN_EXIT_RAMP_MS))
+    );
+
+    target = (turn_low_authority || turn_exit_hold) ?
+             VIS_TURN_YAW_SCALE : 1.0f;
+    if (turn_exit_ramp != 0u)
+    {
+        target = VIS_TURN_YAW_SCALE +
+                 (1.0f - VIS_TURN_YAW_SCALE) *
+                 (float)(turn_exit_elapsed - VIS_TURN_EXIT_HOLD_MS) /
+                 (float)VIS_TURN_EXIT_RAMP_MS;
+    }
     step = (float)g_ctrl_period_ms /
         (turn_low_authority ?
          VIS_TURN_ENTRY_RAMP_MS : VIS_TURN_EXIT_RAMP_MS);
@@ -2278,7 +2316,9 @@ static void yuntai_control(uint32_t now)
              * 差分**：位置一直是真实数据、随 0x2A 回复 1kHz 更新、0.01° 分辨率。
              * 两道保护：
              *   ① 单帧速率 >±10rad/s（573°/s）= 位置跳变/毛刺，整帧丢弃；
-             *   ② 一阶低通 **τ≈50ms**（1kHz 下 a=0.02）。
+             *   ② 一阶低通：普通状态 τ≈50ms（1kHz 下 a=0.02）；
+             *      phase 2 和出弯前 300ms 临时使用 τ≈10ms（a=0.10），
+             *      让转弯起始阶段的本地前馈跟得上底盘角速度。
              *      ⚠ 54 号日志教训：a=0.15（τ=7ms）时，环路自身的 10~25Hz 抖动
              *      会从"陀螺与位置差分的相位差"里冒出来，被误当成底盘转速 ——
              *      所以必须慢到只跟得上手转底盘那种 1~2Hz 的运动。
@@ -2299,9 +2339,19 @@ static void yuntai_control(uint32_t now)
                     float d_deg = g_yaw_fb.cont - g_yaw_pos_last;
                     float rate  = (d_deg / 57.29578f) /
                                   ((float)(now - g_yaw_pos_ms) * 0.001f);
+                    float mot_alpha =
+                        YAW_BASE_RATE_FILTER_ALPHA_NORMAL;
+                    if ((g_chassis_link_valid != 0u) &&
+                        ((g_chassis_turn_phase == 2u) ||
+                         ((g_chassis_turn_phase == 3u) &&
+                          ((uint32_t)(now - g_chassis_turn_exit_ms) <
+                           VIS_TURN_EXIT_SETTLE_MS))))
+                    {
+                        mot_alpha = YAW_BASE_RATE_FILTER_ALPHA_TURN;
+                    }
                     if (fabsf(rate) < 10.0f)
                     {
-                        g_mot_rate_f += 0.02f * (rate - g_mot_rate_f);
+                        g_mot_rate_f += mot_alpha * (rate - g_mot_rate_f);
                     }
                     g_yaw_pos_last = g_yaw_fb.cont;
                 }
@@ -2327,6 +2377,7 @@ static void yuntai_control(uint32_t now)
                  * reverse; never let a wrong-sign term drive yaw feed-forward
                  * in the opposite direction. */
                 else if ((g_chassis_link_valid != 0u) &&
+                         ((g_chassis_flags & 0x02u) != 0u) &&
                          (g_chassis_turn_dir != 0) &&
                          ((g_chassis_turn_phase == 2u) ||
                           (g_chassis_turn_phase == 3u)) &&
@@ -2621,9 +2672,12 @@ static void yuntai_control(uint32_t now)
         if ((g_yaw_base_ff != 0.0f) &&
             (mode == GP_MODE_AIM) && (cmd->aim_valid != 0u))
         {
-            float e = g_yaw_base_rate / 0.3f;
-            e = clampf(e, -1.0f, 1.0f);
-            g_rate_iq_ma -= g_yaw_base_ff * 1000.0f * e;
+            float base_ff_ma =
+                -g_yaw_base_ff * 1000.0f * g_yaw_base_rate;
+            base_ff_ma = clampf(base_ff_ma,
+                                -YAW_BASE_FF_LIMIT_MA,
+                                YAW_BASE_FF_LIMIT_MA);
+            g_rate_iq_ma += base_ff_ma;
             g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
         }
 
