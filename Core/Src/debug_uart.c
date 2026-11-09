@@ -41,7 +41,7 @@ void debug_uart10_init(void)
     static const char header[] =
         "ms,mode,aim,src,age,seq,tu,tv,su,sv,dist,ey,ep,wy,wp,ay,ap,"
         "iyy,iyp,yr,gyro,ycmd,yiq,ybase,pit,ptgt,pcmd,piq,vfps,flt,geom,"
-        "reproj,refine,tw,th,layer,cph,cage,vscale\r\n";
+        "reproj,refine,tw,th,layer,cph,cage,vscale,crx,cerr,cseq\r\n";
     HAL_NVIC_SetPriority(USART10_IRQn, 6u, 0u);
     HAL_NVIC_EnableIRQ(USART10_IRQn);
     (void)debug_uart10_send(header);

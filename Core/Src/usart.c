@@ -119,7 +119,8 @@ void UART7_BindPins(uint8_t pair)
   GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull      = GPIO_PULLUP;
   GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF11_UART7;
+  GPIO_InitStruct.Alternate = (pair == UART7_PAIR_PE)
+                              ? GPIO_AF7_UART7 : GPIO_AF11_UART7;
 
   if (pair == UART7_PAIR_PB3)
   {

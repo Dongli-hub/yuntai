@@ -97,6 +97,7 @@ void               chassis_link_rx_isr(void);
 void               chassis_link_on_uart_error(void);
 uint8_t            chassis_link_get_status(ChassisStatus_t *status,
                                            uint32_t now_ms);
+uint32_t           chassis_link_raw_byte_count(void);
 uint32_t           chassis_link_crc_error_count(void);
 uint32_t           chassis_link_sequence_error_count(void);
 /* 判断某个串口是不是"当前接收串口"（拆分模式下 TX/RX 可能是两个串口） */

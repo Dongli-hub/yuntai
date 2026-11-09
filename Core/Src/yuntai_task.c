@@ -2773,7 +2773,7 @@ static void uart10_append_float(char *buf, size_t cap, size_t *pos,
 static void yuntai_uart10_debug(uint32_t now)
 {
     const GimbalCmd_t *cmd = gimbal_link_cmd();
-    char line[280];
+    char line[360];
     size_t pos = 0u;
     uint32_t vis_age;
     float yaw_rel_deg;
@@ -2905,6 +2905,14 @@ static void yuntai_uart10_debug(uint32_t now)
     }
     uart10_append_float(line, sizeof(line), &pos,
                         g_vis_turn_yaw_scale, 2);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%lu,%lu,%lu",
+                 (unsigned long)chassis_link_raw_byte_count(),
+                 (unsigned long)chassis_link_crc_error_count(),
+                 (unsigned long)chassis_link_sequence_error_count());
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
     snprintf(line + pos, sizeof(line) - pos, "\r\n");
     (void)debug_uart10_send(line);
 }

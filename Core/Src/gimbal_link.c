@@ -149,6 +149,7 @@ static uint8_t           s_text_len;
 static uint8_t            s_chassis_frame[CHASSIS_FRAME_LEN];
 static uint8_t            s_chassis_index;
 static volatile ChassisStatus_t s_chassis_status;
+static volatile uint32_t  s_chassis_raw_bytes;
 static volatile uint32_t  s_chassis_crc_errors;
 static volatile uint32_t  s_chassis_sequence_errors;
 static volatile uint8_t   s_chassis_have_status;
@@ -241,6 +242,7 @@ void chassis_link_init(void)
 {
     s_chassis_index = 0u;
     s_chassis_have_status = 0u;
+    s_chassis_raw_bytes = 0u;
     s_chassis_crc_errors = 0u;
     s_chassis_sequence_errors = 0u;
     memset((void *)&s_chassis_status, 0, sizeof(s_chassis_status));
@@ -257,6 +259,7 @@ void chassis_link_rx_isr(void)
 {
     uint8_t byte = (uint8_t)(huart7.Instance->RDR & 0xFFu);
 
+    s_chassis_raw_bytes++;
     if (s_chassis_index == 0u)
     {
         if (byte == 0xAAu)
@@ -328,6 +331,11 @@ uint8_t chassis_link_get_status(ChassisStatus_t *status, uint32_t now_ms)
 uint32_t chassis_link_crc_error_count(void)
 {
     return s_chassis_crc_errors;
+}
+
+uint32_t chassis_link_raw_byte_count(void)
+{
+    return s_chassis_raw_bytes;
 }
 
 uint32_t chassis_link_sequence_error_count(void)
