@@ -2314,15 +2314,24 @@ static void yuntai_control(uint32_t now)
                 {
                     g_yaw_base_rate = 0.0f;
                 }
-                /* During a confirmed turn the chassis direction is known.
-                 * The indirect gyro-minus-motor estimate can briefly reverse
-                 * at turn entry/exit; never let that wrong-sign term drive the
-                 * yaw feed-forward in the opposite direction. */
+                /* PRE_TURN has zero commanded chassis yaw rate. The indirect
+                 * gyro-minus-motor estimate is therefore noise there, not a
+                 * useful feed-forward. */
                 if ((g_chassis_link_valid != 0u) &&
-                    (g_chassis_turn_dir != 0) &&
-                    ((g_chassis_turn_phase == 2u) ||
-                     (g_chassis_turn_phase == 3u)) &&
-                    ((g_yaw_base_rate * (float)g_chassis_turn_dir) < 0.0f))
+                    (g_chassis_turn_phase == 1u))
+                {
+                    g_yaw_base_rate = 0.0f;
+                }
+                /* During actual turn / post-turn recovery the chassis
+                 * direction is known. The indirect estimate can briefly
+                 * reverse; never let a wrong-sign term drive yaw feed-forward
+                 * in the opposite direction. */
+                else if ((g_chassis_link_valid != 0u) &&
+                         (g_chassis_turn_dir != 0) &&
+                         ((g_chassis_turn_phase == 2u) ||
+                          (g_chassis_turn_phase == 3u)) &&
+                         ((g_yaw_base_rate *
+                           (float)g_chassis_turn_dir) < 0.0f))
                 {
                     g_yaw_base_rate = 0.0f;
                 }
