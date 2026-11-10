@@ -1186,7 +1186,7 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.20f
 
-#define VIS_SIGN_YAW       -1.0f
+#define VIS_SIGN_YAW        1.0f
 #define VIS_SIGN_PITCH     -1.0f
 #define VIS_RATE_YAW_DPS    250.0f   /* 视觉偏置角速度限幅 */
 #define VIS_RATE_PITCH_DPS  250.0f
