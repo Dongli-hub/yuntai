@@ -1506,10 +1506,14 @@ static float vis_turn_target_rate(float raw_rate_dps, float frame_dt,
     return raw_rate_dps;
 }
 
-static void vis_direct_yaw_target_step(float error_deg, float frame_dt)
+static void vis_direct_yaw_target_step(float target_offset_deg,
+                                       float frame_dt)
 {
     float max_step = VIS_DIRECT_TARGET_SLEW_DPS * frame_dt;
-    float target_step = clampf(error_deg, -max_step, max_step);
+    float target_delta = vis_wrap_pm180_deg(
+        target_offset_deg - g_vis_yaw_angle_deg
+    );
+    float target_step = clampf(target_delta, -max_step, max_step);
 
     if (fabsf(target_step) < 0.01f)
     {
@@ -1733,6 +1737,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float raw_yaw_deg;
         float raw_pitch_deg;
         float raw_yaw_error_deg;
+        float predicted_target_offset_deg;
         float yaw_deg;
         float pitch_deg;
         float yaw_measure_deg;
@@ -1847,6 +1852,9 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             raw_yaw_error_deg = vis_wrap_pm180_deg(
                 predicted_yaw - imuAngle[0] * 57.29578f
             );
+            predicted_target_offset_deg = angle_diff_rad(
+                predicted_yaw / 57.29578f, g_yaw_lock_rad
+            ) * 57.29578f;
             yaw_deg = raw_yaw_error_deg;
             g_vis_pitch_target_motor_deg = target_motor_pitch;
             g_vis_pitch_applied_rate_dps = predicted_pitch_rate;
@@ -1880,7 +1888,9 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
          * 没有新视觉帧时偏置角保持，不清零。 */
         {
 #if VIS_USE_DIRECT_ALPHA_TARGET
-            vis_direct_yaw_target_step(raw_yaw_error_deg, frame_dt);
+            vis_direct_yaw_target_step(
+                predicted_target_offset_deg, frame_dt
+            );
 #else
             float yaw_rate;
             yaw_rate = g_yaw_vis_gain *
@@ -1922,12 +1932,12 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             float predicted_elevation = vis_track_predict(
                 &g_vis_track_pitch, now, &predicted_pitch_rate
             );
-            float current_yaw_error = vis_wrap_pm180_deg(
-                predicted_yaw - imuAngle[0] * 57.29578f
-            );
 #if VIS_USE_DIRECT_ALPHA_TARGET
             vis_direct_yaw_target_step(
-                current_yaw_error, (float)g_ctrl_period_ms * 0.001f
+                angle_diff_rad(
+                    predicted_yaw / 57.29578f, g_yaw_lock_rad
+                ) * 57.29578f,
+                (float)g_ctrl_period_ms * 0.001f
             );
 #endif
             g_vis_pitch_target_motor_deg =
