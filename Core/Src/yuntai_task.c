@@ -1242,10 +1242,10 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * around the corner. */
 #define VIS_TURN_YAW_SCALE          1.00f
 #define VIS_TURN_EXIT_SETTLE_MS     300u
-#define VIS_TURN_TRACK_BETA             0.03f
-#define VIS_TURN_TARGET_RATE_LIMIT_DPS  20.0f
-#define VIS_TURN_TARGET_RATE_TAU_S       0.100f
-#define VIS_TURN_TARGET_RATE_SLEW_DPS    2.0f
+#define VIS_TURN_TRACK_BETA             0.05f
+#define VIS_TURN_TARGET_RATE_LIMIT_DPS  25.0f
+#define VIS_TURN_TARGET_RATE_TAU_S       0.070f
+#define VIS_TURN_TARGET_RATE_SLEW_DPS    3.0f
 #define VIS_TURN_TARGET_RATE_RECOVERY_MS 400u
 
 typedef struct
