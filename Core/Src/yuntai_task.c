@@ -1806,7 +1806,8 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             g_vis_yaw_rate_dps = yaw_rate;
             g_vis_pitch_rate_dps = pitch_rate;
             g_vis_yaw_angle_deg = clampf(
-                g_vis_yaw_angle_deg + yaw_rate * frame_dt,
+                g_vis_yaw_angle_deg +
+                    (yaw_rate + g_vis_yaw_applied_rate_dps) * frame_dt,
                 -g_vis_limyaw_deg, g_vis_limyaw_deg);
             g_vis_pitch_angle_deg = clampf(
                 g_vis_pitch_angle_deg + pitch_rate * frame_dt,
@@ -2111,12 +2112,13 @@ static void yuntai_control(uint32_t now)
         }
     }
 
-    /* ---- 主动查一次俯仰位置（1ms = 1kHz）----
+    /* ---- 主动查一次俯仰位置（10ms = 100Hz）----
      * 为什么不能只靠驱动器"主动上报"：上报周期由驱动器决定、我们看不见也改不了。
      * 一旦它偏慢（比如 50ms），位置环就等于多了 25~50ms 的纯延迟 ——
      * 位置环的自激（掰一下开始抖、手扶就稳）几乎都是这么来的。
-     * 主动查询把反馈延迟钉死在 1ms 以内，并与位置环同频。 */
-    if ((now - g_last_read_ms) >= 1u)
+     * 恢复首次延迟补偿版本的 100Hz 查询，避免 1kHz 位置量化噪声经
+     * 速度模式 PID 的 D 项放大成高频颤动。 */
+    if ((now - g_last_read_ms) >= 10u)
     {
         g_last_read_ms = now;
         jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
