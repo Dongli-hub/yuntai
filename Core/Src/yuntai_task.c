@@ -1242,7 +1242,11 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
  * around the corner. */
 #define VIS_TURN_YAW_SCALE          1.00f
 #define VIS_TURN_EXIT_SETTLE_MS     300u
-#define VIS_TURN_TARGET_RATE_LIMIT_DPS 30.0f
+#define VIS_TURN_TRACK_BETA             0.03f
+#define VIS_TURN_TARGET_RATE_LIMIT_DPS  20.0f
+#define VIS_TURN_TARGET_RATE_TAU_S       0.100f
+#define VIS_TURN_TARGET_RATE_SLEW_DPS    2.0f
+#define VIS_TURN_TARGET_RATE_RECOVERY_MS 400u
 
 typedef struct
 {
@@ -1299,6 +1303,10 @@ static VisAlphaBeta_t g_vis_track_yaw = {.wrap360 = 1u};
 static VisAlphaBeta_t g_vis_track_pitch;
 static float   g_vis_turn_yaw_scale = 1.0f;
 static uint8_t g_vis_turn_active;
+static uint8_t g_vis_turn_rate_filter_valid;
+static uint8_t g_vis_turn_rate_prev_active;
+static float   g_vis_turn_target_rate_dps;
+static uint32_t g_vis_turn_rate_recover_ms;
 static uint8_t g_chassis_turn_phase;
 static uint8_t g_chassis_prev_phase;
 static int8_t  g_chassis_turn_dir;
@@ -1415,7 +1423,7 @@ static float vis_track_predict(const VisAlphaBeta_t *tracker, uint32_t now,
 }
 
 static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
-                             uint32_t capture_ms)
+                             uint32_t capture_ms, float beta)
 {
     int32_t gap = (int32_t)(capture_ms - tracker->ms);
     float dt;
@@ -1450,12 +1458,66 @@ static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
         rate_residual = clampf(residual,
                                -VIS_TRACK_RATE_CLIP_DEG,
                                VIS_TRACK_RATE_CLIP_DEG);
-        tracker->rate += VIS_TRACK_BETA * rate_residual / dt;
+        tracker->rate += beta * rate_residual / dt;
         tracker->rate = clampf(tracker->rate,
                                -VIS_TRACK_MAX_RATE_DPS,
                                VIS_TRACK_MAX_RATE_DPS);
         tracker->ms = capture_ms;
     }
+}
+
+static float vis_turn_target_rate(float raw_rate_dps, float frame_dt,
+                                  uint32_t now)
+{
+    float alpha;
+    float next;
+    float step;
+
+    frame_dt = clampf(frame_dt, 0.001f, 0.100f);
+    if (g_vis_turn_active != 0u)
+    {
+        /* The position tracker remains unchanged; only the velocity learned
+         * from a fast-rotating corner is made conservative. */
+        if (g_vis_turn_rate_filter_valid == 0u)
+        {
+            g_vis_turn_target_rate_dps = clampf(
+                g_vis_yaw_applied_rate_dps,
+                -VIS_TURN_TARGET_RATE_LIMIT_DPS,
+                VIS_TURN_TARGET_RATE_LIMIT_DPS
+            );
+            g_vis_turn_rate_filter_valid = 1u;
+            return g_vis_turn_target_rate_dps;
+        }
+        alpha = frame_dt / (VIS_TURN_TARGET_RATE_TAU_S + frame_dt);
+        next = g_vis_turn_target_rate_dps +
+               alpha * (raw_rate_dps - g_vis_turn_target_rate_dps);
+        step = clampf(next - g_vis_turn_target_rate_dps,
+                      -VIS_TURN_TARGET_RATE_SLEW_DPS,
+                      VIS_TURN_TARGET_RATE_SLEW_DPS);
+        g_vis_turn_target_rate_dps = clampf(
+            g_vis_turn_target_rate_dps + step,
+            -VIS_TURN_TARGET_RATE_LIMIT_DPS,
+            VIS_TURN_TARGET_RATE_LIMIT_DPS
+        );
+        return g_vis_turn_target_rate_dps;
+    }
+
+    if (g_vis_turn_rate_filter_valid != 0u)
+    {
+        uint32_t elapsed = now - g_vis_turn_rate_recover_ms;
+        if (elapsed < VIS_TURN_TARGET_RATE_RECOVERY_MS)
+        {
+            float blend = (float)elapsed /
+                          (float)VIS_TURN_TARGET_RATE_RECOVERY_MS;
+            alpha = frame_dt / (0.050f + frame_dt);
+            g_vis_turn_target_rate_dps +=
+                alpha * (raw_rate_dps - g_vis_turn_target_rate_dps);
+            return g_vis_turn_target_rate_dps +
+                   blend * (raw_rate_dps - g_vis_turn_target_rate_dps);
+        }
+        g_vis_turn_rate_filter_valid = 0u;
+    }
+    return raw_rate_dps;
 }
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
@@ -1533,6 +1595,10 @@ static void vis_outer_reset(void)
     g_vis_yaw_error_deg = 0.0f;
     g_vis_pitch_error_deg = 0.0f;
     g_vis_yaw_applied_rate_dps = 0.0f;
+    g_vis_turn_target_rate_dps = 0.0f;
+    g_vis_turn_rate_filter_valid = 0u;
+    g_vis_turn_rate_prev_active = 0u;
+    g_vis_turn_rate_recover_ms = 0u;
     g_vis_latency_ms = 0.0f;
     g_vis_yaw_angle_deg = 0.0f;
     g_vis_pitch_angle_deg = 0.0f;
@@ -1616,6 +1682,18 @@ static void vis_turn_state_update(uint32_t now)
             )
         )
     );
+    if (turn_active != g_vis_turn_rate_prev_active)
+    {
+        if (turn_active != 0u)
+        {
+            g_vis_turn_rate_filter_valid = 0u;
+        }
+        else
+        {
+            g_vis_turn_rate_recover_ms = now;
+        }
+        g_vis_turn_rate_prev_active = turn_active;
+    }
     g_vis_turn_active = turn_active;
     g_vis_turn_yaw_scale = VIS_TURN_YAW_SCALE;
 }
@@ -1738,11 +1816,20 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         /* Keep learning the target's world-bearing rate through a turn. The
          * chassis state lowers the visual position authority, but the target
          * still moves because the car keeps advancing around the arc. */
-        vis_track_update(yaw_tracker, yaw_measure_deg, capture_ms);
-        vis_track_update(pitch_tracker, pitch_measure_deg, capture_ms);
+        vis_track_update(
+            yaw_tracker,
+            yaw_measure_deg,
+            capture_ms,
+            (g_vis_turn_active != 0u) ?
+                VIS_TURN_TRACK_BETA : VIS_TRACK_BETA
+        );
+        vis_track_update(
+            pitch_tracker, pitch_measure_deg, capture_ms, VIS_TRACK_BETA
+        );
         {
+            float raw_yaw_rate_dps;
             float predicted_yaw = vis_track_predict(
-                yaw_tracker, now, &g_vis_yaw_applied_rate_dps
+                yaw_tracker, now, &raw_yaw_rate_dps
             );
             float predicted_pitch_rate;
             float predicted_elevation = vis_track_predict(
@@ -1758,16 +1845,8 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                 target_motor_pitch - g_pitch_fb.cont
             );
             (void)predicted_pitch_rate;
-        }
-        if (g_vis_turn_active != 0u)
-        {
-            /* This is the known motion of the target in the world, not the
-             * yaw position-loop gain. Keep it as inner-loop feed-forward while
-             * bounding turn-time estimator noise. */
-            g_vis_yaw_applied_rate_dps = clampf(
-                g_vis_yaw_applied_rate_dps,
-                -VIS_TURN_TARGET_RATE_LIMIT_DPS,
-                VIS_TURN_TARGET_RATE_LIMIT_DPS
+            g_vis_yaw_applied_rate_dps = vis_turn_target_rate(
+                raw_yaw_rate_dps, frame_dt, now
             );
         }
         yaw_deg = clampf(yaw_deg,
@@ -1821,7 +1900,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         if (g_vis_track_yaw.active != 0u)
         {
             (void)vis_track_predict(
-                &g_vis_track_yaw, now, &g_vis_yaw_applied_rate_dps
+                &g_vis_track_yaw, now, &ignored_rate
             );
             (void)vis_track_predict(
                 &g_vis_track_pitch, now, &ignored_rate
