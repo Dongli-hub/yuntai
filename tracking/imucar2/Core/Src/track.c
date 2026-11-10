@@ -546,10 +546,10 @@ void Track_Update(void)
         target_w = (float)turn_dir * turn_rate;
 
         /*
-         * 不在这里直接把 body_w 赋成目标值。入弯第一段统一使用下面的
-         * 8 rad/s² 角速度斜坡, 让内外轮从预转弯的同速状态连续过渡到
-         * 差速状态; 轮速换算仍保证两个轮子同向, 内轮目标不会降到0。
+         * 转弯曲率由位置层立即建立, 不再等待8 rad/s²的w斜坡。
+         * 左右轮目标速度仍会被电机目标斜率和速度PID平滑。
          */
+        body_w_rad_s = target_w;
 
         if ((turn_angle_rad > TRACK_TURN_FAIL_RAD) ||
             (turn_angle_rad < TRACK_TURN_WRONG_RAD) ||
