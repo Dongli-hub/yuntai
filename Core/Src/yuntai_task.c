@@ -1247,6 +1247,8 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_TURN_TARGET_RATE_TAU_S       0.070f
 #define VIS_TURN_TARGET_RATE_SLEW_DPS    3.0f
 #define VIS_TURN_TARGET_RATE_RECOVERY_MS 400u
+#define VIS_USE_DIRECT_ALPHA_TARGET      1u
+#define VIS_DIRECT_TARGET_SLEW_DPS       180.0f
 
 typedef struct
 {
@@ -1727,6 +1729,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float frame_dt = 0.0125f;
         float raw_yaw_deg;
         float raw_pitch_deg;
+        float raw_yaw_error_deg;
         float yaw_deg;
         float pitch_deg;
         float yaw_measure_deg;
@@ -1838,9 +1841,10 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             float target_motor_pitch =
                 predicted_elevation - imuAngle[1] * 57.29578f;
 
-            yaw_deg = vis_wrap_pm180_deg(
+            raw_yaw_error_deg = vis_wrap_pm180_deg(
                 predicted_yaw - imuAngle[0] * 57.29578f
             );
+            yaw_deg = raw_yaw_error_deg;
             pitch_deg = vis_wrap_pm180_deg(
                 target_motor_pitch - g_pitch_fb.cont
             );
@@ -1869,6 +1873,20 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
          * 没有新视觉帧时偏置角保持，不清零。 */
         {
+#if VIS_USE_DIRECT_ALPHA_TARGET
+            float max_step = VIS_DIRECT_TARGET_SLEW_DPS * frame_dt;
+            float target_step = clampf(raw_yaw_error_deg,
+                                       -max_step, max_step);
+            if (fabsf(target_step) < 0.01f)
+            {
+                target_step = 0.0f;
+            }
+            g_vis_yaw_angle_deg = clampf(
+                g_vis_yaw_angle_deg + target_step,
+                -g_vis_limyaw_deg, g_vis_limyaw_deg
+            );
+            g_vis_yaw_rate_dps = target_step / frame_dt;
+#else
             float yaw_rate;
             yaw_rate = g_yaw_vis_gain *
                 vis_pid_step(&g_vis_pid_yaw, yaw_deg, frame_dt,
@@ -1878,16 +1896,19 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                 yaw_rate, -VIS_RATE_YAW_DPS, VIS_RATE_YAW_DPS
             );
             yaw_rate *= g_vis_turn_yaw_scale;
+#endif
             float pitch_rate = vis_pid_step(&g_vis_pid_pitch, pitch_deg,
                                              frame_dt, g_vis_kp_pitch,
                                              g_vis_ki_pitch, g_vis_kd_pitch,
                                              VIS_RATE_PITCH_DPS);
+#if !VIS_USE_DIRECT_ALPHA_TARGET
             g_vis_yaw_rate_dps = yaw_rate;
-            g_vis_pitch_rate_dps = pitch_rate;
             g_vis_yaw_angle_deg = clampf(
                 g_vis_yaw_angle_deg +
                     (yaw_rate + g_vis_yaw_applied_rate_dps) * frame_dt,
                 -g_vis_limyaw_deg, g_vis_limyaw_deg);
+#endif
+            g_vis_pitch_rate_dps = pitch_rate;
             g_vis_pitch_angle_deg = clampf(
                 g_vis_pitch_angle_deg + pitch_rate * frame_dt,
                 -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
