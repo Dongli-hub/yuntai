@@ -40,7 +40,6 @@
 #define TRACK_TURN_WRONG_RAD        (-15.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_TIMEOUT_SEC      5.0f
 #define TRACK_PRE_TIMEOUT_SEC       2.0f
-#define TRACK_TURN_ENTRY_SPEED_TOL_MPS 0.015f
 
 #define TRACK_HEADING_TRIM_TAU_SEC  0.8f
 #define TRACK_HEADING_TRIM_ERROR_MM (1.0f * TRACK_PROBE_SPACING_MM)
@@ -362,7 +361,6 @@ void Track_Update(void)
     uint16_t sensor_frames = LineSensor_GetFrameCount();
     uint8_t normal;
     uint8_t gyro_valid;
-    uint8_t corner_candidate = 0u;
     int8_t corner_dir = 0;
     float gyro_z_rad_s;
     float target_v;
@@ -431,11 +429,6 @@ void Track_Update(void)
 
     if (state == TRACK_LINE) {
         if ((sensor_frame_new != 0u) && (track_corner(mask, &corner_dir) != 0u)) {
-            /*
-             * 第一帧检测到直角候选时就开始收油。这样即使还需要连续确认,
-             * 车轮也不会一直以直线速度冲到起弧点。
-             */
-            corner_candidate = 1u;
             if (++corner_confirm >= TRACK_CORNER_CONFIRM_FRAMES) {
                 track_enter_pre_turn(corner_dir);
             }
@@ -512,14 +505,6 @@ void Track_Update(void)
             }
 
         }
-
-        /*
-         * 直角候选通常不属于普通连续线图案, 放在普通线/短暂丢线处理之后
-         * 覆盖目标速度, 避免把准备转弯误当成丢线并降到0.08 m/s。
-         */
-        if (corner_candidate != 0u) {
-            target_v = TRACK_TURN_MPS;
-        }
     }
 
     if (state == TRACK_PRE_TURN) {
@@ -534,8 +519,6 @@ void Track_Update(void)
 
         if ((remaining <= 0.0f) &&
             (state_time_s >= 0.06f) &&
-            (body_v_mps <=
-             (TRACK_TURN_MPS + TRACK_TURN_ENTRY_SPEED_TOL_MPS)) &&
             (fabsf(body_w_rad_s) < 0.05f)) {
             track_enter_turn();
         }
