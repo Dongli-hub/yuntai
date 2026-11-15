@@ -572,10 +572,10 @@ void Track_Update(void)
         target_w = (float)turn_dir * turn_rate;
 
         /*
-         * 转弯曲率由位置层立即建立, 不再等待8 rad/s²的w斜坡。
-         * 左右轮目标速度仍会被电机目标斜率和速度PID平滑。
+         * Restore the reference 8 rad/s^2 angular-rate ramp.  Do not shift the
+         * corner entry point: turn_lead already includes w_turn/(2*accel), and
+         * TRACK_SENSOR_AHEAD_M/TRACK_RADIUS_M remain unchanged for this chassis.
          */
-        body_w_rad_s = target_w;
 
         if ((turn_angle_rad > TRACK_TURN_FAIL_RAD) ||
             (turn_angle_rad < TRACK_TURN_WRONG_RAD) ||
