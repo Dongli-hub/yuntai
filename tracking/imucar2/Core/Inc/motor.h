@@ -165,6 +165,8 @@ int32_t Motor_GetEncoderTotal(MotorID motor);
 
 /* 累计里程(cm, 前进为正) */
 float Motor_GetDistanceCm(MotorID motor);
+/* 累计里程(m, 直接由编码器计数换算，不做厘米量化)。 */
+float Motor_GetDistanceMeters(MotorID motor);
 
 float Motor_GetMeasuredPercent(MotorID motor);
 float Motor_GetOutputPercent(MotorID motor);

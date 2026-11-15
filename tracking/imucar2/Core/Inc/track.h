@@ -16,6 +16,7 @@ typedef enum {
     TRACK_LINE = 0,       /* 正常巡线和普通弯道 */
     TRACK_PRE_TURN,       /* 轮轴继续走到起弧点 */
     TRACK_TURN,           /* IMU角度/角速度转弯 */
+    TRACK_REACQUIRE,      /* 80°后继续转弯并抓取新直边 */
     TRACK_LOST,           /* 丢线, 低速找线 */
     TRACK_STOP            /* 停车 */
 } TrackState;

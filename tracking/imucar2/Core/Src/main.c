@@ -395,6 +395,9 @@ static void Chassis_Telemetry(void)
     case TRACK_TURN:
         phase = LINK_PHASE_TURNING;
         break;
+    case TRACK_REACQUIRE:
+        phase = LINK_PHASE_TURN_EXIT;
+        break;
     case TRACK_LOST:
     case TRACK_STOP:
     default:

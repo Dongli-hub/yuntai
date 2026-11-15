@@ -39,6 +39,15 @@
  * the new line.  Advance the turn entry by the same distance; steady-state
  * radius and wheel speed remain unchanged. */
 #define TRACK_TURN_LEAD_EXTRA_M     0.020f
+#define TRACK_REACQUIRE_START_RAD   (80.0f * TRACK_DEG_TO_RAD)
+#define TRACK_REACQUIRE_KP          0.020f
+#define TRACK_REACQUIRE_KH          1.50f
+#define TRACK_REACQUIRE_W_LIMIT     1.50f
+#define TRACK_REACQUIRE_EXIT_PITCH  1.50f
+#define TRACK_REACQUIRE_EXIT_RAD    (15.0f * TRACK_DEG_TO_RAD)
+#define TRACK_REACQUIRE_EXIT_RATE   0.35f
+#define TRACK_REACQUIRE_CONFIRM      3u
+#define TRACK_IMU_DROPOUT_SEC       0.05f
 #define TRACK_TURN_FAIL_RAD         (130.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_WRONG_RAD        (-15.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_TIMEOUT_SEC      5.0f
@@ -83,6 +92,8 @@ static uint8_t  sensor_frame_new;
 static uint8_t  corner_confirm;
 static uint8_t  line_redetect;
 static uint8_t  line_error_initialized;
+static uint8_t  reacquire_confirm;
+static float    imu_invalid_time_s;
 
 static float line_error_mm;
 static float line_error_prev_mm;
@@ -105,8 +116,8 @@ static float state_distance_m;
 static float lost_time_s;
 static uint32_t lost_tick;
 
-static uint32_t last_odo_l_cm;
-static uint32_t last_odo_r_cm;
+static float last_odo_l_m;
+static float last_odo_r_m;
 static float left_delta_m;
 static float right_delta_m;
 
@@ -250,6 +261,8 @@ static void track_apply_velocity(float v_mps, float w_rad_s, float min_wheel_mps
 static void track_reset_line_filter(void)
 {
     line_error_initialized = 0u;
+    reacquire_confirm = 0u;
+    imu_invalid_time_s = 0.0f;
     line_derivative_mm_s = 0.0f;
     line_integral_mm_s = 0.0f;
 }
@@ -262,6 +275,7 @@ static void track_enter_line(void)
     lost_time_s = 0.0f;
     corner_confirm = 0u;
     line_redetect = 0u;
+    reacquire_confirm = 0u;
     post_turn_ramp_active = 0u;
     track_reset_line_filter();
 }
@@ -272,6 +286,7 @@ static void track_enter_pre_turn(int8_t dir)
     state_time_s = 0.0f;
     state_distance_m = 0.0f;
     corner_confirm = 0u;
+    reacquire_confirm = 0u;
     initial_ramp_done = 1u;
     post_turn_ramp_active = 0u;
     /*
@@ -290,6 +305,7 @@ static void track_enter_turn(void)
     turn_angle_rad = 0.0f;
     turn_elapsed_s = 0.0f;
     turn_arc_m = 0.0f;
+    reacquire_confirm = 0u;
     track_reset_line_filter();
 }
 
@@ -299,6 +315,7 @@ static void track_enter_lost(void)
     lost_time_s = 0.0f;
     lost_tick = HAL_GetTick();
     line_redetect = 0u;
+    reacquire_confirm = 0u;
     post_turn_ramp_active = 0u;
     track_reset_line_filter();
 }
@@ -312,8 +329,8 @@ static void track_stop(void)
     measured_v_mps = 0.0f;
     left_delta_m = 0.0f;
     right_delta_m = 0.0f;
-    last_odo_l_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_LEFT);
-    last_odo_r_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_RIGHT);
+    last_odo_l_m = Motor_GetDistanceMeters(MOTOR_LEFT);
+    last_odo_r_m = Motor_GetDistanceMeters(MOTOR_RIGHT);
     Motor_Stop();
 }
 
@@ -331,37 +348,45 @@ static void track_record_turn(void)
 
 static float track_update_odometry(float dt)
 {
-    uint32_t odo_l = (uint32_t)Motor_GetDistanceCm(MOTOR_LEFT);
-    uint32_t odo_r = (uint32_t)Motor_GetDistanceCm(MOTOR_RIGHT);
-    int32_t delta_l_cm = (int32_t)(odo_l - last_odo_l_cm);
-    int32_t delta_r_cm = (int32_t)(odo_r - last_odo_r_cm);
+    float odo_l = Motor_GetDistanceMeters(MOTOR_LEFT);
+    float odo_r = Motor_GetDistanceMeters(MOTOR_RIGHT);
     float raw_v;
 
-    last_odo_l_cm = odo_l;
-    last_odo_r_cm = odo_r;
-    left_delta_m = (float)delta_l_cm * 0.01f;
-    right_delta_m = (float)delta_r_cm * 0.01f;
+    left_delta_m = odo_l - last_odo_l_m;
+    right_delta_m = odo_r - last_odo_r_m;
+    last_odo_l_m = odo_l;
+    last_odo_r_m = odo_r;
 
     raw_v = 0.5f * (left_delta_m + right_delta_m) / dt;
     measured_v_mps += dt / (0.03f + dt) * (raw_v - measured_v_mps);
     state_distance_m += 0.5f * (left_delta_m + right_delta_m);
-    if (state == TRACK_TURN) {
+    if ((state == TRACK_TURN) || (state == TRACK_REACQUIRE)) {
         turn_arc_m += 0.5f * (left_delta_m + right_delta_m);
     }
     return raw_v;
 }
 
-static float track_get_yaw_rate(uint8_t *valid)
+static float track_get_yaw_rate(float dt, uint8_t *valid)
 {
-    if (IMU_IsOnline() != 0u) {
+    float imu_rate = IMU_GetGyroZDps() * TRACK_DEG_TO_RAD;
+
+    if ((IMU_IsOnline() != 0u) && isfinite(imu_rate) &&
+        (fabsf(imu_rate) <= 10.0f)) {
+        imu_invalid_time_s = 0.0f;
         *valid = 1u;
-        return IMU_GetGyroZDps() * TRACK_DEG_TO_RAD;
+        return imu_rate;
     }
 
-    /* 参考实现的降级策略: 用左右轮速度差反推车体角速度。 */
+    imu_invalid_time_s += dt;
+    if (imu_invalid_time_s > TRACK_IMU_DROPOUT_SEC) {
+        *valid = 0u;
+        return 0.0f;
+    }
+
+    /* Short IMU dropout only: use the wheel differential as fallback. */
     *valid = 1u;
     return (right_delta_m - left_delta_m) /
-           (TRACK_WHEEL_BASE_M * MOTOR_CTRL_DT);
+           (TRACK_WHEEL_BASE_M * dt);
 }
 
 /* ========================================================================== */
@@ -400,7 +425,7 @@ void Track_Update(void)
     }
 
     (void)track_update_odometry(dt);
-    gyro_z_rad_s = track_get_yaw_rate(&gyro_valid);
+    gyro_z_rad_s = track_get_yaw_rate(dt, &gyro_valid);
     if (gyro_valid == 0u) {
         track_stop();
         return;
@@ -558,7 +583,7 @@ void Track_Update(void)
         }
     }
 
-    if (state == TRACK_TURN) {
+    if ((state == TRACK_TURN) || (state == TRACK_REACQUIRE)) {
         float signed_gyro = (float)turn_dir * gyro_z_rad_s;
 
         turn_elapsed_s += dt;
@@ -576,12 +601,6 @@ void Track_Update(void)
             sqrtf(2.0f * TRACK_ANGULAR_ACCEL_RAD2 * remaining));
         target_w = (float)turn_dir * turn_rate;
 
-        /*
-         * Restore the reference 8 rad/s^2 angular-rate ramp.  Do not shift the
-         * corner entry point: turn_lead already includes w_turn/(2*accel), and
-         * TRACK_SENSOR_AHEAD_M/TRACK_RADIUS_M remain unchanged for this chassis.
-         */
-
         if ((turn_angle_rad > TRACK_TURN_FAIL_RAD) ||
             (turn_angle_rad < TRACK_TURN_WRONG_RAD) ||
             (turn_elapsed_s > TRACK_TURN_TIMEOUT_SEC)) {
@@ -590,16 +609,67 @@ void Track_Update(void)
             return;
         }
 
-        if (turn_angle_rad >= (TRACK_PI * 0.5f)) {
-            line_direction_rad += (float)turn_dir * TRACK_PI * 0.5f;
-            track_record_turn();
-            if (route_corner_count < 255u) {
-                route_corner_count++;
-            }
-            track_enter_line();
-            post_turn_ramp_active = 1u;
+        if ((state == TRACK_TURN) &&
+            (turn_angle_rad >= TRACK_REACQUIRE_START_RAD)) {
+            state = TRACK_REACQUIRE;
+            reacquire_confirm = 0u;
+            line_error_initialized = 0u;
+        }
+
+        if (state == TRACK_REACQUIRE) {
+            float next_line_direction_rad =
+                line_direction_rad + (float)turn_dir * (TRACK_PI * 0.5f);
+            float next_edge_error =
+                body_heading_rad - next_line_direction_rad - heading_trim_rad;
+
             target_v = TRACK_TURN_MPS;
-            target_w = 0.0f;
+            w_accel = TRACK_ANGULAR_ACCEL_RAD2;
+
+            if (normal != 0u) {
+                if (line_error_initialized == 0u) {
+                    line_error_mm = error_mm;
+                    line_error_initialized = 1u;
+                } else {
+                    line_error_mm +=
+                        dt / (0.02f + dt) * (error_mm - line_error_mm);
+                }
+                target_w = track_clampf(
+                    -TRACK_REACQUIRE_KP * line_error_mm -
+                    TRACK_REACQUIRE_KH * next_edge_error,
+                    -TRACK_REACQUIRE_W_LIMIT,
+                    TRACK_REACQUIRE_W_LIMIT);
+            } else if ((mask == 0u) && (line_error_initialized != 0u)) {
+                target_w = track_search_w(line_error_mm);
+            } else if (next_edge_error > 0.0f) {
+                target_w = track_clampf(
+                    -TRACK_REACQUIRE_KH * next_edge_error,
+                    -TRACK_REACQUIRE_W_LIMIT,
+                    TRACK_REACQUIRE_W_LIMIT);
+            }
+
+            if ((sensor_frame_new != 0u) && (normal != 0u) &&
+                (fabsf(error_mm) <=
+                 TRACK_REACQUIRE_EXIT_PITCH * TRACK_PROBE_SPACING_MM) &&
+                (fabsf(next_edge_error) <= TRACK_REACQUIRE_EXIT_RAD) &&
+                (fabsf(signed_gyro) < TRACK_REACQUIRE_EXIT_RATE)) {
+                if (reacquire_confirm < TRACK_REACQUIRE_CONFIRM) {
+                    reacquire_confirm++;
+                }
+            } else if (sensor_frame_new != 0u) {
+                reacquire_confirm = 0u;
+            }
+
+            if (reacquire_confirm >= TRACK_REACQUIRE_CONFIRM) {
+                line_direction_rad = next_line_direction_rad;
+                track_record_turn();
+                if (route_corner_count < 255u) {
+                    route_corner_count++;
+                }
+                track_enter_line();
+                post_turn_ramp_active = 1u;
+                target_v = TRACK_TURN_MPS;
+                target_w = 0.0f;
+            }
         }
     }
 
@@ -637,7 +707,8 @@ void Track_Update(void)
     }
 
     track_apply_velocity(body_v_mps, wheel_w,
-                         (state == TRACK_TURN) ?
+                         ((state == TRACK_TURN) ||
+                          (state == TRACK_REACQUIRE)) ?
                          TRACK_TURN_INNER_MIN_MPS : TRACK_LINE_INNER_MIN_MPS);
 }
 
@@ -666,8 +737,8 @@ void Track_Init(void)
     state_distance_m = 0.0f;
     lost_time_s = 0.0f;
     lost_tick = 0u;
-    last_odo_l_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_LEFT);
-    last_odo_r_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_RIGHT);
+    last_odo_l_m = Motor_GetDistanceMeters(MOTOR_LEFT);
+    last_odo_r_m = Motor_GetDistanceMeters(MOTOR_RIGHT);
     left_delta_m = 0.0f;
     right_delta_m = 0.0f;
     turn_dir = 0;
@@ -742,7 +813,8 @@ float Track_GetRightTargetMps(void)
 
 uint8_t Track_IsTurnExitActive(void)
 {
-    return post_turn_ramp_active;
+    return (uint8_t)((state == TRACK_REACQUIRE) ||
+                     (post_turn_ramp_active != 0u));
 }
 
 uint8_t Track_GetRouteCornerCount(void)

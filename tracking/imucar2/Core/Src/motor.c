@@ -536,6 +536,12 @@ float Motor_GetDistanceCm(MotorID motor)
     return (motor <= MOTOR_RIGHT) ? ((float)enc_total[motor] / MOTOR_CNT_PER_CM) : 0.0f;
 }
 
+float Motor_GetDistanceMeters(MotorID motor)
+{
+    return (motor <= MOTOR_RIGHT) ?
+        ((float)enc_total[motor] / (MOTOR_CNT_PER_CM * 100.0f)) : 0.0f;
+}
+
 float Motor_GetOutputPercent(MotorID motor)
 {
     return (motor <= MOTOR_RIGHT) ? output[motor] : 0.0f;
