@@ -119,7 +119,7 @@
 #define LOCK_BIAS_CAL_MS         800u   /* 第二次零偏采样时长（500Hz 下仍有约 400 个样本） */
 
 /* ---- 节拍 ---- */
-#define IMU_PERIOD_MS              1u    /* 1000Hz 读 IMU（2026-10-10: 2->1）
+#define IMU_PERIOD_MS              2u    /* 500Hz，与参考 GimbalTask 一致
                                           * 陀螺本身是 1000Hz ODR，M7 完全跟得上；
                                           * 姿态(AHRS)的采样频率会同步成 1000Hz
                                           * （mahonySampleFreq = 1000/IMU_PERIOD_MS）。
@@ -132,10 +132,10 @@
  *   "顿挫/自激"最缺的东西。CAN 每拍发一次：1000Hz × 8 字节 ≈ 240kbps，
  *   1Mbps 总线毫无压力；H723(550MHz) 的 1ms 预算里，BMI088 的 SPI 读 +
  *   双轴 PID + 两路 CAN 发送大约只占 0.3~0.5ms，够用。 */
-#define CONTROL_PERIOD_MS          1u    /* 1000Hz 控制（2026-10-11: 2->1）
+#define CONTROL_PERIOD_MS          2u    /* 500Hz 控制，与参考 GimbalTask 一致
                                           * dt 自动跟着变（dt = 该值/1000），
                                           * 所以 PID 不用另外改。 */
-#define CONTROL_PERIOD_DEFAULT_MS  1u    /* 历史：500Hz(2ms) → 1kHz(1ms) → 退回
+#define CONTROL_PERIOD_DEFAULT_MS  2u    /* 与参考工程保持一致：500Hz
                                           * 500Hz → **2026-10-13 再回到 1kHz**。
                                           * （中间那次"1kHz 出问题"其实是状态寄存器
                                           *   被反复重写的锅，已经修掉了。）
@@ -371,19 +371,26 @@
  *   现场若听到电机持续"滋滋"响 -> KP 再往小调；
  *   若俯仰被扰动后回不来 -> KI 往大调（不是 KP）。
  */
-/* Pitch speed-loop defaults from the reference implementation. */
-#define PITCH_KP                 7.0f   /* rpm/deg */
-#define PITCH_KI                 0.02f  /* rpm/(deg*s) */
-#define PITCH_KD                 0.10f
-#define PITCH_OUT_RPM            50.0f  /* 参考工程安全速度上限，约 300°/s */
+/* ⚠ 2026-09-27 晚 现场实测：KP=15/KI=45 会让俯仰位置环自激。
+ *   证据（tools/pitch_probe.py，AIM 模式下偏置恒为 0）：
+ *     俯仰电机角在 133 ↔ 260 之间以 ~1Hz 来回摆，峰峰 115、逐次跳变中位 73。
+ *   为什么一直没被发现：IMU 装在俯仰轴【下方】，姿态遥测里俯仰纹波不动
+ *   （实测 2.36~2.39），只有相机画面在上下跳 —— 于是靶纸一会儿在画面里、
+ *   一会儿跑出去，视觉环怎么调都收敛不了。
+ *   在线把 KP 降到 8、KI 降到 20 之后，俯仰电机角立刻静如止水（跳变 0.0）。
+ *   所以默认值改成安全预设。要更快再往上加，但"一次只动一个数"。 */
+#define PITCH_KP                 7.0f  /* rpm/deg: reference GimbalTask default */
+#define PITCH_KI                 0.02f /* rpm/(deg*tick) */
+#define PITCH_KD                 0.10f /* derivative gain */
+#define PITCH_OUT_RPM            50.0f
 #define PITCH_ILIM               0.70f  /* 积分限幅；2026-10-09：0.40 -> 0.70
                                          /* ki*ilim = 14rpm > 脱困转速(约10rpm)，
                                           * 这样积分才推得动轴，消掉"俯仰死区"。原注释：
                                           * ki*ilim = 18rpm，
                                          * 要略大于脱困转速(约10rpm)才能顶住静摩擦，
                                          * 但又不能大到积分自己就能把输出顶满 */
-#define PITCH_DEADZONE_DEG       0.10f  /* 参考工程静止死区 */
-#define PITCH_TRAVEL_LIMIT_DEG  95.0f   /* 相对上电位置的行程软限位 */
+#define PITCH_DEADZONE_DEG       0.10f  /* 死区，抑制编码器量化噪声 */
+#define PITCH_TRAVEL_LIMIT_DEG  80.0f   /* 相对上电位置，与参考工程一致 */
 #define PITCH_FB_TIMEOUT_MS     50u     /* 超过这么久没反馈就降级为纯前馈 */
 /* 底盘转速前馈（0x12）用的偏航电机反馈新鲜度上限：反馈断流/过期就把前馈停掉，
  * 免得拿着几十毫秒前的旧转速当"底盘在转"去给一脚。 */
@@ -526,7 +533,6 @@ static uint8_t     g_vis_fps_mode = 0xFFu;
 static float       g_vis_fps;
 /* 调试行交替开关：TEXT 单条上限 60 字符，[DBG]/[VIS] 两条轮着发 */
 static uint8_t     g_dbg_toggle;
-static uint32_t    g_last_fbwarn_ms;
 static uint32_t    g_last_read_ms;
 static uint32_t    g_last_hold_ms;  /* LOCK 阶段"按住两轴"的 0 速指令节拍 */
 static uint32_t    g_last_stat_ms;
@@ -576,7 +582,6 @@ static float      g_pitch_tgt_deg;  /* 当前俯仰目标（deg），仅用于�
 static uint8_t    g_fault;
 static uint32_t   g_runaway_ms;
 static float      g_pitch_pos_deg;  /* 调试用 */
-static uint8_t    g_unwind_done;    /* 本次解绕是否已完成并重锁过基准 */
 static uint8_t    g_prev_mode = 0xFFu;
 static float      g_yaw_cmd_rpm;
 static float      g_pitch_cmd_rpm;
@@ -603,10 +608,6 @@ static uint8_t  g_yaw_loop_rb = 0xFFu;    /* 最近回读到的"闭环使能"状
 static uint8_t  g_pitch_loop_rb = 0xFFu;
 static uint32_t g_last_mode_log_ms;
 
-/* ---- 偏航"指令不跟"监视（2026-10-12，见控制环里的说明）---- */
-static uint32_t g_yaw_stall_ms;
-static uint32_t g_last_stall_log_ms;
-
 /* ---- 原始反馈帧快照（2026-10-12）----
  * 现场日志出现"指令 -80rpm、电机自报转速 0.0、位置却一跳 25~50°"，三种解释
  * 都可能（驱动器没执行/自报字段不对/我们解析错），光看解析后的值分不清 ——
@@ -624,17 +625,13 @@ static uint8_t  g_raw_toggle;
 static uint8_t  g_yaw_test_run;      /* 0=关，1=速度脚本，2=力矩脚本 */
 static uint32_t g_yaw_test_ms;
 static uint32_t g_yaw_test_log_ms;
-static float    g_yaw_test_ma;       /* 力矩脚本当前注入的电流（mA） */
 static uint8_t  g_yaw_torque_bak;    /* 力矩脚本启动前的模式设置（跑完恢复）*/
 /* ---- 力矩符号（±1）----
  * 驱动器自报"正电流→正转"的方向约定，我们无法凭空假定；开机时用两次等幅反向
  * 电流脉冲比一比（见 g_yaw_test_run==3 那段），判不出来就保持 +1，靠控制环里
  * 那道 >3.5rad/s 的保命闸兜底。*/
-static float    g_torque_sign = 1.0f;
 /* Torque polarity is already calibrated on this gimbal. */
 static uint8_t  g_torque_sign_checked = 1u;
-static float    g_sign_int_plus, g_sign_int_minus;
-static float    g_iq_filt;               /* 力矩指令一阶低通状态（防高频颤动）*/
 /* ---- 力矩指令下发节拍（2026-10-13，见控制环里的说明）----
  * 用户实测（上位机）：**0.02Nm 就能让这一轴动** —— 说明轴很轻、之前"推不动"
  * 不是摩擦，是**我们下发的力矩没落到电机上**。最大嫌疑：驱动器参数里的
@@ -649,12 +646,9 @@ static float    g_iq_filt;               /* 力矩指令一阶低通状态（防
  *   一直在驱动平台**（ym 与平台姿态同步摆动）。
  *   保留 0x1E 只是为了必要时做对比实验。*/
 static uint32_t g_torque_wr_ms   = 0u;
-static uint32_t g_last_torque_wr_ms;
 /* 实际接到目标角上的偏航偏置（做过变化率限幅，见 yuntai_control 里的说明） */
 static uint8_t    g_bias_cal;       /* 1 = 正在采陀螺零偏样本（见 gyro_bias_accumulate） */
-static float      g_yaw_err_rad;    /* 偏航角度环当前误差（rad），给零偏自校准判据用 */
 static uint8_t    g_yaw_stiction_on;/* 当前是否正在做静摩擦补偿（调试打印用） */
-static uint8_t    g_bias_by_rest;   /* 本次零偏修正是靠"平台自静止"判据进来的 */
 static uint8_t    g_lock_wait_logged;  /* "等编码器上报"只打一次日志 */
 static float      g_yaw_stiction_rpm = YAW_STICTION_RPM;  /* 可在线改（PARAM 0x0B）*/
 static float      g_yaw_ilim = YAW_ILIM;                  /* 可在线改（PARAM 0x0C）*/
@@ -694,7 +688,6 @@ static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x1
 static float g_yaw_base_ff    = 0.4f;
 static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
 static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
-static float   g_yaw_pos_last;                   /* 上一帧电机位置（deg） */
 static uint32_t g_yaw_pos_ms;                    /* 上一帧时间戳（0=还没初始化）*/
 /* 电机"类速度模式"用哪个控制模式值（写 0x0060）。**默认回到 1=速度模式**。
  * ⚠ 2026-10-12 现场教训：上一版默认 0x05（低速大扭）后，用户单测自稳时
@@ -732,10 +725,8 @@ static uint8_t g_speed_mode = JC_MODE_SPEED;
  *     · 参考代码（QGimbal）稳定环就是"角度环直接出电流"，本来也不走速度环。
  *   于是偏航改成：驱动器收力矩指令，速率环（陀螺反馈）在固件里跑（见下面那段）。
  *   ⚠ 想退回速度模式：(0x14, 0)。*/
-static uint8_t g_yaw_torque   = 0u;        /* 默认速度模式，与参考工程一致 */
+static uint8_t g_yaw_torque   = 0u;        /* 两个电机固定使用速度模式 */
 #define TORQUE_ENGAGE_MS      500u         /* 力矩模式"软接入"时长（见控制环里说明） */
-static uint8_t  g_torque_prev   = 0u;      /* 上一拍是否在力矩模式 */
-static uint32_t g_torque_on_ms  = 0u;      /* 本次进入力矩模式的时刻 */
 /* ⚠ 2026-10-12 深夜(43 号日志)：速率环 P 13 → 25 → **50 mA/rpm**，限幅 1.65A
  *   → **2.5A**。依据：
  *     · 43 号日志的力矩符号自检：±1A（0.04Nm）脉冲下平台净转角只有 0.01° ——
@@ -820,9 +811,6 @@ static float   g_yaw_ilim_ma = 1500.0f;
  *   (0x15,600) kp 6（默认）    (0x16,800) ki 8（默认）
  *   (0x21,1500) 积分上限 1.5A（默认）/ (0x21,500) 0.5A（更保守）
  *   (0x1D,250) 脱困补偿 2.5A（= 默认，2026-10-14 十三版）/ (0x1D,0) 关掉它*/
-static float   g_yaw_off_rate;         /* 视觉目标角变化率（rad/s，AIM 才有）*/
-static float   g_yaw_rate_i_dps;       /* speed-mode inner rate integral, deg/s */
-static int8_t  g_yaw_out_saturated;    /* -1 / +1: last speed command saturated */
 
 /* ---- 俯仰控制模式——默认使用驱动器速度模式 ----
  * 尝试：俯仰也搬进力矩模式、反馈用 IMU 俯仰（世界系，与偏航同构）。
@@ -844,7 +832,6 @@ static float   g_rate_ilim_a  = 8.0f;      /* 电流限幅：A（0x17）→ 0.32
                                             * 的角度段需要更多；②"动的时候抖"要在一次
                                             * 滑动里刹住，刹车（阻尼）也吃限幅。
                                             * 8A=0.32Nm 仍是脉冲性质；嫌热 (0x17, 600)。*/
-static float   g_rate_i       = 0.0f;      /* 速率环积分器（mA）*/
 static float   g_rate_iq_ma   = 0.0f;      /* 最近一次输出的电流（mA，给日志看）*/
 static float g_pitch_kp       = PITCH_KP;
 static float g_pitch_ki       = PITCH_KI;
@@ -1186,7 +1173,13 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_KI_PITCH        0.0f
 #define VIS_KD_PITCH        0.20f
 
-#define VIS_SIGN_YAW        1.0f
+/* 2026-11-13 22:56 联调数据：
+ * yaw误差+0.23° -> +1.7rpm，随后误差增至+10.99°；
+ * yaw误差-5.43° -> -28.2rpm，随后误差增至-10.96°。
+ * 正、负两边均为正反馈，因此视觉Yaw目标必须取反。
+ * Pitch编码器在正指令下能靠近目标，保持+1不变。 */
+#define VIS_SIGN_YAW       -1.0f
+/* 当前实车 Pitch 跟随方向需要与 K230 pitch 误差取反。 */
 #define VIS_SIGN_PITCH     -1.0f
 #define VIS_RATE_YAW_DPS    250.0f   /* 视觉偏置角速度限幅 */
 #define VIS_RATE_PITCH_DPS  250.0f
@@ -1195,14 +1188,14 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_LATENCY_MAX_MS         200.0f
 #define VIS_LIMIT_YAW_DEG   120.0f
 #define VIS_LIMIT_PITCH_DEG  20.0f
-#define VIS_FREEZE_MS       250u
-#define VIS_ERROR_YAW_LIMIT_DEG   30.0f
-#define VIS_ERROR_PITCH_LIMIT_DEG 20.0f
+#define VIS_FREEZE_MS       300u
+#define VIS_ERROR_YAW_LIMIT_DEG   60.0f
+#define VIS_ERROR_PITCH_LIMIT_DEG 60.0f
 /* Pixel centroids move in discrete steps.  0.20 deg yaw (~1.4 px) and
  * 0.20 deg pitch (~1.6 px) are the quiet band where a centroid jump must
  * not keep winding the visual target angle. */
-#define VIS_DEADBAND_YAW_DEG       0.20f
-#define VIS_DEADBAND_PITCH_DEG     0.20f
+#define VIS_DEADBAND_YAW_DEG       0.10f
+#define VIS_DEADBAND_PITCH_DEG     0.10f
 #define VIS_JUMP_YAW_DEG           5.0f
 #define VIS_JUMP_PITCH_DEG         2.0f
 #define VIS_JUMP_MATCH_YAW_DEG     2.0f
@@ -1210,13 +1203,67 @@ static uint8_t enc_fresh(const EncFb_t *e, uint32_t now, uint32_t timeout_ms)
 #define VIS_JUMP_RETURN_YAW_DEG    1.0f
 #define VIS_JUMP_RETURN_PITCH_DEG  0.5f
 
-#define VIS_ANGLE_HISTORY_LEN       256u
+#define VIS_ANGLE_HISTORY_LEN       128u
 #define VIS_TRACK_ALPHA              0.50f
 #define VIS_TRACK_BETA               0.17f
 #define VIS_TRACK_RATE_CLIP_DEG      0.40f
 #define VIS_TRACK_MAX_RATE_DPS      90.0f
 #define VIS_TRACK_COAST_MS          450u
 #define VIS_TRACK_LOST_MS           500u
+#define VIS_TRACK_RESET_GATE_DEG      5.0f
+
+/* Reference speed-control chain (speed_control 111 / GimbalTask). */
+#define REF_YAW_KPOS                    8.0f
+#define REF_YAW_POS_RATE_MAX            40.0f
+#define REF_YAW_KRATE                   7.0f
+#define REF_YAW_RATE_KI                 40.0f
+#define REF_YAW_RATE_I_MAX              60.0f
+#define REF_YAW_RATE_I_ZONE_DEG         3.0f
+#define REF_YAW_TARGET_RATE_LIMIT_DPS  120.0f
+#define REF_YAW_OUT_RPM                 50.0f
+#define REF_PITCH_KP                    7.0f
+#define REF_PITCH_KI                    0.02f
+#define REF_PITCH_KD                    0.10f
+#define REF_PITCH_GYRO_GAIN             1.5f
+#define REF_PITCH_OUT_RPM               50.0f
+#define REF_DEG_S_TO_RPM                (1.0f / 6.0f)
+#define REF_TRACK_SETTLE_MS             300u
+#define REF_VISION_EXTRA_MS              40u
+#define REF_YAW_GZ_LEAD_S               0.10f
+#define REF_YAW_GZ_TAIL_MS              150u
+#define REF_YAW_GZ_LEAD_MAX_DPS         80.0f
+#define REF_VEH_SPEED_LEAD_S            0.05f
+#define REF_VEH_SPEED_LEAD_MAX_MPS      0.20f
+#define REF_VEH_RANGE_MIN_M             0.15f
+#define REF_VEH_RANGE_MAX_AGE_MS        1000u
+#define REF_VEH_PITCH_H_M              (-0.182f)
+/* 2026-11-14 静态标定：摄像头光轴与车头前向对齐，
+ * Yaw 电机机械角中位数 -269.31°，取 -269.30°。 */
+#define REF_YAW_CHASSIS_FORWARD_OFFSET_DEG (-269.30f)
+#define REF_YAW_CHASSIS_SPEED_FILTER_TAU_S 0.05f
+#define REF_YAW_CHASSIS_FF_SIGN        -1.0f
+#define REF_CHASSIS_TIMEOUT_MS          500u
+#define REF_CHASSIS_FRAME_SIZE          22u
+#define REF_CHASSIS_FRAME_VERSION       5u
+#define REF_CHASSIS_FRAME_TYPE          0x31u
+#define REF_CHASSIS_PHASE_TRACK         0u
+#define REF_CHASSIS_PHASE_APPROACH      1u
+#define REF_CHASSIS_PHASE_PIVOT         2u
+#define REF_CHASSIS_PHASE_EXIT          3u
+#define REF_CHASSIS_PHASE_FAULT         4u
+#define REF_CHASSIS_DISTANCE_UNKNOWN    0u
+#define REF_CHASSIS_DISTANCE_NEAR       1u
+#define REF_CHASSIS_DISTANCE_FAR        2u
+#define REF_CHASSIS_DISTANCE_TRANSITION 3u
+
+static uint8_t ref_chassis_phase_is_turning(int8_t phase)
+{
+    return (uint8_t)(
+        (phase == (int8_t)REF_CHASSIS_PHASE_APPROACH) ||
+        (phase == (int8_t)REF_CHASSIS_PHASE_PIVOT) ||
+        (phase == (int8_t)REF_CHASSIS_PHASE_EXIT)
+    );
+}
 
 /* Chassis turn handling: keep the normal visual position loop and preserve
  * the target's world-bearing rate as feed-forward while the car advances
@@ -1236,12 +1283,15 @@ typedef struct
     float yaw_imu_deg;
     float pitch_motor_deg;
     float pitch_imu_deg;
+    float vehicle_yaw_deg;
+    float vehicle_pitch_deg;
 } VisAngleSample_t;
 
 typedef struct
 {
     float value;
     float rate;
+    float u_ref;
     uint32_t ms;
     uint8_t active;
     uint8_t wrap360;
@@ -1286,19 +1336,75 @@ static uint16_t g_vis_history_head;
 static uint16_t g_vis_history_count;
 static VisAlphaBeta_t g_vis_track_yaw = {.wrap360 = 1u};
 static VisAlphaBeta_t g_vis_track_pitch;
-static float   g_vis_turn_yaw_scale = 1.0f;
-static uint8_t g_vis_turn_active;
-static uint8_t g_vis_turn_rate_filter_valid;
-static uint8_t g_vis_turn_rate_prev_active;
-static float   g_vis_turn_target_rate_dps;
-static uint32_t g_vis_turn_rate_recover_ms;
-static uint8_t g_chassis_turn_phase;
-static uint8_t g_chassis_prev_phase;
-static int8_t  g_chassis_turn_dir;
-static uint8_t g_chassis_flags;
-static uint8_t g_chassis_link_valid;
-static uint32_t g_chassis_status_age_ms;
-static uint32_t g_chassis_turn_exit_ms;
+static float g_ref_yaw_target_deg;
+static float g_ref_pitch_target_world_deg;
+static float g_ref_pitch_target_motor_deg;
+static uint32_t g_ref_visual_seen_ms;
+static float g_ref_yaw_target_rate_dps;
+static float g_ref_pitch_target_rate_dps;
+static float g_ref_pitch_ff_rpm;
+static float g_ref_yaw_residual_ff_dps;
+static float g_ref_yaw_error_deg;
+static float g_ref_pitch_error_deg;
+static float g_ref_yaw_integral_dps;
+static uint32_t g_ref_startup_tick;
+static uint8_t g_ref_target_valid;
+static uint8_t g_ref_yaw_saturated;
+static float g_ref_yaw_geometry_rate_dps;
+static float g_ref_yaw_chassis_gz_dps;
+static float g_ref_yaw_chassis_lead_dps;
+static float g_dbg_yaw_ab_rate_dps;
+static float g_dbg_yaw_ab_target_deg;
+static float g_dbg_yaw_recovery_rate_dps;
+static float g_dbg_yaw_position_rpm;
+static float g_dbg_yaw_rate_feedback_rpm;
+static float g_dbg_yaw_gz_ff_rpm;
+static float g_dbg_yaw_gz_ff_scale = 1.0f;
+static float g_dbg_yaw_ab_residual_ff_rpm;
+static float g_ref_yaw_speed_mps;
+static float g_ref_yaw_accel_mps2;
+static float g_ref_yaw_target_range_m = 0.75f;
+static float g_vehicle_yaw_cum_deg;
+static float g_ref_vehicle_pitch_rate_dps;
+static float g_vehicle_pitch_cum_deg;
+static uint32_t g_ref_yaw_settle_until_ms;
+static uint32_t g_ref_pitch_settle_until_ms;
+static float g_ref_chassis_last_gz_dps;
+static float g_ref_chassis_gz_accel_dps2;
+static uint32_t g_ref_chassis_last_gz_ms;
+static uint32_t g_ref_chassis_last_gz_seq;
+static uint8_t g_ref_turning_seen;
+static uint32_t g_ref_turning_seen_ms;
+static float g_ref_pitch_prev_error_deg;
+static uint8_t g_ref_route_corner_count;
+
+typedef struct
+{
+    uint32_t last_rx_ms;
+    uint32_t sequence;
+    uint32_t good_frames;
+    uint32_t bad_frames;
+    uint32_t raw_bytes;
+    uint32_t version_errors;
+    uint32_t sample_ms;
+    int32_t sample_age_raw_ms;
+    uint32_t sample_age_relative_ms;
+    int16_t speed_mm_s;
+    int16_t yaw_rate_dps_x10;
+    int8_t phase;
+    int8_t turn_dir;
+    uint8_t flags;
+    uint8_t distance_zone;
+    uint8_t corner_count;
+    uint8_t control_valid;
+} ChassisLinkState_t;
+
+static volatile ChassisLinkState_t g_chassis_link;
+static uint8_t g_chassis_rx_dma[32];
+static uint8_t g_chassis_stream[64];
+static uint16_t g_chassis_stream_len;
+static int32_t g_chassis_min_clock_offset_ms;
+static uint8_t g_chassis_clock_offset_valid;
 
 static float vis_wrap_deg(float deg)
 {
@@ -1312,10 +1418,240 @@ static float vis_wrap_pm180_deg(float deg)
     return (wrapped > 180.0f) ? (wrapped - 360.0f) : wrapped;
 }
 
+static uint16_t chassis_read_le16(const uint8_t *data)
+{
+    return (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+}
+
+static uint32_t chassis_read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] |
+           ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+static uint16_t chassis_crc16_ccitt_false(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    uint16_t i;
+
+    while (len-- != 0u)
+    {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (i = 0u; i < 8u; i++)
+        {
+            crc = ((crc & 0x8000u) != 0u)
+                ? (uint16_t)((crc << 1) ^ 0x1021u)
+                : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static void chassis_commit_frame(const uint8_t *frame, uint32_t now)
+{
+    int16_t speed_mm_s = (int16_t)chassis_read_le16(&frame[10]);
+    int16_t yaw_rate_dps_x10 = (int16_t)chassis_read_le16(&frame[12]);
+    int8_t phase = (int8_t)frame[6];
+    int8_t turn_dir = (int8_t)frame[7];
+    uint8_t flags = frame[8];
+    uint8_t distance_zone = frame[9];
+    uint8_t corner_count = frame[14];
+    uint32_t sample_ms = chassis_read_le32(&frame[16]);
+    int32_t sample_age_raw_ms = (int32_t)(now - sample_ms);
+
+    if ((phase < (int8_t)REF_CHASSIS_PHASE_TRACK) ||
+        (phase > (int8_t)REF_CHASSIS_PHASE_FAULT) ||
+        (turn_dir < -1) || (turn_dir > 1) ||
+        (distance_zone > REF_CHASSIS_DISTANCE_TRANSITION) ||
+        (speed_mm_s < -5000) || (speed_mm_s > 5000) ||
+        (yaw_rate_dps_x10 < -3000) || (yaw_rate_dps_x10 > 3000))
+    {
+        g_chassis_link.bad_frames++;
+        return;
+    }
+
+    {
+        float new_speed_mps = (float)speed_mm_s * 0.001f;
+
+        if ((g_chassis_link.good_frames != 0u) &&
+            (g_chassis_link.last_rx_ms != 0u))
+        {
+            uint32_t dt_ms = now - g_chassis_link.last_rx_ms;
+            if ((dt_ms > 0u) && (dt_ms <= 100u))
+            {
+                float raw_accel =
+                    (new_speed_mps - g_ref_yaw_speed_mps) * 1000.0f /
+                    (float)dt_ms;
+                g_ref_yaw_accel_mps2 +=
+                    0.5f * (raw_accel - g_ref_yaw_accel_mps2);
+            }
+            else
+            {
+                g_ref_yaw_accel_mps2 = 0.0f;
+            }
+        }
+        else
+        {
+            g_ref_yaw_accel_mps2 = 0.0f;
+        }
+        g_ref_yaw_speed_mps = new_speed_mps;
+    }
+    g_chassis_link.sequence = chassis_read_le16(&frame[4]);
+    g_chassis_link.phase = phase;
+    g_chassis_link.turn_dir = turn_dir;
+    g_chassis_link.flags = flags;
+    g_chassis_link.distance_zone = distance_zone;
+    g_chassis_link.corner_count = corner_count;
+    g_ref_route_corner_count = corner_count;
+    g_chassis_link.speed_mm_s = speed_mm_s;
+    g_chassis_link.yaw_rate_dps_x10 = yaw_rate_dps_x10;
+    g_chassis_link.sample_ms = sample_ms;
+    g_chassis_link.sample_age_raw_ms = sample_age_raw_ms;
+    if (g_chassis_clock_offset_valid == 0u)
+    {
+        g_chassis_min_clock_offset_ms = sample_age_raw_ms;
+        g_chassis_clock_offset_valid = 1u;
+    }
+    else if (sample_age_raw_ms < g_chassis_min_clock_offset_ms)
+    {
+        g_chassis_min_clock_offset_ms = sample_age_raw_ms;
+    }
+    {
+        int32_t relative_age =
+            sample_age_raw_ms - g_chassis_min_clock_offset_ms;
+        g_chassis_link.sample_age_relative_ms =
+            (relative_age > 0) ? (uint32_t)relative_age : 0u;
+    }
+    g_chassis_link.control_valid =
+        (uint8_t)(((flags & 0x01u) != 0u) &&
+                  ((flags & 0x08u) == 0u) &&
+                  (phase != REF_CHASSIS_PHASE_FAULT));
+    g_chassis_link.last_rx_ms = now;
+    g_chassis_link.good_frames++;
+}
+
+static void chassis_parse_stream(const uint8_t *data, uint16_t len,
+                                 uint32_t now)
+{
+    uint16_t i;
+
+    g_chassis_link.raw_bytes += len;
+    for (i = 0u; i < len; i++)
+    {
+        if (g_chassis_stream_len >= sizeof(g_chassis_stream))
+        {
+            memmove(g_chassis_stream, g_chassis_stream + 1,
+                    sizeof(g_chassis_stream) - 1u);
+            g_chassis_stream_len = (uint16_t)(sizeof(g_chassis_stream) - 1u);
+        }
+        g_chassis_stream[g_chassis_stream_len++] = data[i];
+    }
+
+    while (g_chassis_stream_len >= REF_CHASSIS_FRAME_SIZE)
+    {
+        uint16_t expected_crc;
+        uint16_t received_crc;
+
+        if ((g_chassis_stream[0] != 0xAAu) ||
+            (g_chassis_stream[1] != 0x55u))
+        {
+            memmove(g_chassis_stream, g_chassis_stream + 1,
+                    g_chassis_stream_len - 1u);
+            g_chassis_stream_len--;
+            continue;
+        }
+        if ((g_chassis_stream[2] != REF_CHASSIS_FRAME_VERSION) ||
+            (g_chassis_stream[3] != REF_CHASSIS_FRAME_TYPE))
+        {
+            g_chassis_link.version_errors++;
+            memmove(g_chassis_stream, g_chassis_stream + 1,
+                    g_chassis_stream_len - 1u);
+            g_chassis_stream_len--;
+            continue;
+        }
+
+        expected_crc = chassis_crc16_ccitt_false(
+            g_chassis_stream, REF_CHASSIS_FRAME_SIZE - 2u);
+        received_crc = chassis_read_le16(
+            &g_chassis_stream[REF_CHASSIS_FRAME_SIZE - 2u]);
+        if (expected_crc != received_crc)
+        {
+            g_chassis_link.bad_frames++;
+            memmove(g_chassis_stream, g_chassis_stream + 1,
+                    g_chassis_stream_len - 1u);
+            g_chassis_stream_len--;
+            continue;
+        }
+
+        chassis_commit_frame(g_chassis_stream, now);
+        g_chassis_stream_len =
+            (uint16_t)(g_chassis_stream_len - REF_CHASSIS_FRAME_SIZE);
+        if (g_chassis_stream_len != 0u)
+        {
+            memmove(g_chassis_stream,
+                    g_chassis_stream + REF_CHASSIS_FRAME_SIZE,
+                    g_chassis_stream_len);
+        }
+    }
+}
+
+static void chassis_link_start_rx(void)
+{
+    __HAL_UART_CLEAR_FLAG(&huart7, UART_CLEAR_OREF | UART_CLEAR_FEF |
+                                     UART_CLEAR_NEF | UART_CLEAR_PEF);
+    HAL_NVIC_SetPriority(UART7_IRQn, 6u, 0u);
+    HAL_NVIC_EnableIRQ(UART7_IRQn);
+    (void)HAL_UARTEx_ReceiveToIdle_IT(
+        &huart7, g_chassis_rx_dma, (uint16_t)sizeof(g_chassis_rx_dma));
+}
+
+void yuntai_chassis_uart_error(void)
+{
+    (void)HAL_UART_AbortReceive(&huart7);
+    chassis_link_start_rx();
+}
+
+static void chassis_link_snapshot(uint32_t now, ChassisLinkState_t *out)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    *out = g_chassis_link;
+    __set_PRIMASK(primask);
+    out->control_valid = (uint8_t)(
+        (out->last_rx_ms != 0u) &&
+        ((now - out->last_rx_ms) < REF_CHASSIS_TIMEOUT_MS) &&
+        out->control_valid
+    );
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+{
+    if (huart != &huart7)
+    {
+        return;
+    }
+
+    if (size > sizeof(g_chassis_rx_dma))
+    {
+        size = (uint16_t)sizeof(g_chassis_rx_dma);
+    }
+    chassis_parse_stream(g_chassis_rx_dma, size, HAL_GetTick());
+    (void)HAL_UARTEx_ReceiveToIdle_IT(
+        &huart7, g_chassis_rx_dma, (uint16_t)sizeof(g_chassis_rx_dma));
+}
+
 static void vis_history_reset(void)
 {
     g_vis_history_head = 0u;
     g_vis_history_count = 0u;
+    g_vehicle_yaw_cum_deg = 0.0f;
+    g_vehicle_pitch_cum_deg = 0.0f;
+    g_ref_vehicle_pitch_rate_dps = 0.0f;
+    g_ref_yaw_settle_until_ms = 0u;
+    g_ref_pitch_settle_until_ms = 0u;
     memset(&g_vis_track_yaw, 0, sizeof(g_vis_track_yaw));
     memset(&g_vis_track_pitch, 0, sizeof(g_vis_track_pitch));
     g_vis_track_yaw.wrap360 = 1u;
@@ -1328,6 +1664,8 @@ static void vis_history_push(uint32_t now)
     sample->yaw_imu_deg = vis_wrap_deg(imuAngle[0] * 57.29578f);
     sample->pitch_motor_deg = g_pitch_fb.cont;
     sample->pitch_imu_deg = imuAngle[1] * 57.29578f;
+    sample->vehicle_yaw_deg = g_vehicle_yaw_cum_deg;
+    sample->vehicle_pitch_deg = g_vehicle_pitch_cum_deg;
     g_vis_history_head = (uint16_t)(
         (g_vis_history_head + 1u) % VIS_ANGLE_HISTORY_LEN
     );
@@ -1346,6 +1684,8 @@ static VisAngleSample_t vis_history_at(uint32_t ms)
     found.yaw_imu_deg = vis_wrap_deg(imuAngle[0] * 57.29578f);
     found.pitch_motor_deg = g_pitch_fb.cont;
     found.pitch_imu_deg = imuAngle[1] * 57.29578f;
+    found.vehicle_yaw_deg = g_vehicle_yaw_cum_deg;
+    found.vehicle_pitch_deg = g_vehicle_pitch_cum_deg;
     for (k = 1u; k <= g_vis_history_count; k++)
     {
         uint16_t index = (uint16_t)(
@@ -1361,26 +1701,8 @@ static VisAngleSample_t vis_history_at(uint32_t ms)
     return found;
 }
 
-static float vis_track_value_at(const VisAlphaBeta_t *tracker,
-                                uint32_t at_ms)
-{
-    int32_t ahead = (int32_t)(at_ms - tracker->ms);
-    float value;
-
-    if (!tracker->active || ahead < 0)
-    {
-        return tracker->value;
-    }
-    if (ahead > (int32_t)VIS_TRACK_COAST_MS)
-    {
-        ahead = (int32_t)VIS_TRACK_COAST_MS;
-    }
-    value = tracker->value + tracker->rate * (float)ahead * 0.001f;
-    return tracker->wrap360 ? vis_wrap_deg(value) : value;
-}
-
 static float vis_track_predict(const VisAlphaBeta_t *tracker, uint32_t now,
-                               float *rate_dps)
+                               float vehicle_yaw_now, float *rate_dps)
 {
     int32_t ahead = (int32_t)(now - tracker->ms);
     float rate = tracker->rate;
@@ -1402,13 +1724,16 @@ static float vis_track_predict(const VisAlphaBeta_t *tracker, uint32_t now,
     *rate_dps = rate;
     if (tracker->wrap360 != 0u)
     {
-        return vis_wrap_deg(tracker->value + rate * (float)ahead * 0.001f);
+        return vis_wrap_deg(
+            tracker->value + rate * (float)ahead * 0.001f +
+            (vehicle_yaw_now - tracker->u_ref));
     }
-    return tracker->value + rate * (float)ahead * 0.001f;
+    return tracker->value + rate * (float)ahead * 0.001f +
+           (vehicle_yaw_now - tracker->u_ref);
 }
 
-static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
-                             uint32_t capture_ms, float beta)
+static uint8_t vis_track_update(VisAlphaBeta_t *tracker, float measured,
+                                uint32_t capture_ms, float vehicle_input_at)
 {
     int32_t gap = (int32_t)(capture_ms - tracker->ms);
     float dt;
@@ -1420,20 +1745,31 @@ static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
     {
         tracker->value = tracker->wrap360 ? vis_wrap_deg(measured) : measured;
         tracker->rate = 0.0f;
+        tracker->u_ref = vehicle_input_at;
         tracker->ms = capture_ms;
         tracker->active = 1u;
-        return;
+        return 1u;
     }
     if (gap < 0)
     {
-        return;
+        return 0u;
     }
     dt = (float)gap * 0.001f;
-    predicted = tracker->value + tracker->rate * dt;
+    predicted = tracker->value + tracker->rate * dt +
+                (vehicle_input_at - tracker->u_ref);
     residual = measured - predicted;
     if (tracker->wrap360 != 0u)
     {
         residual = vis_wrap_pm180_deg(residual);
+    }
+    if (fabsf(residual) > VIS_TRACK_RESET_GATE_DEG)
+    {
+        tracker->value = tracker->wrap360 ? vis_wrap_deg(measured) : measured;
+        tracker->rate = 0.0f;
+        tracker->u_ref = vehicle_input_at;
+        tracker->ms = capture_ms;
+        tracker->active = 1u;
+        return 1u;
     }
     tracker->value = tracker->wrap360 ?
         vis_wrap_deg(predicted + VIS_TRACK_ALPHA * residual) :
@@ -1447,8 +1783,10 @@ static void vis_track_update(VisAlphaBeta_t *tracker, float measured,
         tracker->rate = clampf(tracker->rate,
                                -VIS_TRACK_MAX_RATE_DPS,
                                VIS_TRACK_MAX_RATE_DPS);
+        tracker->u_ref = vehicle_input_at;
         tracker->ms = capture_ms;
     }
+    return 0u;
 }
 
 static float vis_turn_target_rate(float raw_rate_dps, float frame_dt,
@@ -1551,45 +1889,6 @@ static void vis_pid_reset(VisPidState_t *pid)
     pid->have_prev = 0u;
 }
 
-/**
- * 一次视觉外环 PID 计算。
- * 输入角度误差，输出视觉偏置角速度；额外的Ki默认关闭，
- * 偏置角由调用者持续积分。
- */
-static float vis_pid_step(VisPidState_t *pid, float error_deg, float dt,
-                          float kp, float ki, float kd, float out_limit)
-{
-    float p;
-    float d = 0.0f;
-    float next_i;
-    float out;
-
-    dt = clampf(dt, 0.001f, 0.100f);
-    p = kp * error_deg;
-    if (pid->have_prev != 0u)
-    {
-        d = clampf(kd * ((error_deg - pid->prev_error_deg) / dt),
-                   -VIS_D_LIMIT_ANGLE_DEG, VIS_D_LIMIT_ANGLE_DEG);
-    }
-    next_i = clampf(pid->integral_angle_deg + (ki * error_deg * dt),
-                    -VIS_I_LIMIT_ANGLE_DEG, VIS_I_LIMIT_ANGLE_DEG);
-    out = p + next_i + d;
-
-    if (((out > out_limit) && (error_deg > 0.0f)) ||
-        ((out < -out_limit) && (error_deg < 0.0f)))
-    {
-        out = p + pid->integral_angle_deg + d;  /* anti-windup */
-    }
-    else
-    {
-        pid->integral_angle_deg = next_i;
-    }
-
-    pid->prev_error_deg = error_deg;
-    pid->have_prev = 1u;
-    return clampf(out, -out_limit, out_limit);
-}
-
 static void vis_outer_reset(void)
 {
     vis_history_reset();
@@ -1615,7 +1914,421 @@ static void vis_outer_reset(void)
     g_vis_jump_pending = 0u;
     g_vis_last_ms = 0u;
     g_vis_applied_ms = 0u;
+    g_ref_visual_seen_ms = 0u;
 }
+
+#if 0
+/* Superseded by the reference GimbalTask short-loss/settle behavior. */
+static float vis_guard_clip(float value, float limit)
+{
+    return clampf(value, -limit, limit);
+}
+
+static void vis_hold_reset(void)
+{
+    memset(&g_vis_hold, 0, sizeof(g_vis_hold));
+    memset(&g_vis_yaw_recovery, 0, sizeof(g_vis_yaw_recovery));
+    memset(&g_pitch_target_guard, 0, sizeof(g_pitch_target_guard));
+    g_ref_last_chassis_phase = -1;
+    g_ref_turn_reacquire_active = 0u;
+    g_ref_turn_reacquire_frames = 0u;
+    g_ref_turn_reacquire_yaw_deg = 0.0f;
+    g_ref_turn_reacquire_pitch_deg = 0.0f;
+}
+
+static void vis_hold_enter_loss(uint32_t now)
+{
+    if (g_vis_hold.hold_active != 0u)
+    {
+        g_vis_hold.recovery_active = 0u;
+        return;
+    }
+    g_vis_hold.yaw_anchor_deg = vis_wrap_deg(g_ref_yaw_target_deg);
+    g_vis_hold.pitch_anchor_deg = g_ref_pitch_target_world_deg;
+    g_vis_hold.last_valid_ms = now;
+    g_vis_hold.hold_active = 1u;
+    g_vis_hold.recovery_active = 0u;
+    g_vis_yaw_recovery.active = 0u;
+}
+
+static uint8_t vis_hold_note_valid(uint32_t now)
+{
+    if (g_vis_hold.hold_active == 0u)
+    {
+        g_vis_hold.last_valid_ms = now;
+        return 0u;
+    }
+
+    g_vis_hold.last_valid_ms = now;
+    if ((g_vis_hold.recovery_active == 0u) ||
+        ((uint32_t)(now - g_vis_hold.recovery_last_ms) >
+         VIS_HOLD_RECOVERY_GAP_MS))
+    {
+        g_vis_hold.recovery_active = 1u;
+        g_vis_hold.recovery_start_ms = now;
+    }
+    g_vis_hold.recovery_last_ms = now;
+    if ((uint32_t)(now - g_vis_hold.recovery_start_ms) >=
+        VIS_HOLD_RECOVERY_CONFIRM_MS)
+    {
+        g_vis_hold.hold_active = 0u;
+        g_vis_hold.recovery_active = 0u;
+        return 1u;
+    }
+    return 0u;
+}
+
+static float vis_hold_clamp_yaw(float target_deg)
+{
+    float offset;
+
+    if (g_vis_hold.hold_active == 0u)
+    {
+        return target_deg;
+    }
+    offset = vis_guard_clip(
+        vis_wrap_pm180_deg(target_deg - g_vis_hold.yaw_anchor_deg),
+        VIS_HOLD_MAX_DEVIATION_DEG);
+    return vis_wrap_deg(g_vis_hold.yaw_anchor_deg + offset);
+}
+
+static float vis_hold_clamp_pitch(float target_deg)
+{
+    if (g_vis_hold.hold_active == 0u)
+    {
+        return target_deg;
+    }
+    return g_vis_hold.pitch_anchor_deg + vis_guard_clip(
+        target_deg - g_vis_hold.pitch_anchor_deg,
+        VIS_HOLD_MAX_DEVIATION_DEG);
+}
+
+static float vis_hold_output_scale(uint32_t now)
+{
+    uint32_t no_valid_ms;
+
+    if (g_vis_hold.hold_active == 0u)
+    {
+        return 1.0f;
+    }
+    no_valid_ms = now - g_vis_hold.last_valid_ms;
+    if (no_valid_ms <= VIS_HOLD_SAFE_STOP_MS)
+    {
+        return 1.0f;
+    }
+    no_valid_ms -= VIS_HOLD_SAFE_STOP_MS;
+    if (no_valid_ms >= VIS_HOLD_SAFE_STOP_RAMP_MS)
+    {
+        return 0.0f;
+    }
+    return 1.0f -
+        (float)no_valid_ms / (float)VIS_HOLD_SAFE_STOP_RAMP_MS;
+}
+
+static uint8_t vis_hold_state(uint32_t now)
+{
+    if (g_vis_hold.hold_active == 0u)
+    {
+        return 0u;
+    }
+    if (vis_hold_output_scale(now) < 0.999f)
+    {
+        return 3u;
+    }
+    return (g_vis_hold.recovery_active != 0u) ? 2u : 1u;
+}
+
+static void vis_recovery_begin(float origin_yaw_deg, uint32_t now)
+{
+    g_vis_yaw_recovery.output = vis_wrap_deg(origin_yaw_deg);
+    g_vis_yaw_recovery.goal = g_vis_yaw_recovery.output;
+    g_vis_yaw_recovery.rate = 0.0f;
+    g_vis_yaw_recovery.tick_ms = now;
+    g_vis_yaw_recovery.stable_ms = now;
+    g_vis_yaw_recovery.active = 1u;
+    g_vis_yaw_recovery.stable = 0u;
+}
+
+static float vis_recovery_step(uint32_t now, float visual_error_deg)
+{
+    float dt;
+    float error;
+    float desired;
+    float delta;
+
+    if (g_vis_yaw_recovery.active == 0u)
+    {
+        return g_vis_yaw_recovery.output;
+    }
+    dt = clampf(
+        (float)(now - g_vis_yaw_recovery.tick_ms) * 0.001f,
+        0.001f, 0.020f);
+    g_vis_yaw_recovery.tick_ms = now;
+    error = vis_wrap_pm180_deg(
+        g_vis_yaw_recovery.goal - g_vis_yaw_recovery.output);
+    desired = fminf(
+        sqrtf(2.0f * VIS_RECOVERY_MAX_ACCEL_DPS2 * fabsf(error)),
+        VIS_RECOVERY_MAX_RATE_DPS);
+    if (error < 0.0f)
+    {
+        desired = -desired;
+    }
+    g_vis_yaw_recovery.rate += vis_guard_clip(
+        desired - g_vis_yaw_recovery.rate,
+        VIS_RECOVERY_MAX_ACCEL_DPS2 * dt);
+    delta = g_vis_yaw_recovery.rate * dt;
+    if (((error * delta) >= 0.0f) && (fabsf(delta) >= fabsf(error)))
+    {
+        g_vis_yaw_recovery.output = g_vis_yaw_recovery.goal;
+        g_vis_yaw_recovery.rate = 0.0f;
+    }
+    else
+    {
+        g_vis_yaw_recovery.output = vis_wrap_deg(
+            g_vis_yaw_recovery.output + delta);
+    }
+
+    if ((fabsf(vis_wrap_pm180_deg(
+             g_vis_yaw_recovery.goal - g_vis_yaw_recovery.output)) <= 0.2f) &&
+        (fabsf(visual_error_deg) <= 0.5f))
+    {
+        if (g_vis_yaw_recovery.stable == 0u)
+        {
+            g_vis_yaw_recovery.stable = 1u;
+            g_vis_yaw_recovery.stable_ms = now;
+        }
+        if ((uint32_t)(now - g_vis_yaw_recovery.stable_ms) >=
+            VIS_RECOVERY_SETTLE_MS)
+        {
+            g_vis_yaw_recovery.active = 0u;
+            g_vis_yaw_recovery.rate = 0.0f;
+        }
+    }
+    else
+    {
+        g_vis_yaw_recovery.stable = 0u;
+    }
+    return g_vis_yaw_recovery.output;
+}
+
+static void pitch_guard_reset(void)
+{
+    memset(&g_pitch_target_guard, 0, sizeof(g_pitch_target_guard));
+}
+
+static void pitch_guard_begin(float origin_deg, float goal_deg, uint32_t now)
+{
+    pitch_guard_reset();
+    g_pitch_target_guard.valid = 1u;
+    g_pitch_target_guard.accepted = goal_deg;
+    g_pitch_target_guard.goal = goal_deg;
+    g_pitch_target_guard.output = origin_deg;
+    g_pitch_target_guard.capture_ms = now;
+    g_pitch_target_guard.tick_ms = now;
+    g_pitch_target_guard.observation_tick_ms = now;
+    g_pitch_target_guard.ff_tick_ms = now;
+    g_pitch_target_guard.ff_inhibit_until_ms = now + PITCH_GUARD_FF_HOLD_MS;
+    g_pitch_target_guard.protected_move = 1u;
+}
+
+static void pitch_guard_observe(float goal_deg, float origin_deg,
+                                uint32_t seq, uint32_t capture_ms,
+                                uint32_t now)
+{
+    PitchTargetGuard_t *guard = &g_pitch_target_guard;
+    float raw_step;
+    float control_step;
+    float max_step;
+    uint32_t elapsed;
+
+    if (guard->valid == 0u)
+    {
+        pitch_guard_begin(origin_deg, goal_deg, now);
+        guard->capture_ms = capture_ms;
+        return;
+    }
+    if ((int32_t)(capture_ms - guard->capture_ms) <= 0)
+    {
+        return;
+    }
+    elapsed = capture_ms - guard->capture_ms;
+    raw_step = goal_deg - guard->accepted;
+    if (fabsf(raw_step) > PITCH_GUARD_CONFIRM_DEG)
+    {
+        if ((guard->pending_valid != 0u) &&
+            (seq != guard->pending_seq) &&
+            ((int32_t)(capture_ms - guard->pending_capture_ms) > 0) &&
+            ((uint32_t)(capture_ms - guard->pending_capture_ms) <=
+             PITCH_GUARD_CONFIRM_WINDOW_MS) &&
+            ((uint32_t)(now - guard->pending_tick_ms) <=
+             PITCH_GUARD_CONFIRM_WINDOW_MS) &&
+            ((raw_step * (guard->pending - guard->accepted)) > 0.0f) &&
+            (fabsf(goal_deg - guard->pending) <=
+             PITCH_GUARD_CONFIRM_MATCH_DEG))
+        {
+            guard->protected_move = 1u;
+            guard->velocity = 0.0f;
+            guard->rate = 0.0f;
+        }
+        else
+        {
+            if ((guard->pending_valid == 0u) ||
+                (seq != guard->pending_seq))
+            {
+                guard->pending = goal_deg;
+                guard->pending_seq = seq;
+                guard->pending_capture_ms = capture_ms;
+                guard->pending_tick_ms = now;
+                guard->pending_valid = 1u;
+            }
+            guard->held = 1u;
+            guard->rate = 0.0f;
+            return;
+        }
+    }
+    guard->held = 0u;
+    guard->pending_valid = 0u;
+    guard->accepted = goal_deg;
+
+    max_step = PITCH_GUARD_STEP_RATE_DPS *
+        clampf((float)elapsed * 0.001f, 0.001f, 0.100f);
+    if (max_step > PITCH_GUARD_STEP_MAX_DEG)
+    {
+        max_step = PITCH_GUARD_STEP_MAX_DEG;
+    }
+    control_step = goal_deg - guard->goal;
+    control_step = clampf(control_step, -max_step, max_step);
+    guard->goal += control_step;
+    if (guard->protected_move == 0u)
+    {
+        float dt = clampf((float)elapsed * 0.001f, 0.001f, 0.100f);
+        float alpha = (94.24778f * dt) / (1.0f + 94.24778f * dt);
+        float measured_rate = clampf(control_step / dt, -120.0f, 120.0f);
+        guard->rate += alpha * (measured_rate - guard->rate);
+    }
+    guard->capture_ms = capture_ms;
+    guard->observation_tick_ms = now;
+}
+
+static float pitch_guard_step(uint32_t now)
+{
+    PitchTargetGuard_t *guard = &g_pitch_target_guard;
+    float dt;
+    float error;
+    float desired;
+    float delta;
+
+    if (guard->valid == 0u)
+    {
+        return g_ref_pitch_target_world_deg;
+    }
+    dt = clampf((float)(now - guard->tick_ms) * 0.001f, 0.001f, 0.020f);
+    guard->tick_ms = now;
+    if (guard->held != 0u)
+    {
+        guard->velocity = 0.0f;
+        guard->rate = 0.0f;
+        return guard->output;
+    }
+    if (guard->protected_move == 0u)
+    {
+        if ((uint32_t)(now - guard->observation_tick_ms) >
+            VIS_HOLD_RECOVERY_GAP_MS)
+        {
+            if (guard->rate > 0.0f)
+            {
+                guard->rate = fmaxf(0.0f, guard->rate - 240.0f * dt);
+            }
+            else
+            {
+                guard->rate = fminf(0.0f, guard->rate + 240.0f * dt);
+            }
+        }
+        guard->output = guard->goal;
+        return guard->output;
+    }
+
+    error = guard->goal - guard->output;
+    desired = fminf(
+        sqrtf(2.0f * VIS_RECOVERY_MAX_ACCEL_DPS2 * fabsf(error)),
+        VIS_RECOVERY_MAX_RATE_DPS);
+    if (error < 0.0f)
+    {
+        desired = -desired;
+    }
+    guard->velocity += vis_guard_clip(
+        desired - guard->velocity,
+        VIS_RECOVERY_MAX_ACCEL_DPS2 * dt);
+    delta = guard->velocity * dt;
+    if (((error * delta) >= 0.0f) && (fabsf(delta) >= fabsf(error)))
+    {
+        guard->output = guard->goal;
+        guard->velocity = 0.0f;
+    }
+    else
+    {
+        guard->output += delta;
+    }
+    guard->rate = guard->velocity;
+
+    if ((fabsf(guard->goal - guard->output) <=
+         PITCH_GUARD_EXIT_OUTPUT_DEG) &&
+        (fabsf(guard->accepted - guard->goal) <=
+         PITCH_GUARD_EXIT_ERROR_DEG))
+    {
+        if (guard->stable_tick_ms == 0u)
+        {
+            guard->stable_tick_ms = now;
+        }
+        if ((uint32_t)(now - guard->stable_tick_ms) >=
+            PITCH_GUARD_EXIT_HOLD_MS)
+        {
+            guard->protected_move = 0u;
+            guard->rate = 0.0f;
+        }
+    }
+    else
+    {
+        guard->stable_tick_ms = 0u;
+    }
+    return guard->output;
+}
+
+static float pitch_guard_feedforward_rpm(uint32_t now)
+{
+    PitchTargetGuard_t *guard = &g_pitch_target_guard;
+    float requested;
+    float dt;
+    float max_delta;
+    float reversing;
+    float slew;
+
+    if ((guard->valid == 0u) || (guard->held != 0u) ||
+        ((int32_t)(now - guard->ff_inhibit_until_ms) < 0))
+    {
+        guard->ff_applied = 0.0f;
+        guard->ff_tick_ms = now;
+        return 0.0f;
+    }
+    requested = guard->rate * REF_DEG_S_TO_RPM;
+    if (guard->protected_move != 0u)
+    {
+        requested = clampf(requested, -12.0f, 12.0f);
+    }
+    dt = clampf((float)(now - guard->ff_tick_ms) * 0.001f, 0.001f, 0.020f);
+    guard->ff_tick_ms = now;
+    reversing = (guard->ff_applied * requested) < 0.0f;
+    slew = (fabsf(requested) < 0.01f)
+        ? PITCH_GUARD_FF_STOP_PER_S
+        : (reversing
+           ? PITCH_GUARD_FF_REVERSAL_PER_S
+           : PITCH_GUARD_FF_SLEW_PER_S);
+    max_delta = slew * dt;
+    guard->ff_applied += clampf(
+        requested - guard->ff_applied, -max_delta, max_delta);
+    return guard->ff_applied;
+}
+#endif
 
 static void vis_read_error_deg(const GimbalCmd_t *cmd, float k,
                                float *yaw_deg, float *pitch_deg)
@@ -1648,62 +2361,16 @@ static float vis_total_age_ms(const GimbalCmd_t *cmd, uint32_t now)
     return clampf(age_ms, 0.0f, 9999.0f);
 }
 
-static void vis_turn_state_update(uint32_t now)
+#if 0
+static uint8_t ref_turn_suppresses_ab_rate(int8_t phase)
 {
-    ChassisStatus_t chassis;
-    uint8_t link_valid;
-    uint8_t turn_active;
-
-    link_valid = chassis_link_get_status(&chassis, now);
-    g_chassis_link_valid = link_valid;
-    if (link_valid)
+    if ((phase == (int8_t)REF_CHASSIS_PHASE_APPROACH) ||
+        (phase == (int8_t)REF_CHASSIS_PHASE_PIVOT) ||
+        (phase == (int8_t)REF_CHASSIS_PHASE_EXIT))
     {
-        if ((chassis.phase == 3u) && (g_chassis_prev_phase != 3u))
-        {
-            g_chassis_turn_exit_ms = now;
-        }
-        g_chassis_turn_phase = chassis.phase;
-        g_chassis_turn_dir = chassis.turn_dir;
-        g_chassis_flags = chassis.flags;
-        g_chassis_prev_phase = chassis.phase;
-        g_chassis_status_age_ms = now - chassis.rx_ms;
+        return 1u;
     }
-    else
-    {
-        g_chassis_turn_phase = 0u;
-        g_chassis_turn_dir = 0;
-        g_chassis_flags = 0u;
-        g_chassis_prev_phase = 0u;
-        g_chassis_status_age_ms = 0xFFFFFFFFu;
-    }
-
-    turn_active = (uint8_t)(
-        link_valid &&
-        ((chassis.flags & 0x04u) != 0u) &&
-        (
-            (chassis.phase == 1u) ||
-            (chassis.phase == 2u) ||
-            (
-                (chassis.phase == 3u) &&
-                ((uint32_t)(now - g_chassis_turn_exit_ms) <
-                 VIS_TURN_EXIT_SETTLE_MS)
-            )
-        )
-    );
-    if (turn_active != g_vis_turn_rate_prev_active)
-    {
-        if (turn_active != 0u)
-        {
-            g_vis_turn_rate_filter_valid = 0u;
-        }
-        else
-        {
-            g_vis_turn_rate_recover_ms = now;
-        }
-        g_vis_turn_rate_prev_active = turn_active;
-    }
-    g_vis_turn_active = turn_active;
-    g_vis_turn_yaw_scale = VIS_TURN_YAW_SCALE;
+    return 0u;
 }
 
 static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
@@ -1732,7 +2399,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
 
     if (cmd->px_ms != g_vis_last_ms)
     {
-        float frame_dt = 0.0125f;
         float raw_yaw_deg;
         float raw_pitch_deg;
         float raw_yaw_error_deg;
@@ -1742,24 +2408,30 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float yaw_measure_deg;
         float pitch_measure_deg;
         float capture_age_ms;
+        float capture_vehicle_yaw_deg;
         uint32_t capture_ms;
         VisAngleSample_t capture_pose;
         VisAlphaBeta_t *yaw_tracker = &g_vis_track_yaw;
         VisAlphaBeta_t *pitch_tracker = &g_vis_track_pitch;
         const float k = vis_k_px_deg(cmd);
 
-        if ((g_vis_applied_ms != 0u) && (cmd->px_ms > g_vis_applied_ms))
-        {
-            frame_dt = (float)(cmd->px_ms - g_vis_applied_ms) / 1000.0f;
-        }
         g_vis_last_ms = cmd->px_ms;
 
         vis_read_error_deg(cmd, k, &raw_yaw_deg, &raw_pitch_deg);
+        if (fabsf(raw_yaw_deg) < VIS_DEADBAND_YAW_DEG)
+        {
+            raw_yaw_deg = 0.0f;
+        }
+        if (fabsf(raw_pitch_deg) < VIS_DEADBAND_PITCH_DEG)
+        {
+            raw_pitch_deg = 0.0f;
+        }
         capture_age_ms = clampf(vis_total_age_ms(cmd, now), 0.0f,
                                 VIS_LATENCY_MAX_MS);
         g_vis_latency_ms = capture_age_ms;
         capture_ms = now - (uint32_t)(capture_age_ms + 0.5f);
         capture_pose = vis_history_at(capture_ms);
+        capture_vehicle_yaw_deg = capture_pose.vehicle_yaw_deg;
         yaw_measure_deg = vis_wrap_deg(
             capture_pose.yaw_imu_deg + VIS_SIGN_YAW * raw_yaw_deg
         );
@@ -1771,9 +2443,11 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         /* 保留原来的大跳确认：异常测量先挂起一帧。 */
         if ((yaw_tracker->active != 0u) && (pitch_tracker->active != 0u))
         {
-            float predicted_yaw = vis_track_value_at(yaw_tracker, capture_ms);
+            float predicted_yaw = vis_track_value_at(
+                yaw_tracker, capture_ms, capture_vehicle_yaw_deg);
             float predicted_pitch =
-                vis_track_value_at(pitch_tracker, capture_ms);
+                vis_track_value_at(
+                    pitch_tracker, capture_ms, capture_vehicle_yaw_deg);
             float yaw_from_prediction = fabsf(vis_wrap_pm180_deg(
                 yaw_measure_deg - predicted_yaw
             ));
@@ -1823,27 +2497,36 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             }
         }
 
-        /* Keep learning the target's world-bearing rate through a turn. The
-         * chassis state lowers the visual position authority, but the target
-         * still moves because the car keeps advancing around the arc. */
         vis_track_update(
-            yaw_tracker,
-            yaw_measure_deg,
-            capture_ms,
-            (g_vis_turn_active != 0u) ?
-                VIS_TURN_TRACK_BETA : VIS_TRACK_BETA
-        );
+            yaw_tracker, yaw_measure_deg, capture_ms,
+            capture_vehicle_yaw_deg);
         vis_track_update(
-            pitch_tracker, pitch_measure_deg, capture_ms, VIS_TRACK_BETA
-        );
+            pitch_tracker, pitch_measure_deg, capture_ms,
+            capture_vehicle_yaw_deg);
+        {
+            ChassisLinkState_t chassis;
+
+            chassis_link_snapshot(now, &chassis);
+            if ((chassis.control_valid != 0u) &&
+                ((ref_turn_suppresses_ab_rate(chassis.phase) != 0u) ||
+                 (g_ref_turn_reacquire_active != 0u)))
+            {
+                /* Turning: update position only.  Body rotation must not
+                 * become an Alpha-Beta residual velocity. */
+                yaw_tracker->rate = 0.0f;
+                pitch_tracker->rate = 0.0f;
+            }
+        }
         {
             float raw_yaw_rate_dps;
             float predicted_yaw = vis_track_predict(
-                yaw_tracker, now, &raw_yaw_rate_dps
+                yaw_tracker, now, g_vehicle_yaw_cum_deg,
+                &g_vis_yaw_applied_rate_dps
             );
             float predicted_pitch_rate;
             float predicted_elevation = vis_track_predict(
-                pitch_tracker, now, &predicted_pitch_rate
+                pitch_tracker, now, g_vehicle_yaw_cum_deg,
+                &predicted_pitch_rate
             );
             float target_motor_pitch =
                 predicted_elevation - imuAngle[1] * 57.29578f;
@@ -1861,10 +2544,7 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             pitch_deg = vis_wrap_pm180_deg(
                 target_motor_pitch - g_pitch_fb.cont
             );
-            (void)predicted_pitch_rate;
-            g_vis_yaw_applied_rate_dps = vis_turn_target_rate(
-                raw_yaw_rate_dps, frame_dt, now
-            );
+            g_vis_pitch_rate_dps = predicted_pitch_rate;
         }
         yaw_deg = clampf(yaw_deg,
                          -VIS_ERROR_YAW_LIMIT_DEG,
@@ -1883,21 +2563,13 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         g_vis_yaw_error_deg = yaw_deg;
         g_vis_pitch_error_deg = pitch_deg;
 
-        /* 视觉 PID 输出偏置角速率，再积分到上一帧的偏置角上。
-         * 没有新视觉帧时偏置角保持，不清零。 */
-        {
-            vis_direct_yaw_target_step(
-                predicted_target_offset_deg, frame_dt
-            );
-            float pitch_rate = vis_pid_step(&g_vis_pid_pitch, pitch_deg,
-                                             frame_dt, g_vis_kp_pitch,
-                                             g_vis_ki_pitch, g_vis_kd_pitch,
-                                             VIS_RATE_PITCH_DPS);
-            g_vis_pitch_rate_dps = pitch_rate;
-            g_vis_pitch_angle_deg = clampf(
-                g_vis_pitch_angle_deg + pitch_rate * frame_dt,
-                -VIS_LIMIT_PITCH_DEG, VIS_LIMIT_PITCH_DEG);
-        }
+        /*
+         * The reference controller has one target estimator and no second
+         * "visual PID -> bias angle -> integration" stage.  Keep the PID
+         * parameters above only for the legacy remote-tuning protocol; the
+         * active speed-control chain consumes the Alpha-Beta target directly.
+         */
+        g_vis_yaw_rate_dps = 0.0f;
         g_vis_applied_ms = cmd->px_ms;
     }
     else
@@ -1905,12 +2577,13 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
         float ignored_rate;
         if (g_vis_track_yaw.active != 0u)
         {
-            float predicted_yaw = vis_track_predict(
-                &g_vis_track_yaw, now, &ignored_rate
+            (void)vis_track_predict(
+                &g_vis_track_yaw, now, g_vehicle_yaw_cum_deg,
+                &g_vis_yaw_applied_rate_dps
             );
-            float predicted_pitch_rate;
-            float predicted_elevation = vis_track_predict(
-                &g_vis_track_pitch, now, &predicted_pitch_rate
+            (void)vis_track_predict(
+                &g_vis_track_pitch, now, g_vehicle_yaw_cum_deg,
+                &ignored_rate
             );
             vis_direct_yaw_target_step(
                 angle_diff_rad(
@@ -1932,6 +2605,481 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
     }
 }
 
+#endif
+
+/*
+ * speed_control 111 tracking_motion.h:
+ *     omega_bearing = 57.29578 * v / range * sin(phi)
+ *
+ * v is the measured chassis speed with 50 ms lead, and phi is the yaw motor
+ * angle after the mechanical forward offset.  This is a bearing-rate
+ * feedforward caused by chassis translation, not chassis rotation.
+ */
+static float ref_yaw_chassis_speed_feedforward(uint32_t now, uint8_t allow,
+                                               const GimbalCmd_t *cmd)
+{
+    ChassisLinkState_t chassis;
+    float target_range_m;
+    float target_age_ms;
+    float speed_lead_mps;
+    float speed_used_mps;
+    float motor_yaw_deg;
+    float phi_deg;
+    float rate_scale_dps_per_mps;
+
+    chassis_link_snapshot(now, &chassis);
+    target_range_m = cmd->vis_distance_m;
+    target_age_ms = vis_total_age_ms(cmd, now);
+    g_ref_yaw_target_range_m = target_range_m;
+    g_ref_vehicle_pitch_rate_dps = 0.0f;
+
+    if ((allow == 0u) || (chassis.control_valid == 0u) ||
+        (target_range_m < REF_VEH_RANGE_MIN_M) ||
+        (target_age_ms > (float)REF_VEH_RANGE_MAX_AGE_MS))
+    {
+        return 0.0f;
+    }
+
+    speed_lead_mps = g_ref_yaw_speed_mps +
+        REF_VEH_SPEED_LEAD_S * g_ref_yaw_accel_mps2;
+    speed_lead_mps = clampf(
+        speed_lead_mps,
+        -REF_VEH_SPEED_LEAD_MAX_MPS,
+        REF_VEH_SPEED_LEAD_MAX_MPS);
+    speed_used_mps = speed_lead_mps;
+    motor_yaw_deg = g_yaw_fb.seen
+        ? g_yaw_fb.cont
+        : 0.0f;
+    phi_deg = vis_wrap_pm180_deg(
+        motor_yaw_deg - REF_YAW_CHASSIS_FORWARD_OFFSET_DEG);
+    rate_scale_dps_per_mps =
+        57.29578f * speed_used_mps / target_range_m;
+    g_ref_vehicle_pitch_rate_dps =
+        REF_VEH_PITCH_H_M * rate_scale_dps_per_mps *
+        cosf(phi_deg * 0.01745329f) / target_range_m;
+    return rate_scale_dps_per_mps * sinf(phi_deg * 0.01745329f);
+}
+
+static float ref_yaw_chassis_gz_feedforward(uint32_t now, float *lead_dps)
+{
+    ChassisLinkState_t chassis;
+    float gz_dps;
+    uint8_t turning;
+    uint8_t tail;
+
+    *lead_dps = 0.0f;
+    chassis_link_snapshot(now, &chassis);
+    if (chassis.control_valid == 0u)
+    {
+        g_ref_chassis_last_gz_ms = 0u;
+        g_ref_chassis_last_gz_seq = 0u;
+        g_ref_chassis_gz_accel_dps2 = 0.0f;
+        return 0.0f;
+    }
+
+    gz_dps = (float)chassis.yaw_rate_dps_x10 * 0.1f;
+    turning = ref_chassis_phase_is_turning(chassis.phase);
+    if (chassis.sequence != g_ref_chassis_last_gz_seq)
+    {
+        if (g_ref_chassis_last_gz_ms != 0u)
+        {
+            float dt = (float)(chassis.last_rx_ms -
+                               g_ref_chassis_last_gz_ms) * 0.001f;
+            if ((dt > 0.005f) && (dt < 0.100f))
+            {
+                float raw_accel_dps2 =
+                    (gz_dps - g_ref_chassis_last_gz_dps) / dt;
+                g_ref_chassis_gz_accel_dps2 +=
+                    0.5f * (raw_accel_dps2 -
+                            g_ref_chassis_gz_accel_dps2);
+            }
+        }
+        g_ref_chassis_last_gz_dps = gz_dps;
+        g_ref_chassis_last_gz_ms = chassis.last_rx_ms;
+        g_ref_chassis_last_gz_seq = chassis.sequence;
+    }
+
+    if (turning != 0u)
+    {
+        g_ref_turning_seen = 1u;
+        g_ref_turning_seen_ms = now;
+    }
+    tail = (uint8_t)(
+        (g_ref_turning_seen != 0u) &&
+        ((uint32_t)(now - g_ref_turning_seen_ms) <=
+         REF_YAW_GZ_TAIL_MS)
+    );
+    if ((turning != 0u) || (tail != 0u))
+    {
+        *lead_dps = clampf(
+            REF_YAW_GZ_LEAD_S * g_ref_chassis_gz_accel_dps2,
+            -REF_YAW_GZ_LEAD_MAX_DPS,
+            REF_YAW_GZ_LEAD_MAX_DPS);
+    }
+    return gz_dps;
+}
+
+#if 0
+/*
+ * The reference controller uses the Alpha-Beta state itself as the world
+ * target. There is no second "visual PID -> bias angle -> integration" stage.
+ * We still run vis_outer_step() above because it provides the existing latency
+ * compensation and outlier confirmation, but the inner loops consume these
+ * direct targets and rates.
+ */
+static void reference_target_update(const GimbalCmd_t *cmd, uint8_t mode,
+                                    uint32_t now)
+{
+    float yaw_rate = 0.0f;
+    float pitch_rate = 0.0f;
+    float predicted_yaw;
+    float predicted_pitch;
+    float age_ms = vis_total_age_ms(cmd, now);
+    uint8_t fresh;
+    uint8_t new_observation;
+    uint8_t release_hold = 0u;
+    float candidate_yaw;
+    float candidate_pitch;
+    ChassisLinkState_t chassis;
+
+    fresh = (uint8_t)(
+        (mode == GP_MODE_AIM) &&
+        (cmd->rx_count != 0u) &&
+        (cmd->aim_valid != 0u) &&
+        (cmd->vis_distance_source != 0u) &&
+        (age_ms <= (float)VIS_FREEZE_MS)
+    );
+    new_observation = (uint8_t)(
+        (cmd->px_ms != 0u) &&
+        (cmd->px_ms != g_ref_visual_seen_ms)
+    );
+
+    if ((mode != GP_MODE_AIM) || (cmd->rx_count == 0u))
+    {
+        g_ref_yaw_target_rate_dps = 0.0f;
+        g_ref_pitch_target_rate_dps = 0.0f;
+        g_ref_pitch_ff_rpm = 0.0f;
+        return;
+    }
+
+    chassis_link_snapshot(now, &chassis);
+    if (chassis.control_valid != 0u)
+    {
+        int8_t phase = chassis.phase;
+        if ((ref_turn_suppresses_ab_rate(phase) != 0u) ||
+            (g_ref_turn_reacquire_active != 0u))
+        {
+            /* Hold position-only through APPROACH/PIVOT/EXIT.  Only the
+             * return to TRACK may start re-learning the residual rate. */
+            g_vis_track_yaw.rate = 0.0f;
+            g_vis_track_pitch.rate = 0.0f;
+        }
+        if ((g_ref_last_chassis_phase ==
+             (int8_t)REF_CHASSIS_PHASE_PIVOT) &&
+            ((phase == (int8_t)REF_CHASSIS_PHASE_EXIT) ||
+             (phase == (int8_t)REF_CHASSIS_PHASE_TRACK)))
+        {
+            g_ref_turn_reacquire_active = 1u;
+            g_ref_turn_reacquire_frames = 0u;
+            g_ref_turn_reacquire_yaw_deg = g_ref_yaw_target_deg;
+            g_ref_turn_reacquire_pitch_deg =
+                g_ref_pitch_target_world_deg;
+            g_vis_yaw_recovery.active = 0u;
+            pitch_guard_reset();
+        }
+        g_ref_last_chassis_phase = phase;
+    }
+
+    if (new_observation != 0u)
+    {
+        g_ref_visual_seen_ms = cmd->px_ms;
+        if (fresh != 0u)
+        {
+            if (g_ref_turn_reacquire_active != 0u)
+            {
+                if (g_ref_turn_reacquire_frames <
+                    VIS_TURN_REACQUIRE_FRAMES)
+                {
+                    g_ref_turn_reacquire_frames++;
+                }
+            }
+            release_hold = vis_hold_note_valid(now);
+            if (release_hold != 0u)
+            {
+                vis_recovery_begin(imuAngle[0] * 57.29578f, now);
+                pitch_guard_reset();
+            }
+        }
+        else
+        {
+            g_vis_hold.recovery_active = 0u;
+            vis_hold_enter_loss(now);
+        }
+    }
+    else if ((fresh == 0u) && (g_vis_hold.hold_active == 0u))
+    {
+        vis_hold_enter_loss(now);
+    }
+
+    if ((fresh == 0u) || (g_vis_hold.hold_active != 0u))
+    {
+        g_ref_yaw_target_deg = vis_hold_clamp_yaw(g_ref_yaw_target_deg);
+        g_ref_pitch_target_world_deg =
+            vis_hold_clamp_pitch(g_ref_pitch_target_world_deg);
+        g_ref_pitch_target_motor_deg =
+            g_ref_pitch_target_world_deg - imuAngle[1] * 57.29578f;
+        g_ref_yaw_target_rate_dps = 0.0f;
+        g_ref_pitch_target_rate_dps = 0.0f;
+        g_ref_pitch_ff_rpm = 0.0f;
+        g_vis_yaw_rate_dps = 0.0f;
+        g_vis_pitch_rate_dps = 0.0f;
+        g_ref_target_valid = (g_vis_hold.hold_active != 0u) ? 1u : 0u;
+        return;
+    }
+
+    predicted_yaw = vis_track_predict(
+        &g_vis_track_yaw, now, g_vehicle_yaw_cum_deg, &yaw_rate);
+    predicted_pitch = vis_track_predict(
+        &g_vis_track_pitch, now, g_vehicle_yaw_cum_deg, &pitch_rate);
+    g_dbg_yaw_ab_rate_dps = g_vis_track_yaw.rate;
+    g_dbg_yaw_ab_target_deg = vis_wrap_deg(predicted_yaw);
+    if ((g_vis_track_yaw.active == 0u) ||
+        (g_vis_track_pitch.active == 0u))
+    {
+        g_ref_yaw_target_rate_dps = 0.0f;
+        g_ref_pitch_target_rate_dps = 0.0f;
+        g_ref_pitch_ff_rpm = 0.0f;
+        return;
+    }
+
+    if (g_ref_turn_reacquire_active != 0u)
+    {
+        if (g_ref_turn_reacquire_frames < VIS_TURN_REACQUIRE_FRAMES)
+        {
+            predicted_yaw = g_ref_turn_reacquire_yaw_deg;
+            predicted_pitch = g_ref_turn_reacquire_pitch_deg;
+            yaw_rate = 0.0f;
+            pitch_rate = 0.0f;
+        }
+        else
+        {
+            g_ref_turn_reacquire_active = 0u;
+            vis_recovery_begin(imuAngle[0] * 57.29578f, now);
+            pitch_guard_reset();
+        }
+    }
+
+    if ((g_ref_target_valid == 0u) &&
+        (g_ref_turn_reacquire_active == 0u) &&
+        (g_vis_yaw_recovery.active == 0u))
+    {
+        vis_recovery_begin(imuAngle[0] * 57.29578f, now);
+        pitch_guard_reset();
+    }
+
+    candidate_yaw = vis_wrap_deg(predicted_yaw);
+    candidate_yaw = vis_hold_clamp_yaw(candidate_yaw);
+    candidate_pitch = vis_hold_clamp_pitch(predicted_pitch);
+
+    if (new_observation != 0u)
+    {
+        pitch_guard_observe(
+            candidate_pitch,
+            g_pitch_fb.cont + imuAngle[1] * 57.29578f,
+            cmd->vision_seq,
+            cmd->px_ms,
+            now);
+    }
+    g_ref_pitch_target_world_deg = pitch_guard_step(now);
+    g_ref_pitch_target_rate_dps = g_pitch_target_guard.valid
+        ? g_pitch_target_guard.rate : 0.0f;
+    g_ref_pitch_ff_rpm = pitch_guard_feedforward_rpm(now);
+
+    if (g_vis_yaw_recovery.active != 0u)
+    {
+        g_vis_yaw_recovery.goal = candidate_yaw;
+        g_ref_yaw_target_deg =
+            vis_recovery_step(now, cmd->vis_yaw_deg);
+        yaw_rate = g_vis_yaw_recovery.rate;
+    }
+    else
+    {
+        g_ref_yaw_target_deg = candidate_yaw;
+    }
+    g_ref_pitch_target_motor_deg =
+        g_ref_pitch_target_world_deg - imuAngle[1] * 57.29578f;
+    g_ref_yaw_target_rate_dps =
+        clampf(yaw_rate, -REF_YAW_TARGET_RATE_LIMIT_DPS,
+               REF_YAW_TARGET_RATE_LIMIT_DPS);
+    g_ref_yaw_error_deg = vis_wrap_pm180_deg(
+        g_ref_yaw_target_deg - imuAngle[0] * 57.29578f);
+    g_ref_pitch_error_deg =
+        g_ref_pitch_target_motor_deg - g_pitch_fb.cont;
+    g_vis_yaw_angle_deg = vis_wrap_pm180_deg(
+        g_ref_yaw_target_deg - g_yaw_lock_rad * 57.29578f);
+    g_vis_pitch_angle_deg =
+        g_ref_pitch_target_motor_deg - g_pitch_motor_lock;
+    g_vis_yaw_rate_dps = g_ref_yaw_target_rate_dps;
+    g_vis_pitch_rate_dps = g_ref_pitch_target_rate_dps;
+    g_ref_target_valid = 1u;
+}
+
+#endif
+
+/*
+ * Active vision chain copied structurally from the reference GimbalTask:
+ * each valid frame only updates the Alpha-Beta tracker.  The tracker is then
+ * predicted every control cycle using the integrated chassis-motion input.
+ * There is no separate hold/recovery controller and no visual PID integration.
+ */
+static void reference_vision_update(const GimbalCmd_t *cmd, uint8_t mode,
+                                    uint32_t now)
+{
+    ChassisLinkState_t chassis;
+    uint8_t new_observation;
+    uint8_t turning;
+
+    chassis_link_snapshot(now, &chassis);
+    turning = (uint8_t)(
+        (chassis.control_valid != 0u) &&
+        (ref_chassis_phase_is_turning(chassis.phase) != 0u)
+    );
+    new_observation = (uint8_t)(
+        (mode == GP_MODE_AIM) &&
+        (cmd->rx_count != 0u) &&
+        (cmd->px_ms != 0u) &&
+        (cmd->px_ms != g_ref_visual_seen_ms)
+    );
+
+    if (new_observation != 0u)
+    {
+        float target_age_ms = vis_total_age_ms(cmd, now);
+
+        g_ref_visual_seen_ms = cmd->px_ms;
+        if ((cmd->aim_valid != 0u) &&
+            (target_age_ms <= (float)VIS_FREEZE_MS))
+        {
+            float raw_yaw_deg;
+            float raw_pitch_deg;
+            float capture_age_ms;
+            uint32_t capture_ms;
+            VisAngleSample_t capture_pose;
+            uint8_t yaw_reset;
+            uint8_t pitch_reset;
+
+            capture_age_ms = clampf(
+                target_age_ms + (float)REF_VISION_EXTRA_MS,
+                0.0f, VIS_LATENCY_MAX_MS);
+            g_vis_latency_ms = capture_age_ms;
+            capture_ms = now - (uint32_t)(capture_age_ms + 0.5f);
+            capture_pose = vis_history_at(capture_ms);
+            vis_read_error_deg(
+                cmd, vis_k_px_deg(cmd), &raw_yaw_deg, &raw_pitch_deg);
+
+            yaw_reset = vis_track_update(
+                &g_vis_track_yaw,
+                vis_wrap_deg(
+                    capture_pose.yaw_imu_deg + VIS_SIGN_YAW * raw_yaw_deg),
+                capture_ms,
+                capture_pose.vehicle_yaw_deg);
+            pitch_reset = vis_track_update(
+                &g_vis_track_pitch,
+                capture_pose.pitch_motor_deg +
+                    VIS_SIGN_PITCH * raw_pitch_deg +
+                    capture_pose.pitch_imu_deg,
+                capture_ms,
+                capture_pose.vehicle_pitch_deg);
+            if (yaw_reset != 0u)
+            {
+                g_ref_yaw_settle_until_ms =
+                    capture_ms + REF_TRACK_SETTLE_MS;
+            }
+            if (pitch_reset != 0u)
+            {
+                g_ref_pitch_settle_until_ms =
+                    capture_ms + REF_TRACK_SETTLE_MS;
+            }
+            if (turning != 0u)
+            {
+                g_ref_yaw_settle_until_ms =
+                    capture_ms + REF_TRACK_SETTLE_MS;
+                g_ref_pitch_settle_until_ms =
+                    capture_ms + REF_TRACK_SETTLE_MS;
+            }
+            if ((int32_t)(capture_ms -
+                          g_ref_yaw_settle_until_ms) < 0)
+            {
+                g_vis_track_yaw.rate = 0.0f;
+            }
+            if ((int32_t)(capture_ms -
+                          g_ref_pitch_settle_until_ms) < 0)
+            {
+                g_vis_track_pitch.rate = 0.0f;
+            }
+        }
+    }
+
+    if (g_vis_track_yaw.active != 0u &&
+        (int32_t)(now - g_vis_track_yaw.ms) >
+            (int32_t)VIS_TRACK_LOST_MS)
+    {
+        g_vis_track_yaw.active = 0u;
+        g_vis_track_yaw.rate = 0.0f;
+        g_vis_track_pitch.active = 0u;
+        g_vis_track_pitch.rate = 0.0f;
+    }
+
+    if ((mode != GP_MODE_AIM) ||
+        (g_vis_track_yaw.active == 0u) ||
+        (g_vis_track_pitch.active == 0u))
+    {
+        g_ref_yaw_target_rate_dps = 0.0f;
+        g_ref_pitch_target_rate_dps = 0.0f;
+        g_ref_pitch_ff_rpm = 0.0f;
+        g_ref_target_valid = 0u;
+        g_vis_yaw_rate_dps = 0.0f;
+        g_vis_pitch_rate_dps = 0.0f;
+        return;
+    }
+
+    {
+        float yaw_residual_rate_dps;
+        float pitch_residual_rate_dps;
+        float predicted_yaw = vis_track_predict(
+            &g_vis_track_yaw,
+            now,
+            g_vehicle_yaw_cum_deg,
+            &yaw_residual_rate_dps);
+        float predicted_pitch = vis_track_predict(
+            &g_vis_track_pitch,
+            now,
+            g_vehicle_pitch_cum_deg,
+            &pitch_residual_rate_dps);
+
+        g_ref_yaw_target_deg = vis_wrap_deg(predicted_yaw);
+        g_ref_pitch_target_world_deg = predicted_pitch;
+        g_ref_pitch_target_motor_deg =
+            predicted_pitch - imuAngle[1] * 57.29578f;
+        g_ref_yaw_target_rate_dps =
+            yaw_residual_rate_dps + g_ref_yaw_geometry_rate_dps;
+        g_ref_pitch_target_rate_dps =
+            pitch_residual_rate_dps + g_ref_vehicle_pitch_rate_dps;
+        g_ref_pitch_ff_rpm = 0.0f;
+        g_ref_yaw_error_deg = vis_wrap_pm180_deg(
+            g_ref_yaw_target_deg - imuAngle[0] * 57.29578f);
+        g_ref_pitch_error_deg =
+            g_ref_pitch_target_motor_deg - g_pitch_fb.cont;
+        g_vis_yaw_error_deg = g_ref_yaw_error_deg;
+        g_vis_pitch_error_deg = g_ref_pitch_error_deg;
+        g_vis_yaw_rate_dps = g_ref_yaw_target_rate_dps;
+        g_vis_pitch_rate_dps = g_ref_pitch_target_rate_dps;
+        g_vis_yaw_applied_rate_dps = g_ref_yaw_target_rate_dps;
+        g_dbg_yaw_ab_rate_dps = g_vis_track_yaw.rate;
+        g_dbg_yaw_ab_target_deg = g_ref_yaw_target_deg;
+    }
+    g_ref_target_valid = 1u;
+}
+
 static void yuntai_lock_reference(void)
 {
     g_yaw_lock_rad      = imuAngle[0];       /* 绝对方位基准 */
@@ -1949,6 +3097,18 @@ static void yuntai_lock_reference(void)
 
     g_yaw_fb.zero       = g_yaw_fb.cont;     /* 相对偏航角从这里开始算 0 */
     g_pitch_fb.zero     = g_pitch_fb.cont;
+
+    g_ref_yaw_target_deg = vis_wrap_deg(g_yaw_lock_rad * 57.29578f);
+    g_ref_pitch_target_world_deg =
+        g_pitch_motor_lock + imuAngle[1] * 57.29578f;
+    g_ref_pitch_target_motor_deg = g_pitch_motor_lock;
+    g_ref_yaw_target_rate_dps = 0.0f;
+    g_ref_pitch_target_rate_dps = 0.0f;
+    g_ref_yaw_error_deg = 0.0f;
+    g_ref_pitch_error_deg = 0.0f;
+    g_ref_yaw_integral_dps = 0.0f;
+    g_ref_startup_tick = HAL_GetTick();
+    g_ref_target_valid = 0u;
 
     PID_Reset(&g_yaw_pid);
     PID_Reset(&g_pitch_pid);
@@ -2188,6 +3348,9 @@ static void yuntai_set_pitch(float rpm)
     jc_set_speed_rpm_x100(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, (int32_t)(rpm * 100.0f));
 }
 
+#if 0
+/* Legacy controller retained only as historical reference; the active chain
+ * is yuntai_reference_speed_control(). */
 static void yuntai_control(uint32_t now)
 {
     const GimbalCmd_t *cmd = gimbal_link_cmd();
@@ -2938,6 +4101,286 @@ static void yuntai_control(uint32_t now)
         }
     }
 }
+#endif
+
+/*
+ * Reference speed-mode chain:
+ * K230 error -> latency-compensated world target -> Alpha-Beta target/rate
+ * -> Yaw position/rate cascade and Pitch position PID
+ * -> JC4310 speed command on both axes.
+ */
+static void yuntai_reference_speed_control(uint32_t now)
+{
+    const GimbalCmd_t *cmd = gimbal_link_cmd();
+    const uint8_t mode = cmd->mode;
+    const float dt = (float)g_ctrl_period_ms / 1000.0f;
+    const float rad2deg = 57.29578f;
+
+    gyro_bias_track();
+
+    if (mode != g_prev_mode)
+    {
+        g_prev_mode = mode;
+        g_ref_yaw_target_deg = vis_wrap_deg(imuAngle[0] * rad2deg);
+        g_ref_pitch_target_world_deg =
+            g_pitch_fb.cont + imuAngle[1] * rad2deg;
+        g_ref_pitch_target_motor_deg = g_pitch_fb.cont;
+        g_ref_yaw_target_rate_dps = 0.0f;
+        g_ref_pitch_target_rate_dps = 0.0f;
+        g_ref_yaw_integral_dps = 0.0f;
+        g_ref_yaw_saturated = 0u;
+        g_ref_pitch_prev_error_deg = 0.0f;
+        g_ref_target_valid = 0u;
+        vis_outer_reset();
+        PID_Reset(&g_pitch_pid);
+    }
+
+    if ((now - g_last_read_ms) >= 1u)
+    {
+        g_last_read_ms = now;
+        jc_read_position(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+    }
+    if ((now - g_last_err_read_ms) >= 2000u)
+    {
+        g_last_err_read_ms = now;
+        jc_read_error(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_error(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        jc_read_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+        jc_read_loop_state(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
+        jc_read_loop_state(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
+    }
+
+    yuntai_read_feedback(now);
+    if (gimbal_link_take_zero_req())
+    {
+        yuntai_lock_reference();
+    }
+
+    {
+        float target_age_ms = vis_total_age_ms(cmd, now);
+        uint8_t geometry_allowed = (uint8_t)(
+            (mode == GP_MODE_AIM) &&
+            (cmd->aim_valid != 0u) &&
+            (target_age_ms <= (float)VIS_FREEZE_MS)
+        );
+
+        g_ref_yaw_geometry_rate_dps =
+            ref_yaw_chassis_speed_feedforward(
+                now, geometry_allowed, cmd);
+        g_vehicle_yaw_cum_deg +=
+            g_ref_yaw_geometry_rate_dps * dt;
+        g_vehicle_pitch_cum_deg +=
+            g_ref_vehicle_pitch_rate_dps * dt;
+    }
+    vis_history_push(now);
+    reference_vision_update(cmd, mode, now);
+
+    if (mode == GP_MODE_ESTOP)
+    {
+        g_ref_yaw_integral_dps = 0.0f;
+        g_yaw_cmd_rpm = 0.0f;
+        g_pitch_cmd_rpm = 0.0f;
+        PID_Reset(&g_pitch_pid);
+        yuntai_set_yaw(0.0f);
+        yuntai_set_pitch(0.0f);
+        return;
+    }
+
+    /* ---------------- Yaw position-rate cascade ---------------- */
+    {
+        float yaw_now_deg = vis_wrap_deg(imuAngle[0] * rad2deg);
+        float target_yaw_deg = g_ref_yaw_target_deg;
+        float error_deg =
+            vis_wrap_pm180_deg(target_yaw_deg - yaw_now_deg);
+        float target_rate_dps;
+        float yaw_track_rate_dps;
+        float position_rate_dps;
+        float rate_error_dps;
+        float yaw_rate_feedback_rpm;
+        float yaw_chassis_gz_dps;
+        float yaw_chassis_lead_dps;
+        float yaw_chassis_gz_rpm;
+        float yaw_chassis_lead_rpm;
+        float yaw_gz_ff_scale = 1.0f;
+        float yaw_relative_target_rpm;
+        float output_limit = REF_YAW_OUT_RPM;
+
+        /* The reference uses the complete track rate (vehicle-explained
+         * input plus Alpha-Beta residual), not a subtracted residual. */
+        g_ref_yaw_residual_ff_dps = 0.0f;
+        yaw_track_rate_dps = (
+            (mode == GP_MODE_AIM) &&
+            (g_ref_target_valid != 0u)
+        ) ? g_ref_yaw_target_rate_dps : 0.0f;
+        position_rate_dps = clampf(
+            REF_YAW_KPOS * error_deg,
+            -REF_YAW_POS_RATE_MAX, REF_YAW_POS_RATE_MAX);
+        target_rate_dps = yaw_track_rate_dps + position_rate_dps;
+        rate_error_dps =
+            target_rate_dps - gyro_c[2] * rad2deg;
+
+        if ((mode == GP_MODE_AIM) &&
+            (g_ref_target_valid != 0u) &&
+            (fabsf(error_deg) < REF_YAW_RATE_I_ZONE_DEG) &&
+            !(((g_ref_yaw_saturated == 1u) && (rate_error_dps > 0.0f)) ||
+              ((g_ref_yaw_saturated == 2u) && (rate_error_dps < 0.0f))))
+        {
+            g_ref_yaw_integral_dps +=
+                REF_YAW_RATE_KI * rate_error_dps * dt;
+            g_ref_yaw_integral_dps = clampf(
+                g_ref_yaw_integral_dps,
+                -REF_YAW_RATE_I_MAX, REF_YAW_RATE_I_MAX);
+        }
+        else
+        {
+            g_ref_yaw_integral_dps = 0.0f;
+        }
+
+        yaw_chassis_gz_dps =
+            ref_yaw_chassis_gz_feedforward(now, &yaw_chassis_lead_dps);
+        yaw_rate_feedback_rpm =
+            REF_YAW_KRATE * rate_error_dps * REF_DEG_S_TO_RPM;
+        yaw_chassis_gz_rpm =
+            REF_YAW_CHASSIS_FF_SIGN * yaw_chassis_gz_dps *
+            REF_DEG_S_TO_RPM * yaw_gz_ff_scale;
+        yaw_chassis_lead_rpm =
+            REF_YAW_CHASSIS_FF_SIGN * yaw_chassis_lead_dps *
+            REF_DEG_S_TO_RPM * yaw_gz_ff_scale;
+        yaw_relative_target_rpm =
+            (yaw_track_rate_dps + position_rate_dps +
+             g_ref_yaw_integral_dps) * REF_DEG_S_TO_RPM +
+            yaw_chassis_gz_rpm + yaw_chassis_lead_rpm;
+
+        g_dbg_yaw_recovery_rate_dps = 0.0f;
+        g_dbg_yaw_position_rpm =
+            position_rate_dps * REF_DEG_S_TO_RPM;
+        g_dbg_yaw_rate_feedback_rpm = yaw_rate_feedback_rpm;
+        g_dbg_yaw_gz_ff_rpm =
+            yaw_chassis_gz_rpm + yaw_chassis_lead_rpm;
+        g_dbg_yaw_gz_ff_scale = yaw_gz_ff_scale;
+        g_dbg_yaw_ab_residual_ff_rpm =
+            g_ref_yaw_residual_ff_dps * REF_DEG_S_TO_RPM;
+
+        g_yaw_cmd_rpm =
+            yaw_relative_target_rpm +
+            yaw_rate_feedback_rpm;
+        g_ref_yaw_saturated = 0u;
+        if (g_yaw_cmd_rpm > output_limit)
+        {
+            g_yaw_cmd_rpm = output_limit;
+            g_ref_yaw_saturated = 1u;
+        }
+        else if (g_yaw_cmd_rpm < -output_limit)
+        {
+            g_yaw_cmd_rpm = -output_limit;
+            g_ref_yaw_saturated = 2u;
+        }
+        g_ref_yaw_error_deg = error_deg;
+        g_vis_yaw_error_deg = error_deg;
+        g_vis_yaw_applied_rate_dps = yaw_track_rate_dps;
+        g_vis_yaw_rate_dps = position_rate_dps;
+        g_ref_yaw_chassis_gz_dps = yaw_chassis_gz_dps;
+        g_ref_yaw_chassis_lead_dps = yaw_chassis_lead_dps;
+        yuntai_set_yaw(g_yaw_cmd_rpm);
+    }
+
+    /* ---------------- Pitch position loop ---------------- */
+    {
+        uint8_t pitch_fb_ok =
+            enc_fresh(&g_pitch_fb, now, PITCH_FB_TIMEOUT_MS);
+        if (!pitch_fb_ok)
+        {
+            PID_Reset(&g_pitch_pid);
+            g_pitch_cmd_rpm = 0.0f;
+            g_fault |= FAULT_PITCH_FB_LOST;
+        }
+        else
+        {
+            float target_motor_deg =
+                g_ref_pitch_target_world_deg -
+                imuAngle[1] * rad2deg;
+            float pitch_rate_dps =
+                ((mode == GP_MODE_AIM) &&
+                 (g_ref_target_valid != 0u))
+                    ? g_ref_pitch_target_rate_dps : 0.0f;
+            float gyro_pitch_dps = gyro_c[1] * rad2deg;
+            float gyro_damping_rpm;
+            float pitch_error_deg;
+            float pitch_loop_error_deg;
+            float pitch_p_rpm;
+            float pitch_i_rpm;
+            float pitch_d_rpm;
+
+            target_motor_deg = clampf(
+                target_motor_deg,
+                g_pitch_motor_lock - PITCH_TRAVEL_LIMIT_DEG,
+                g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
+
+            g_pitch_pid.kp = g_pitch_kp;
+            g_pitch_pid.ki = g_pitch_ki;
+            g_pitch_pid.kd = g_pitch_kd;
+            g_pitch_pid.output_limit = g_pitch_out_rpm;
+            g_pitch_pid.integral_limit = 300.0f;
+            g_pitch_pid.dead_zone = PITCH_DEADZONE_DEG;
+
+            /*
+             * Match speed_control 111 pid_calc(): its Pitch loop accumulates
+             * error once per control tick and uses Kd * delta(error).  The
+             * generic PID_Update() differentiates error/dt after a 5 ms
+             * low-pass, which is a materially stronger high-frequency term.
+             */
+            pitch_error_deg = target_motor_deg - g_pitch_fb.cont;
+            pitch_loop_error_deg = 0.0f;
+            if (fabsf(pitch_error_deg) > g_pitch_pid.dead_zone)
+            {
+                pitch_loop_error_deg =
+                    pitch_error_deg -
+                    copysignf(g_pitch_pid.dead_zone, pitch_error_deg);
+            }
+            g_pitch_pid.integral += pitch_loop_error_deg;
+            g_pitch_pid.integral = clampf(
+                g_pitch_pid.integral,
+                -g_pitch_pid.integral_limit,
+                g_pitch_pid.integral_limit);
+            pitch_p_rpm = g_pitch_pid.kp * pitch_loop_error_deg;
+            pitch_i_rpm = g_pitch_pid.ki * g_pitch_pid.integral;
+            pitch_d_rpm = g_pitch_pid.kd *
+                (pitch_loop_error_deg - g_ref_pitch_prev_error_deg);
+            g_ref_pitch_prev_error_deg = pitch_loop_error_deg;
+            g_pitch_pid.out = clampf(
+                pitch_p_rpm + pitch_i_rpm + pitch_d_rpm,
+                -g_pitch_pid.output_limit,
+                g_pitch_pid.output_limit);
+
+            if (fabsf(pitch_error_deg) < 0.50f)
+            {
+                g_pitch_pid.integral *= 0.90f;
+            }
+            gyro_damping_rpm = -REF_PITCH_GYRO_GAIN *
+                gyro_pitch_dps * REF_DEG_S_TO_RPM;
+            g_pitch_cmd_rpm =
+                g_pitch_pid.out +
+                pitch_rate_dps * REF_DEG_S_TO_RPM +
+                gyro_damping_rpm;
+            g_pitch_cmd_rpm = clampf(
+                g_pitch_cmd_rpm,
+                -g_pitch_out_rpm, g_pitch_out_rpm);
+
+            g_ref_pitch_error_deg =
+                target_motor_deg - g_pitch_fb.cont;
+            g_vis_pitch_error_deg = g_ref_pitch_error_deg;
+            g_vis_pitch_rate_dps = pitch_rate_dps;
+            g_pitch_tgt_deg = target_motor_deg;
+            g_pitch_pos_deg = g_pitch_fb.cont;
+            g_fault &= (uint8_t)~FAULT_PITCH_FB_LOST;
+        }
+        yuntai_set_pitch(g_pitch_cmd_rpm);
+    }
+
+    g_retained.magic = 0u;
+}
 
 static void uart10_append_float(char *buf, size_t cap, size_t *pos,
                                 float value, uint8_t decimals)
@@ -2962,7 +4405,8 @@ static void uart10_append_float(char *buf, size_t cap, size_t *pos,
 static void yuntai_uart10_debug(uint32_t now)
 {
     const GimbalCmd_t *cmd = gimbal_link_cmd();
-    char line[360];
+    ChassisLinkState_t chassis;
+    char line[384];
     size_t pos = 0u;
     uint32_t vis_age;
     float yaw_rel_deg;
@@ -3022,6 +4466,7 @@ static void yuntai_uart10_debug(uint32_t now)
 
     vis_age = (uint32_t)vis_total_age_ms(cmd, now);
     yaw_rel_deg = angle_diff_rad(imuAngle[0], g_yaw_lock_rad) * 57.29578f;
+    chassis_link_snapshot(now, &chassis);
 
     n = snprintf(line, sizeof(line),
                  "%lu,%u,%u,%u,%lu,%u,%u,%u,%u,%u",
@@ -3081,28 +4526,133 @@ static void yuntai_uart10_debug(uint32_t now)
                         (float)cmd->vis_target_w_x100 / 100.0f, 1);
     uart10_append_float(line, sizeof(line), &pos,
                         (float)cmd->vis_target_h_x100 / 100.0f, 1);
-    n = snprintf(line + pos, sizeof(line) - pos, ",%u,%u,%lu",
-                 (unsigned)cmd->vis_target_layer,
-                 (unsigned)g_chassis_turn_phase,
-                 (unsigned long)(
-                     (g_chassis_status_age_ms == 0xFFFFFFFFu) ?
-                     9999u : g_chassis_status_age_ms
-                 ));
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u,",
+                 (unsigned)cmd->vis_target_layer);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+
+    /*
+     * Appended fields keep the old CSV prefix stable while making the newly
+     * restored chassis feedforward observable over Bluetooth.
+     */
+    n = snprintf(line + pos, sizeof(line) - pos,
+                 "%u,%d,%d,%d,%u,%u,%u,%u",
+                 (unsigned)chassis.control_valid,
+                 (int)chassis.phase, (int)chassis.speed_mm_s,
+                 (int)chassis.yaw_rate_dps_x10,
+                 (unsigned)chassis.good_frames,
+                 (unsigned)chassis.bad_frames,
+                 (unsigned)chassis.sequence,
+                 (unsigned)g_ref_route_corner_count);
     if (n > 0)
     {
         pos += (size_t)n;
     }
     uart10_append_float(line, sizeof(line), &pos,
-                        g_vis_turn_yaw_scale, 2);
-    n = snprintf(line + pos, sizeof(line) - pos, ",%lu,%lu,%lu",
-                 (unsigned long)chassis_link_raw_byte_count(),
-                 (unsigned long)chassis_link_crc_error_count(),
-                 (unsigned long)chassis_link_sequence_error_count());
+                        g_ref_yaw_speed_mps, 3);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_geometry_rate_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_chassis_gz_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_chassis_lead_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_target_range_m, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_vehicle_yaw_cum_deg, 2);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%lu,%lu",
+                 (unsigned long)chassis.raw_bytes,
+                 (unsigned long)chassis.version_errors);
     if (n > 0)
     {
         pos += (size_t)n;
     }
-    snprintf(line + pos, sizeof(line) - pos, "\r\n");
+    n = snprintf(line + pos, sizeof(line) - pos, ",%lu,%lu,%lu",
+                 (unsigned long)gimbal_link_raw_byte_count(),
+                 (unsigned long)gimbal_link_ascii_line_count(),
+                 (unsigned long)gimbal_link_ascii_checksum_error_count());
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u,%u,%u,%u,%u",
+                 (unsigned)chassis.distance_zone,
+                 (unsigned)chassis.corner_count,
+                 0u, 0u, 0u);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        (float)cmd->vis_pose_range_ms_x10 * 0.1f, 1);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u",
+                 (unsigned)cmd->vis_distance_source);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_target_rate_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        cmd->target_vx_px_s, 1);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%lu",
+                 (unsigned long)((chassis.last_rx_ms != 0u)
+                     ? (now - chassis.last_rx_ms) : 9999u));
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_ref_yaw_residual_ff_dps, 2);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%lu,%ld,%lu",
+                 (unsigned long)chassis.sample_ms,
+                 (long)chassis.sample_age_raw_ms,
+                 (unsigned long)chassis.sample_age_relative_ms);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    n = snprintf(line + pos, sizeof(line) - pos, ",%u",
+                 (unsigned)cmd->vis_lost_reason);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        vis_wrap_pm180_deg(
+                            (g_yaw_fb.seen ? g_yaw_fb.cont : 0.0f) -
+                            REF_YAW_CHASSIS_FORWARD_OFFSET_DEG), 2);
+    n = snprintf(line + pos, sizeof(line) - pos, ",%d",
+                 (int)chassis.turn_dir);
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_ab_rate_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_ab_target_deg, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_recovery_rate_dps, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_position_rpm, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_rate_feedback_rpm, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_gz_ff_rpm, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_ab_residual_ff_rpm, 2);
+    uart10_append_float(line, sizeof(line), &pos,
+                        g_dbg_yaw_gz_ff_scale, 2);
+    n = snprintf(line + pos, sizeof(line) - pos, "\r\n");
+    if (n > 0)
+    {
+        pos += (size_t)n;
+    }
     (void)debug_uart10_send(line);
 }
 
@@ -3338,6 +4888,11 @@ void yuntai_init(void)
         g_boot_cfsr = 0u;
         g_boot_hfsr = 0u;
     }
+    /*
+     * UART7 is the F103 chassis telemetry link.  USART1 remains the K230
+     * vision link, so this does not touch the active vision protocol.
+     */
+    chassis_link_start_rx();
     /* ⚠ 告诉 AHRS"我们多久调一次它"：必须等于 1000/IMU_PERIOD_MS。
      * 之前这里写死 1000Hz，而实际只在 IMU_PERIOD_MS=2ms（500Hz）调用，
      * 于是四元数积分步长 halfT 只有真实的一半 —— 姿态角"走一半"。
@@ -3649,11 +5204,8 @@ void yuntai_control_loop(void)
         {
             yuntai_mark_stage(13u);
             g_last_ctrl_ms = now;
-            yuntai_control(now);
+            yuntai_reference_speed_control(now);
         }
-        yuntai_mark_stage(35u);
-        yuntai_uart10_debug(now);
-        yuntai_mark_stage(36u);
         yuntai_debug(now);
         break;
 
@@ -3662,6 +5214,12 @@ void yuntai_control_loop(void)
         g_state_ms = now;
         break;
     }
+
+    /* Bluetooth CSV must remain visible in every startup state, otherwise a
+     * gimbal waiting for motor feedback looks exactly like a dead UART. */
+    yuntai_mark_stage(35u);
+    yuntai_uart10_debug(now);
+    yuntai_mark_stage(36u);
 
     /* 遥测与链路必须在所有状态下都刷新：
      * 上位机靠 GIMBAL_STATE 判断"云台起来没有"，
@@ -3843,39 +5401,21 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
         break;
 
     case GP_PARAM_SPEED_MODE:
-        /* 切换电机控制模式（写 0x0060），**立即生效**：
-         *   1 = 速度模式（**默认**；历史所有成功测试都是它）
-         *   5 = 低速大扭（⚠ 语义未证实：可能用的是寄存器 0x0027 的固定低速
-         *       而不是我们写的 0x0021 —— 上一版默认它时现场出现"转底盘不顶"。
-         *       要用的话必须盯着日志里 ym= 与指令是否还对得上）
-         *   0 = 力矩模式（别在这里切；力矩模式有自己的开关 0x14 和整套
-         *       速率环参数 0x15~0x17） */
-        if ((v > 0.5f) && (v < 6.0f))
-        {
-            g_speed_mode = (uint8_t)v;
-            /* 偏航若开着力矩模式，这里只改"速度模式备选值"，别把它掰回速度模式 */
-            jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                                (g_yaw_torque != 0u) ? JC_MODE_TORQUE
-                                                     : g_speed_mode);
-            jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, g_speed_mode);
-            {
-                char sb[44];
-                snprintf(sb, sizeof(sb), "[MOTOR] mode <- 0x%02X",
-                         (unsigned)g_speed_mode);
-                gimbal_link_log_force(sb);
-            }
-        }
+        /* Both axes are fixed to the reference project's speed mode. */
+        (void)v;
+        g_speed_mode = JC_MODE_SPEED;
+        g_yaw_torque = 0u;
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
+        jc_set_control_mode(&hfdcan2, YUNTAI_MOTOR_PITCH_ID, JC_MODE_SPEED);
+        gimbal_link_log_force("[MOTOR] both axes fixed to speed mode");
         break;
 
     case GP_PARAM_YAW_TORQUE:
-        /* Both axes intentionally use speed mode. Keep the old parameter
-         * accepted for protocol compatibility, but never re-enter torque mode. */
+        /* Torque mode is intentionally unavailable in this control chain. */
+        (void)v;
         g_yaw_torque = 0u;
-        g_rate_i = 0.0f;
-        g_rate_iq_ma = 0.0f;
-        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                            g_speed_mode);
-        gimbal_link_log_force("[MOTOR] yaw -> speed mode (fixed)");
+        jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
+        gimbal_link_log_force("[MOTOR] torque mode disabled");
         break;
 
     case GP_PARAM_RATE_KP:
@@ -3923,31 +5463,14 @@ void gimbal_link_on_param(uint8_t pid, int16_t value)
          *   其它值      -> 中止。测试期间会刷 [MOTO] 行。*/
         {
             uint32_t tnow = HAL_GetTick();
-            if (value >= 300)
+            if (value >= 200)
             {
-                /* 只做符号自检（自动切力矩模式，跑完恢复现场设置）*/
-                g_yaw_test_run = 3u;
-                g_yaw_test_ms = tnow;
-                g_yaw_test_log_ms = tnow - 200u;
-                g_yaw_torque_bak = g_yaw_torque;
-                g_yaw_torque = 1u;
-                jc_enter_closed_loop(&hfdcan1, YUNTAI_MOTOR_YAW_ID);
-                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                                    JC_MODE_TORQUE);
-                gimbal_link_log_force("[MOTO] sign check start");
-            }
-            else if (value >= 200)
-            {
-                g_yaw_test_run = 2u;
-                g_yaw_test_ms = tnow;
-                g_yaw_test_log_ms = tnow - 200u;
-                g_yaw_test_ma = 0.0f;
-                g_yaw_torque_bak = g_yaw_torque;   /* 跑完恢复现场设置 */
-                g_yaw_torque = 1u;
-                jc_set_control_mode(&hfdcan1, YUNTAI_MOTOR_YAW_ID,
-                                    JC_MODE_TORQUE);
+                g_yaw_test_run = 0u;
+                g_yaw_torque = 0u;
+                jc_set_control_mode(
+                    &hfdcan1, YUNTAI_MOTOR_YAW_ID, JC_MODE_SPEED);
                 gimbal_link_log_force(
-                    "[MOTO] torque test: 0/+500/-500/+1500/-1500 mA");
+                    "[MOTO] torque tests disabled: speed mode only");
             }
             else if (value >= 100)
             {

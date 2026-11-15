@@ -5,8 +5,10 @@
 #include <stdlib.h>
 
 static char g_tx_buf[256];
-static char g_uart10_buf[320];
+/* yuntai_task 的扩展 CSV 已超过 256 字节；这里必须容纳完整一行。 */
+static char g_uart10_buf[512];
 static volatile uint8_t g_uart10_tx_busy;
+static uint32_t g_uart10_tx_started_ms;
 
 static void ftoa(char *buf, float val, int decimals)
 {
@@ -50,10 +52,20 @@ void debug_uart10_init(void)
 uint8_t debug_uart10_send(const char *msg)
 {
     size_t n;
+    uint32_t now_ms = HAL_GetTick();
 
-    if ((msg == NULL) || (g_uart10_tx_busy != 0u))
+    if (msg == NULL)
     {
         return 0u;
+    }
+    if (g_uart10_tx_busy != 0u)
+    {
+        if ((uint32_t)(now_ms - g_uart10_tx_started_ms) <= 100u)
+        {
+            return 0u;
+        }
+        (void)HAL_UART_AbortTransmit(&huart10);
+        g_uart10_tx_busy = 0u;
     }
     n = strlen(msg);
     if ((n == 0u) || (n >= sizeof(g_uart10_buf)))
@@ -62,6 +74,7 @@ uint8_t debug_uart10_send(const char *msg)
     }
     memcpy(g_uart10_buf, msg, n);
     g_uart10_tx_busy = 1u;
+    g_uart10_tx_started_ms = now_ms;
     if (HAL_UART_Transmit_IT(&huart10, (uint8_t *)g_uart10_buf,
                              (uint16_t)n) != HAL_OK)
     {
@@ -74,6 +87,7 @@ uint8_t debug_uart10_send(const char *msg)
 void debug_uart10_tx_complete(void)
 {
     g_uart10_tx_busy = 0u;
+    g_uart10_tx_started_ms = 0u;
 }
 
 /*

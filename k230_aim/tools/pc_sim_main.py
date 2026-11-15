@@ -51,11 +51,19 @@ if MAIN_PY is None:
 
 
 def _read_proc_size():
-    """从 main.py 里读 PROC_W/PROC_H —— 仿真场景必须和真实处理分辨率一致，
+    """从 main.py 里读处理分辨率 —— 仿真场景必须和真实处理分辨率一致，
     否则 main.py 里那套"按 S_SCALE 缩放"的判据会全部对不上（手动同步迟早会忘）。"""
     txt = io.open(MAIN_PY, encoding="utf-8").read()
-    w = int(re.search(r"^PROC_W\s*=\s*(\d+)", txt, re.M).group(1))
-    h = int(re.search(r"^PROC_H\s*=\s*(\d+)", txt, re.M).group(1))
+    width_match = re.search(
+        r"^(?:PROC_W|FRAME_WIDTH)\s*=\s*(\d+)", txt, re.M
+    )
+    height_match = re.search(
+        r"^(?:PROC_H|FRAME_HEIGHT)\s*=\s*(\d+)", txt, re.M
+    )
+    if width_match is None or height_match is None:
+        raise SystemExit("main.py 中找不到 FRAME_WIDTH/FRAME_HEIGHT")
+    w = int(width_match.group(1))
+    h = int(height_match.group(1))
     return w, h
 
 
@@ -86,6 +94,26 @@ def sleep_ms(ms):
 real_time.ticks_ms = ticks_ms
 real_time.ticks_diff = ticks_diff
 real_time.sleep_ms = sleep_ms
+
+
+class _FakeClock(object):
+    def __init__(self):
+        self.last_ms = _vtime[0]
+        self.fps_value = 30.0
+
+    def tick(self):
+        now_ms = _vtime[0]
+        elapsed = now_ms - self.last_ms
+        self.last_ms = now_ms
+        if elapsed > 0:
+            self.fps_value = 1000.0 / elapsed
+        return now_ms
+
+    def fps(self):
+        return self.fps_value
+
+
+real_time.clock = _FakeClock
 
 _iterations = [0]
 MAX_ITERS = 6000
@@ -811,9 +839,37 @@ def install_fake_modules():
         def deinit(self):
             pass
 
+    class FPIOA(object):
+        UART1_TXD = 1
+        UART1_RXD = 2
+
+        def set_function(self, pin, function, ie=0, oe=0):
+            return 0
+
     machine.Pin = Pin
     machine.UART = UART
+    machine.FPIOA = FPIOA
     sys.modules["machine"] = machine
+
+    uos_mod = types.ModuleType("uos")
+    uos_mod.stat = os.stat
+    uos_mod.mkdir = os.mkdir
+    sys.modules["uos"] = uos_mod
+
+    yb_utils_pkg = types.ModuleType("ybUtils")
+    yb_key_mod = types.ModuleType("ybUtils.YbKey")
+
+    class YbKey(object):
+        def value(self):
+            return 0
+
+        def is_pressed(self):
+            return 0
+
+    yb_key_mod.YbKey = YbKey
+    yb_utils_pkg.YbKey = yb_key_mod
+    sys.modules["ybUtils"] = yb_utils_pkg
+    sys.modules["ybUtils.YbKey"] = yb_key_mod
 
     sensor_mod = types.ModuleType("media.sensor")
     sensor_mod.Sensor = FakeSensor

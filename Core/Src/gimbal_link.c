@@ -1,11 +1,11 @@
 /**
   ******************************************************************************
   * @file    gimbal_link.c
-  * @brief   H723(UART7) <-> 机载计算机链路实现
+  * @brief   H723(USART1) <-> K230 视觉链路实现
   *
   * 三个关键工程决定：
   *  1) 收：只用 RXNE 中断 + 软件环形缓冲，不碰 DMA、不改 .ioc。
- *     921600 下文本视觉帧约 80Hz，对 550MHz 的 H723 不算负担，
+ *     115200 下文本视觉帧对 550MHz 的 H723 不算负担，
   *     而且中断里只做"存一个字节"这一件事，绝不解析。
   *  2) 发：用 HAL_UART_Transmit_IT + 发送环形缓冲，绝不阻塞主循环。
   *     若用阻塞发送，一帧 28 字节要 2.4ms，会把 2ms 的 IMU 节拍拖歪。
@@ -23,6 +23,7 @@
 #include "gimbal_proto.h"
 #include "debug_uart.h"
 #include "usart.h"
+#include "yuntai_task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -89,7 +90,8 @@ uint8_t gimbal_link_is_rx_uart(UART_HandleTypeDef *huart)
 
 /* ========================== 可调参数 ========================== */
 #define GL_TELEM_PERIOD_MS   20u     /* 遥测周期：20ms = 50Hz */
-#define GL_WATCHDOG_MS       250u    /* 正常视觉约 80Hz；连续断流后回 STAB */
+#define GL_WATCHDOG_MS       300u    /* 与参考工程 300ms 目标保持窗口一致 */
+#define GL_AIM_LOST_STAB_MS  500u    /* 显式丢靶保持窗口，超时回 STAB */
 #define GL_LOG_PERIOD_MS     50u     /* 调试文本最快 20 条/s */
 #define GL_TX_CHUNK          32u     /* 单次 IT 发送的字节数上限 */
 #define GL_HB_ACK_PERIOD_MS  1000u   /* 心跳 ACK 最快 1 条/s（不挤占遥测） */
@@ -141,7 +143,11 @@ static uint8_t           s_ready;
 static uint32_t          s_last_hb_ack_ms;
 static uint32_t          s_log_dropped;
 static uint32_t          s_rx_bytes;        /* 链路上收到的原始字节数 */
+static uint32_t          s_ascii_lines;
+static uint32_t          s_ascii_checksum_errors;
 static uint8_t           s_rx_any_logged;   /* 是否已经打过"收到第一个字节" */
+static uint32_t          s_vision_lost_since_ms;
+static uint8_t           s_vision_lost_stab_latched;
 static char              s_text_line[GL_TEXT_BUF_SIZE];
 static uint8_t           s_text_len;
 
@@ -461,7 +467,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     }
     if (huart == &huart7)
     {
-        chassis_link_on_uart_error();
+        yuntai_chassis_uart_error();
         return;
     }
     if ((huart != &GL_TX_HUART) && (huart != &GL_RX_HUART))
@@ -576,6 +582,59 @@ static int32_t gl_abs_i32(int32_t value)
     return (value < 0) ? -value : value;
 }
 
+static uint8_t gl_hex_nibble(char c)
+{
+    if ((c >= '0') && (c <= '9'))
+    {
+        return (uint8_t)(c - '0');
+    }
+    if ((c >= 'A') && (c <= 'F'))
+    {
+        return (uint8_t)(c - 'A' + 10);
+    }
+    if ((c >= 'a') && (c <= 'f'))
+    {
+        return (uint8_t)(c - 'a' + 10);
+    }
+    return 0xFFu;
+}
+
+/*
+ * K230 ASCII vision frame checksum:
+ *   payload*HH
+ * XOR covers every ASCII byte before '*'.  This follows the checksum used by
+ * the earlier VisionLink implementation and prevents one dropped digit from
+ * being accepted as a new target.
+ */
+static uint8_t gl_verify_text_checksum(char *line)
+{
+    char *star = strrchr(line, '*');
+    uint8_t high;
+    uint8_t low;
+    uint8_t calculated = 0u;
+    uint8_t received;
+    char *p;
+
+    if ((star == NULL) || (star[1] == '\0') || (star[2] == '\0') ||
+        (star[3] != '\0'))
+    {
+        return 0u;
+    }
+    high = gl_hex_nibble(star[1]);
+    low = gl_hex_nibble(star[2]);
+    if ((high == 0xFFu) || (low == 0xFFu))
+    {
+        return 0u;
+    }
+    received = (uint8_t)((high << 4) | low);
+    for (p = line; p < star; p++)
+    {
+        calculated ^= (uint8_t)*p;
+    }
+    *star = '\0';
+    return (uint8_t)(calculated == received);
+}
+
 static void gl_handle_text_line(uint32_t now_ms)
 {
     const char *p = s_text_line;
@@ -584,9 +643,9 @@ static void gl_handle_text_line(uint32_t now_ms)
     uint8_t ok_aux;
     int32_t yaw_x100;
     int32_t pitch_x100;
-    int32_t aux[14] = {
+    int32_t aux[16] = {
         0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0
+        0, 0, 0, 0, 0, 0, 0, 0, 0
     };
     uint8_t aux_n = 0u;
     uint8_t aux_i;
@@ -610,7 +669,7 @@ static void gl_handle_text_line(uint32_t now_ms)
      * 和图像处理年龄；后面依次是几何状态、重投影误差、细化标志、
      * 当前候选框宽高和内外框类型。
      * 老版缺少后续列时仍按原协议工作。 */
-    for (aux_i = 0u; aux_i < 14u; aux_i++)
+    for (aux_i = 0u; aux_i < 16u; aux_i++)
     {
         if (*p != ',')
         {
@@ -626,6 +685,19 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
 
     lost = (uint8_t)((yaw_x100 == 40400) && (pitch_x100 == 40400));
+    s_cmd.vis_lost_reason = 0u;
+    if ((lost != 0u) && (aux_n >= 1u))
+    {
+        if ((aux[0] >= 1) && (aux[0] <= 9))
+        {
+            s_cmd.vis_lost_reason = (uint8_t)aux[0];
+        }
+        else if ((aux[0] >= 100) && (aux[0] <= 900) &&
+                 ((aux[0] % 100) == 0))
+        {
+            s_cmd.vis_lost_reason = (uint8_t)(aux[0] / 100);
+        }
+    }
     s_cmd.vis_proc_age_ms = 0u;
     if ((!lost) && (aux_n >= 8u) && (aux[7] >= 0) && (aux[7] <= 100))
     {
@@ -684,7 +756,37 @@ static void gl_handle_text_line(uint32_t now_ms)
         }
     }
     was_aim = (uint8_t)(s_cmd.mode == GP_MODE_AIM);
-    s_cmd.mode = lost ? GP_MODE_STAB : GP_MODE_AIM;
+    if (lost != 0u)
+    {
+        if (s_vision_lost_since_ms == 0u)
+        {
+            s_vision_lost_since_ms = now_ms;
+            s_vision_lost_stab_latched = 0u;
+        }
+        if ((was_aim != 0u) &&
+            ((uint32_t)(now_ms - s_vision_lost_since_ms) >=
+             GL_AIM_LOST_STAB_MS))
+        {
+            s_cmd.mode = GP_MODE_STAB;
+            s_zero_req = 1u;
+            if (s_vision_lost_stab_latched == 0u)
+            {
+                s_vision_lost_stab_latched = 1u;
+                gimbal_link_log_force(
+                    "[LINK] vision lost 500ms -> STAB");
+            }
+        }
+        else
+        {
+            s_cmd.mode = (was_aim != 0u) ? GP_MODE_AIM : GP_MODE_STAB;
+        }
+    }
+    else
+    {
+        s_vision_lost_since_ms = 0u;
+        s_vision_lost_stab_latched = 0u;
+        s_cmd.mode = GP_MODE_AIM;
+    }
     s_cmd.vis_direct_angle = 1u;
     s_cmd.vis_direct_error = 0u;
     s_cmd.vis_geometry_state = geometry_state;
@@ -718,6 +820,16 @@ static void gl_handle_text_line(uint32_t now_ms)
             s_cmd.vis_target_layer = (uint8_t)(aux[13] / 100);
         }
     }
+    s_cmd.vis_pose_range_ms_x10 = 0u;
+    if ((aux_n >= 15u) && (aux[14] >= 0) && (aux[14] <= 655350))
+    {
+        s_cmd.vis_pose_range_ms_x10 =
+            (uint16_t)((aux[14] + 5) / 10);
+    }
+    s_cmd.vis_distance_source =
+        (uint8_t)((aux_n >= 16u &&
+                   ((aux[15] == 1) || (aux[15] == 100)))
+                      ? 1u : 0u);
     s_cmd.vis_k_x100 = K230_PX_PER_DEG_X100;
     s_cmd.vision_seq++;
     s_cmd.px_ms = now_ms;
@@ -790,9 +902,8 @@ static void gl_handle_text_line(uint32_t now_ms)
     }
     if (lost && was_aim)
     {
-        s_zero_req = 1u;
         s_last_log_ms = 0u;
-        gimbal_link_log("[LINK] vision lost -> STAB + relock pose");
+        gimbal_link_log("[LINK] vision lost -> hold");
     }
     if (!s_alive)
     {
@@ -813,7 +924,15 @@ static void gl_text_feed_byte(uint8_t byte, uint32_t now_ms)
         if (s_text_len > 0u)
         {
             s_text_line[s_text_len] = '\0';
-            gl_handle_text_line(now_ms);
+            s_ascii_lines++;
+            if (gl_verify_text_checksum(s_text_line) != 0u)
+            {
+                gl_handle_text_line(now_ms);
+            }
+            else
+            {
+                s_ascii_checksum_errors++;
+            }
         }
         s_text_len = 0u;
         return;
@@ -870,6 +989,9 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_target_w_x100 = 0u;
             s_cmd.vis_target_h_x100 = 0u;
             s_cmd.vis_target_layer = 0u;
+            s_cmd.vis_pose_range_ms_x10 = 0u;
+            s_cmd.vis_distance_source = 0u;
+            s_cmd.vis_lost_reason = 0u;
             s_cmd.px_ms      = now_ms;
             s_cmd.vis_proc_age_ms = 0u;
             s_cmd.aim_valid  = (uint8_t)((s_cmd.flags & GP_AIM_VALID) ? 1u : 0u);
@@ -902,6 +1024,9 @@ static void gl_handle_frame(uint32_t now_ms)
             s_cmd.vis_target_w_x100 = 0u;
             s_cmd.vis_target_h_x100 = 0u;
             s_cmd.vis_target_layer = 0u;
+            s_cmd.vis_pose_range_ms_x10 = 0u;
+            s_cmd.vis_distance_source = 0u;
+            s_cmd.vis_lost_reason = 0u;
             s_cmd.mode      = GP_MODE_AIM;
             if (!was_aim)
             {
@@ -952,6 +1077,9 @@ static void gl_handle_frame(uint32_t now_ms)
                     s_cmd.vis_target_w_x100 = 0u;
                     s_cmd.vis_target_h_x100 = 0u;
                     s_cmd.vis_target_layer = 0u;
+                    s_cmd.vis_pose_range_ms_x10 = 0u;
+                    s_cmd.vis_distance_source = 0u;
+                    s_cmd.vis_lost_reason = 0u;
                 }
             }
             else
@@ -1036,6 +1164,10 @@ void gimbal_link_init(void)
     s_log_dropped = 0u;
     s_last_hb_ack_ms = 0u;
     s_rx_bytes = 0u;
+    s_ascii_lines = 0u;
+    s_ascii_checksum_errors = 0u;
+    s_vision_lost_since_ms = 0u;
+    s_vision_lost_stab_latched = 0u;
     s_rx_any_logged = 0u;
     s_text_len = 0u;
     memset(&s_cmd, 0, sizeof(s_cmd));
@@ -1062,7 +1194,7 @@ void gimbal_link_init(void)
      */
     {
         static const char banner[] =
-            "\r\nYUNTAI LINK BANNER 921600 8N1\r\n";
+            "\r\nYUNTAI LINK BANNER 115200 8N1\r\n";
         HAL_UART_Transmit(&GL_TX_HUART, (uint8_t *)banner,
                           (uint16_t)(sizeof(banner) - 1u), 50u);
         gimbal_link_log("[LINK] " GL_LINK_NAME " ready");
@@ -1246,4 +1378,19 @@ const char *gimbal_link_stats(void)
              (unsigned long)s_rx_ovf,          /* ovf：接收缓冲溢出 */
              (unsigned long)s_tx_drop);        /* txd：发送丢帧 */
     return s_buf;
+}
+
+uint32_t gimbal_link_ascii_line_count(void)
+{
+    return s_ascii_lines;
+}
+
+uint32_t gimbal_link_ascii_checksum_error_count(void)
+{
+    return s_ascii_checksum_errors;
+}
+
+uint32_t gimbal_link_raw_byte_count(void)
+{
+    return s_rx_bytes;
 }

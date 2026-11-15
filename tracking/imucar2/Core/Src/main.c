@@ -339,21 +339,54 @@ static void Motor_DeadzoneSweep(void)
 }
 #endif
 
-/* 50Hz 底盘状态帧: 16 字节固定长度, 小端字段, CRC16-CCITT-FALSE。 */
+/* 50Hz 底盘状态帧: 22 字节固定长度, 小端字段, CRC16-CCITT-FALSE。 */
 static void Chassis_Telemetry(void)
 {
     static uint16_t seq = 0u;
-    TrackState state = Track_GetState();
-    int8_t     raw_turn_dir = Track_GetTurnDir();
+    int32_t speed_mm_s;
+    int32_t yaw_rate_deci_dps;
+    TrackState state;
+    int8_t     raw_turn_dir;
     int8_t     turn_dir = 0;
     uint8_t    phase;
     uint8_t    flags = 0u;
     uint8_t    fault;
     uint8_t    direction_valid;
+    uint8_t    turn_exit_active;
+    uint8_t    distance_zone;
+    uint8_t    corner_count;
+    uint8_t    motor_enabled;
+    uint8_t    motor_stall;
+    uint8_t    imu_online;
+    float      measured_v_mps;
+    float      gyro_z_dps;
+    uint32_t   primask;
+    uint32_t   sample_ms;
+
+    /*
+     * Track_Update(), IMU_Update() and Motor_ControlUpdate() run in the TIM2
+     * ISR.  Snapshot every telemetry input in one short critical section so
+     * phase, direction, speed and gyro in one frame belong to the same control
+     * instant.
+     */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    state = Track_GetState();
+    raw_turn_dir = Track_GetTurnDir();
+    turn_exit_active = Track_IsTurnExitActive();
+    distance_zone = Track_GetDistanceZone();
+    corner_count = Track_GetRouteCornerCount();
+    measured_v_mps = Track_GetBodyMeasuredMps();
+    gyro_z_dps = IMU_GetGyroZDps();
+    motor_enabled = Motor_IsEnabled();
+    motor_stall = Motor_GetStallFlag();
+    imu_online = IMU_IsOnline();
+    sample_ms = HAL_GetTick();
+    __set_PRIMASK(primask);
 
     switch (state) {
     case TRACK_LINE:
-        phase = (Track_IsTurnExitActive() != 0u) ?
+        phase = (turn_exit_active != 0u) ?
                 LINK_PHASE_TURN_EXIT : LINK_PHASE_STRAIGHT;
         break;
     case TRACK_PRE_TURN:
@@ -380,13 +413,13 @@ static void Chassis_Telemetry(void)
     }
 
     fault = (uint8_t)((phase == LINK_PHASE_FAULT) ||
-                      (Motor_GetStallFlag() != 0u) ||
-                      (IMU_IsOnline() == 0u) ||
+                      (motor_stall != 0u) ||
+                      (imu_online == 0u) ||
                       (((phase == LINK_PHASE_PRE_TURN) ||
                         (phase == LINK_PHASE_TURNING) ||
                         (phase == LINK_PHASE_TURN_EXIT)) &&
                        (direction_valid == 0u)));
-    if ((Motor_IsEnabled() != 0u) && (fault == 0u)) {
+    if ((motor_enabled != 0u) && (fault == 0u)) {
         flags |= LINK_FLAG_CONTROL_VALID;
     }
     if (state != TRACK_STOP) {
@@ -397,7 +430,31 @@ static void Chassis_Telemetry(void)
         flags |= LINK_FLAG_FAULT;
     }
 
-    Link_SendChassisFrame(seq, phase, turn_dir, flags, HAL_GetTick());
+    speed_mm_s = (int32_t)(measured_v_mps * 1000.0f +
+                           (measured_v_mps >= 0.0f ? 0.5f : -0.5f));
+    if (speed_mm_s > 32767) {
+        speed_mm_s = 32767;
+    } else if (speed_mm_s < -32768) {
+        speed_mm_s = -32768;
+    }
+    yaw_rate_deci_dps = (int32_t)(gyro_z_dps * 10.0f +
+                                  (gyro_z_dps >= 0.0f ? 0.5f : -0.5f));
+    if (yaw_rate_deci_dps > 32767) {
+        yaw_rate_deci_dps = 32767;
+    } else if (yaw_rate_deci_dps < -32768) {
+        yaw_rate_deci_dps = -32768;
+    }
+    Link_SendChassisFrame(
+        seq,
+        phase,
+        turn_dir,
+        flags,
+        distance_zone,
+        (int16_t)speed_mm_s,
+        (int16_t)yaw_rate_deci_dps,
+        corner_count,
+        sample_ms
+    );
     seq++;
 }
 

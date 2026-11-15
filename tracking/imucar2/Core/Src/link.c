@@ -50,14 +50,18 @@ static void link_store_le32(uint8_t *dst, uint32_t value)
     dst[0] = (uint8_t)(value & 0xFFu);
     dst[1] = (uint8_t)((value >> 8) & 0xFFu);
     dst[2] = (uint8_t)((value >> 16) & 0xFFu);
-    dst[3] = (uint8_t)(value >> 24);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFu);
 }
 
 void Link_SendChassisFrame(uint16_t seq,
                            uint8_t phase,
                            int8_t turn_dir,
                            uint8_t flags,
-                           uint32_t chassis_ms)
+                           uint8_t distance_zone,
+                           int16_t speed_mm_s,
+                           int16_t yaw_rate_deci_dps,
+                           uint8_t corner_count,
+                           uint32_t sample_ms)
 {
     uint8_t  frame[LINK_CHASSIS_FRAME_SIZE];
     uint16_t crc;
@@ -70,11 +74,17 @@ void Link_SendChassisFrame(uint16_t seq,
     frame[6]  = phase;
     frame[7]  = (uint8_t)turn_dir;
     frame[8]  = flags;
-    frame[9]  = 0u;
-    link_store_le32(&frame[10], chassis_ms);
+    frame[9]  = distance_zone;
+    /* Version 4: measured motion plus exact route phase from F103. */
+    link_store_le16(&frame[10], (uint16_t)speed_mm_s);
+    link_store_le16(&frame[12], (uint16_t)yaw_rate_deci_dps);
+    frame[14] = corner_count;
+    frame[15] = 0u;
+    /* Version 5: F103 monotonic sample timestamp before telemetry formatting. */
+    link_store_le32(&frame[16], sample_ms);
 
-    crc = Link_Crc16CcittFalse(frame, 14u);
-    link_store_le16(&frame[14], crc);
+    crc = Link_Crc16CcittFalse(frame, 20u);
+    link_store_le16(&frame[20], crc);
     Link_SendBytes(frame, LINK_CHASSIS_FRAME_SIZE);
 }
 

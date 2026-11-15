@@ -10,6 +10,7 @@
 
 void yuntai_init(void);
 void yuntai_control_loop(void);
+void yuntai_chassis_uart_error(void);
 
 /* Reset-preserved diagnostics used by the exception handlers. */
 #define YUNTAI_FAULT_HARD       1u

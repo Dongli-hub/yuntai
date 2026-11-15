@@ -116,7 +116,7 @@ int main(void)
   MX_FDCAN2_Init();
   MX_SPI2_Init();
   MX_USART1_UART_Init();
-  MX_UART7_UART_Init();          /* 底盘转弯状态链路：PE7/PE8 */
+  MX_UART7_UART_Init();          /* F103 底盘遥测：115200 8N1 */
   MX_USART10_UART_Init();        /* UART10 排针（RX=PE02 / TX=PE03） */
   /* USER CODE BEGIN 2 */
   /* 先打开板上电源输出（PC13/PC14/PC15）：各排针的 5V 都靠它，

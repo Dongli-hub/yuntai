@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file    gimbal_link.h
-  * @brief   H723(UART7) <-> 机载计算机（K230）的链路层
+  * @brief   H723 视觉链路层（当前 USART1 <-> K230）
   *
   * 分工：
   *   gimbal_proto.c  —— 纯协议（CRC / 组帧 / 拆帧），不含 HAL，可在 PC 上单测
@@ -56,6 +56,9 @@ typedef struct
     uint16_t vis_target_w_x100;/* K230 当前候选框宽(px x100) */
     uint16_t vis_target_h_x100;/* K230 当前候选框高(px x100) */
     uint8_t vis_target_layer;  /* 0=unknown 1=outer 2=inner */
+    uint16_t vis_pose_range_ms_x10; /* 位姿测距耗时(ms x10) */
+    uint8_t vis_distance_source;    /* 1=位姿测距；0=无效 */
+    uint8_t vis_lost_reason;        /* 1=无靶框/关联 2=位姿 3=激光光斑 */
     uint16_t vis_k_x100;       /* 像素/度 ×100（AIM 尾部的可选字段；0 = 没给，用默认） */
     uint32_t px_ms;            /* 本帧到达时刻（视觉帧间隔/年龄） */
     uint32_t rx_count;         /* 收到多少帧 AIM（用来确认链路真的在动） */
@@ -111,5 +114,8 @@ void               gimbal_link_log(const char *text); /* 调试文本 -> 上位�
 void               gimbal_link_log_force(const char *text);
 void               gimbal_link_on_param(uint8_t pid, int16_t value); /* 由 yuntai_task 实现 */
 const char        *gimbal_link_stats(void);           /* 一行统计，便于随遥测发出 */
+uint32_t           gimbal_link_ascii_line_count(void);
+uint32_t           gimbal_link_ascii_checksum_error_count(void);
+uint32_t           gimbal_link_raw_byte_count(void);
 
 #endif /* __GIMBAL_LINK_H__ */

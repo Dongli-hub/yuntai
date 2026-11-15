@@ -42,7 +42,7 @@ except Exception:
 
 # 每次修改本文件时更新版本号，使启动日志能确认
 # 板端实际运行的版本。
-VISION_VERSION = "v115-20261108-near-distance-020"
+VISION_VERSION = "v145-20261114-near-roi-fast"
 RUN_MODE = "PRODUCTION"  # 测试或生产模式
 
 FRAME_WIDTH = 640
@@ -73,7 +73,7 @@ FRAME_INTERVAL_MS = 1000 // TARGET_PROCESS_FPS
 DISPLAY_EVERY_N_FRAMES = 1
 # 光照统计和垃圾回收开销都较大，无需每帧执行。
 PROFILE_EVERY_N_FRAMES = 15
-GC_EVERY_N_FRAMES = 150
+GC_EVERY_N_FRAMES = 300
 
 # 测试模式设置。
 # 每个距离分别改成 laser_050 / laser_100 / laser_150。
@@ -103,7 +103,7 @@ HIGH_RES_VERIFY_DISTANCE_M = 1.2
 HIGH_RES_SEARCH_ENABLED = False
 HIGH_RES_SEARCH_EVERY_N_FRAMES = 3
 
-# 联调显示通道全部关闭。
+# 联调预览关闭，恢复最低视觉延迟。
 DISPLAY_ENABLED = False
 DISPLAY_DRAW_RAW_RECTANGLES = False
 DISPLAY_DRAW_FINAL_TARGET = False
@@ -111,17 +111,35 @@ DISPLAY_DRAW_LASER_PREDICTION = False
 DISPLAY_DRAW_TARGET_TEXT = False
 DISPLAY_USE_GRAYSCALE_PREVIEW = False
 
-UART_BAUDRATE = 921600
+# 这版使用旧仓库验证过的 115200；当前线束在 921600 下校验错误率过高。
+UART_BAUDRATE = 115200
 UART_TX_PIN = 9
 UART_RX_PIN = 10
 VISION_LOST_VALUE = 404
 VISION_LOST_SEND_INTERVAL_MS = 100
 
-# 几何激光落点开关。关闭时只保留矩形检测/靶心跟踪，瞄准使用固定点。
+# 几何激光射线求交开关。关闭时只接受实时亮斑检测结果。
 GEOMETRY_LANDING_ENABLED = False
-FIXED_LASER_POINT_X_PX = 317.0
-FIXED_LASER_POINT_Y_PX = 230.0
-GIMBAL_ANGLE_PER_PIXEL_DEG = 0.28 * 320.0 / FRAME_WIDTH
+
+# 靶纸高亮曝光白斑检测。只寻找接近饱和的白色激光连通域。
+LIVE_LASER_SPOT_ENABLED = True
+# CanMV 的 LAB 阈值使用 L=0..100，不是 0..255。
+LIVE_LASER_WHITE_THRESHOLD = (95, 100, -15, 15, -15, 15)
+LIVE_LASER_WHITE_MIN_PIXELS = 6
+LIVE_LASER_WHITE_MAX_PIXELS = 1500
+LIVE_LASER_WHITE_MIN_DENSITY = 0.45
+LIVE_LASER_WHITE_MAX_BOX_SIDE = 50
+LIVE_LASER_WHITE_MAX_AREA_FRACTION = 0.05
+LIVE_LASER_ASPECT_RATIO_MIN = 0.35
+LIVE_LASER_ASPECT_RATIO_MAX = 3.00
+LIVE_LASER_ROI_MARGIN_PX = 4
+LIVE_LASER_TRACK_ROI_RADIUS_PX = 56
+LIVE_LASER_NEAR_TRACK_ROI_RADIUS_PX = 40
+LIVE_LASER_TRACK_GATE_PX = 120.0
+LIVE_LASER_SMOOTHING_ALPHA_STATIC = 0.35
+LIVE_LASER_SMOOTHING_ALPHA_MOVING = 0.80
+LIVE_LASER_CENTER_DEADBAND_PX = 1.0
+LIVE_LASER_MAX_STEP_PX = 18.0
 
 # 目标外框 300×210 mm，实际内框 260×170 mm，
 # 因此黑胶带宽度为 (300-260)/2 = (210-170)/2 = 20 mm。
@@ -129,10 +147,9 @@ TARGET_OUTER_WIDTH_M = 0.30
 TARGET_OUTER_HEIGHT_M = 0.21
 BLACK_BORDER_WIDTH_M = 0.020
 FOCAL_LENGTH_PX = REFERENCE_FOCAL_LENGTH_PX * FRAME_WIDTH / REFERENCE_FRAME_WIDTH
-# 近距离正对时内框会长到 310 px 以上，尺寸估算距离会短暂掉到
-# 0.30 m 以下。下限过低会丢靶，但不能继续卡在 0.30 m。
-MIN_VALID_DISTANCE_M = 0.20
-MAX_VALID_DISTANCE_M = 1.60
+MIN_VALID_DISTANCE_M = 0.30
+# 标定后的单目距离在 1.5m 靶位会因透视和边缘定位落在 1.6~1.9m 区间。
+MAX_VALID_DISTANCE_M = 2.00
 
 # 相机内参、畸变和激光相对相机的位姿。
 # 使用 2026-11-04 当场多距离、多视角标定结果。
@@ -172,6 +189,10 @@ GEOMETRY_CORNER_REFINE_ENABLED = True
 GEOMETRY_CORNER_SEARCH_PX = 3
 GEOMETRY_CORNER_SAMPLES = 11
 GEOMETRY_CORNER_MAX_SHIFT_PX = 2.0
+# 2026-11-14 赛道路线实测：位姿原始距离在近/远端分别约 0.60/1.67 m，
+# 对应实际 0.50/1.50 m。该两点线性校正只修正测距系统偏差，不参与识别。
+POSE_RANGE_CAL_SCALE = 0.9346
+POSE_RANGE_CAL_OFFSET_M = -0.0607
 
 # 灰度光斑慢速校正。只在靶纸内部搜索，每 5 个有效跟踪帧更新一次。
 SPOT_CORRECTION_ENABLED = True
@@ -292,6 +313,7 @@ PROFILE_HIGH_PERCENTILE = 0.95
 # 时序逻辑。
 CONFIRM_WINDOW_FRAMES = 5
 CONFIRM_HITS_REQUIRED = 3
+NO_CANDIDATE_RECAPTURE_FRAMES = 3
 # 快速重捕获：确认阶段落在预测框上的候选
 # 直接计为完整命中，短暂闪烁一两帧的目标
 # 可立即恢复，无需重新满足五帧内命中三次的条件。
@@ -302,7 +324,6 @@ CONFIRM_FAST_AREA_RATIO_MAX = 1.40
 # 属于正常现象，而随后重捕获大约需要二十个
 # 无目标帧，这期间云台完全看不到目标，因此短暂丢失
 # 不应直接破坏锁定。
-HOLD_LOST_FRAMES = 12
 # 短暂丢失预测：跟踪器丢失目标时不再立即发送 404，
 # 而是按目标速度外推上一个框，并在该时间内继续发送，
 # 使云台在空档期继续运动，避免先停住再突然跳动。
@@ -317,7 +338,7 @@ NEAR_TRACK_AREA_RATIO_MAX = 1.60
 NEAR_TRACK_AXIS_RATIO_MIN = 0.80
 NEAR_TRACK_AXIS_RATIO_MAX = 1.30
 NEAR_TRACK_CENTER_RADIUS_FACTOR = 1.00
-INNER_CANDIDATE_SCORE_FACTOR = 2.00
+INNER_CANDIDATE_SCORE_FACTOR = 4.00
 # 原值为 0.60。跟踪 ROI 是真实裁剪区域（裁剪检测与 cv_lite），
 # 因此边距直接决定开销：面积按 ((1+2m)^2) 缩放，0.60 改为 0.30 后
 # 裁剪面积降至 53%，这是检测阶段最大的一项提速。
@@ -326,15 +347,18 @@ INNER_CANDIDATE_SCORE_FACTOR = 2.00
 # 应先将该值调回 0.45 附近。
 TRACK_DETECTION_ROI_MARGIN_FACTOR = 0.30
 NEAR_TRACK_DISTANCE_M = 0.90
-NEAR_TRACK_DETECTION_ROI_MARGIN_FACTOR = 0.30
+NEAR_TRACK_DETECTION_ROI_MARGIN_FACTOR = 0.15
 # 跟踪模式中的低成本预筛选：近距离大目标会产生大量四边形，
 # build_candidate（白暗采样与几何计算）每帧可能耗时 5 到 11 毫秒，
 # 而跟踪器最终也会丢弃远离预测位置的候选，因此先按中心距离
 # 过滤四边形。每轴 1.0 个框宽已经比较宽松，
 # 即使目标一帧移动半个框宽也不会被丢弃。
 TRACK_CANDIDATE_GATE_FACTOR = 1.00
-LAYER_SWITCH_SCORE_FACTOR = 0.55
-LAYER_SWITCH_VOTES = 2
+# 近距离目标占画面比例很大，原 1.0 倍框宽的预筛选会让大量背景四边形
+# 进入白/暗采样。近距离每帧只移动十几像素，0.35 倍框宽仍有充足余量。
+NEAR_TRACK_CANDIDATE_GATE_FACTOR = 0.35
+LAYER_SWITCH_SCORE_FACTOR = 0.25
+LAYER_SWITCH_VOTES = 4
 LAYER_ALTERNATE_AREA_RATIO_MIN = 0.55
 LAYER_ALTERNATE_AREA_RATIO_MAX = 1.55
 LAYER_ALTERNATE_AXIS_RATIO_MIN = 0.72
@@ -342,8 +366,11 @@ LAYER_ALTERNATE_AXIS_RATIO_MAX = 1.30
 CONFIRM_OUTER_AREA_RATIO_MIN = 1.08
 CONFIRM_OUTER_AREA_RATIO_MAX = 1.45
 MAX_TRACK_VELOCITY_PX_PER_S = 2250.0 * PIXEL_SCALE
-SMOOTH_CENTER_ALPHA = 0.50
+SMOOTH_CENTER_ALPHA_STATIC = 0.35
+SMOOTH_CENTER_ALPHA_MOVING = 0.80
 SMOOTH_SIZE_ALPHA = 0.30
+SMOOTH_MOTION_SLOW_PX = 2.0
+SMOOTH_MOTION_FAST_PX = 10.0
 RECAPTURE_ROI_FRAMES = 8
 RECAPTURE_FULL_FRAMES = 12
 RECAPTURE_ROI_MARGIN_FACTOR = 0.30
@@ -884,7 +911,39 @@ def bump_diagnostic(diagnostics, name, amount=1):
     diagnostics[name] = diagnostics.get(name, 0) + amount
 
 
-def calculate_distance_metrics(width, height, is_inner):
+def _distance_quad_side_lengths(corners):
+    """返回矩形两组对边的“宽度像素”和“高度像素”平均值。"""
+    if corners is None or len(corners) != 4:
+        return 0.0, 0.0
+
+    ordered = order_corners(corners)
+    lengths = []
+    horizontal_ratio = []
+    for index in range(4):
+        x1, y1 = ordered[index]
+        x2, y2 = ordered[(index + 1) % 4]
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        length = math.sqrt(delta_x * delta_x + delta_y * delta_y)
+        if length <= 0.0:
+            return 0.0, 0.0
+        lengths.append(length)
+        horizontal_ratio.append(abs(delta_x) / length)
+
+    # 靶纸正常横放。对边中方向更接近水平的一组作为上下边，
+    # 另一组作为左右边；两组各取平均值以减小透视造成的单边误差。
+    pair_0_horizontal = 0.5 * (horizontal_ratio[0] + horizontal_ratio[2])
+    pair_1_horizontal = 0.5 * (horizontal_ratio[1] + horizontal_ratio[3])
+    if pair_0_horizontal >= pair_1_horizontal:
+        width_px = 0.5 * (lengths[0] + lengths[2])
+        height_px = 0.5 * (lengths[1] + lengths[3])
+    else:
+        width_px = 0.5 * (lengths[1] + lengths[3])
+        height_px = 0.5 * (lengths[0] + lengths[2])
+    return width_px, height_px
+
+
+def calculate_distance_metrics(corners, width, height, is_inner):
     width_m = TARGET_OUTER_WIDTH_M
     height_m = TARGET_OUTER_HEIGHT_M
 
@@ -892,8 +951,20 @@ def calculate_distance_metrics(width, height, is_inner):
         width_m -= 2.0 * BLACK_BORDER_WIDTH_M
         height_m -= 2.0 * BLACK_BORDER_WIDTH_M
 
-    distance_width = FOCAL_LENGTH_PX * width_m / max(1.0, width)
-    distance_height = FOCAL_LENGTH_PX * height_m / max(1.0, height)
+    width_px, height_px = _distance_quad_side_lengths(corners)
+    # 四边形角点异常时保留原包围框兜底，避免直接丢掉一帧有效靶框。
+    if width_px <= 0.0:
+        width_px = width
+    if height_px <= 0.0:
+        height_px = height
+
+    # cx/cy 用于像平面坐标和位姿计算；深度只依赖 fx、fy。
+    distance_width = (
+        CAMERA_CALIBRATION["fx"] * width_m / max(1.0, width_px)
+    )
+    distance_height = (
+        CAMERA_CALIBRATION["fy"] * height_m / max(1.0, height_px)
+    )
     larger_distance = max(distance_width, distance_height)
 
     if larger_distance <= 0:
@@ -911,7 +982,10 @@ def calculate_distance_metrics(width, height, is_inner):
 
 def refresh_candidate_distance(candidate):
     metrics = calculate_distance_metrics(
-        candidate["w"], candidate["h"], candidate["inner"]
+        candidate.get("corners"),
+        candidate["w"],
+        candidate["h"],
+        candidate["inner"],
     )
     candidate["distance_m"] = metrics["distance_m"]
     candidate["distance_width_m"] = metrics["distance_width_m"]
@@ -987,7 +1061,9 @@ def build_candidate(
 
     center_x, center_y = perspective_center_of_corners(corners)
     is_inner = inner_edge_score >= MIN_INNER_EDGE_SCORE
-    distance_metrics = calculate_distance_metrics(width, height, is_inner)
+    distance_metrics = calculate_distance_metrics(
+        corners, width, height, is_inner
+    )
     distance_consistency = distance_metrics["distance_consistency"]
 
     absolute_quality = (0.4 + 0.6 * min(1.0, white_ratio))
@@ -1132,17 +1208,6 @@ def select_best_candidate(candidates, state, last, diagnostics=None, roi=None):
             diagnostics["lost_reason"] = "distance"
         return None
 
-    # 当前靶面只稳定产生一个角点候选，且画面确认它贴着黑胶带内沿。
-    # 远距时边沿采样不足会让 inner_edge_score 偶发跌破阈值，若不强制
-    # 标记，几何计算会错误使用 300x210 外框尺寸。
-    if len(valid_distance_candidates) == 1:
-        candidate = valid_distance_candidates[0]
-        if not candidate["inner"]:
-            candidate["inner"] = True
-            candidate["layer"] = "inner"
-            refresh_candidate_distance(candidate)
-            bump_diagnostic(diagnostics, "forced_inner")
-
     pool = []
     for candidate in valid_distance_candidates:
         if candidate["inner"]:
@@ -1282,20 +1347,6 @@ def select_best_candidate(candidates, state, last, diagnostics=None, roi=None):
             )
         ):
             best = candidate
-
-    # 最终选中的框如果仍只是 unknown，而本帧没有任何明确的 outer
-    # 候选，就按当前靶面实际检测到的内沿处理。这不改变候选选择和跟踪。
-    if best is not None and not best["inner"]:
-        has_explicit_outer = False
-        for candidate in valid_distance_candidates:
-            if candidate["layer"] == "outer":
-                has_explicit_outer = True
-                break
-        if not has_explicit_outer:
-            best["inner"] = True
-            best["layer"] = "inner"
-            refresh_candidate_distance(best)
-            bump_diagnostic(diagnostics, "forced_inner_final")
 
     if best is not None and diagnostics is not None:
         diagnostics["candidate_source"] = best["source"]
@@ -1717,6 +1768,91 @@ def _estimate_target_pose(corners, camera, width_mm, height_mm):
     return pose, residual, ordered, refined
 
 
+class TargetRangeEstimator(object):
+    """Reference-style planar pose range without enabling laser geometry aim."""
+
+    def __init__(self):
+        self.camera, _origin, _direction = _load_calibration()
+
+    def solve(self, target):
+        corners = target.get("corners")
+        if corners is None or len(corners) != 4:
+            raise ValueError("target has no four corners")
+
+        if bool(target.get("inner")):
+            width_mm = (
+                TARGET_OUTER_WIDTH_M - 2.0 * BLACK_BORDER_WIDTH_M
+            ) * 1000.0
+            height_mm = (
+                TARGET_OUTER_HEIGHT_M - 2.0 * BLACK_BORDER_WIDTH_M
+            ) * 1000.0
+        else:
+            width_mm = TARGET_OUTER_WIDTH_M * 1000.0
+            height_mm = TARGET_OUTER_HEIGHT_M * 1000.0
+
+        pose, residual, _ordered, pose_refined = _estimate_target_pose(
+            corners,
+            self.camera,
+            width_mm,
+            height_mm,
+        )
+        center_camera = pose.camera_point(
+            (width_mm * 0.5, height_mm * 0.5)
+        )
+        raw_range_m = _vec_norm(center_camera) / 1000.0
+        depth_m = center_camera[2] / 1000.0
+        if not (
+            MIN_VALID_DISTANCE_M <= raw_range_m <= MAX_VALID_DISTANCE_M
+        ):
+            raise ValueError("pose range out of range")
+        range_m = (
+            POSE_RANGE_CAL_SCALE * raw_range_m +
+            POSE_RANGE_CAL_OFFSET_M
+        )
+        if not (
+            MIN_VALID_DISTANCE_M <= range_m <= MAX_VALID_DISTANCE_M
+        ):
+            raise ValueError("calibrated pose range out of range")
+        return {
+            "raw_range_m": raw_range_m,
+            "range_m": range_m,
+            "depth_m": depth_m,
+            "reprojection_px": residual,
+            "pose_refined": bool(pose_refined),
+        }
+
+
+def update_target_pose_range(target, estimator, diagnostics=None):
+    if target is None or estimator is None:
+        return False
+
+    try:
+        solution = estimator.solve(target)
+    except Exception as exc:
+        target["distance_m"] = 0.0
+        if diagnostics is not None:
+            diagnostics["pose_range_reject"] = str(exc)
+            diagnostics["distance_source"] = 0
+        return False
+
+    target["distance_side_m"] = target.get("distance_m", 0.0)
+    target["distance_m"] = solution["range_m"]
+    target["distance_pose_raw_m"] = solution["raw_range_m"]
+    target["pose_depth_m"] = solution["depth_m"]
+    target["pose_range_m"] = solution["range_m"]
+    target["pose_reprojection_px"] = solution["reprojection_px"]
+    target["pose_range_refined"] = 1 if solution["pose_refined"] else 0
+    if diagnostics is not None:
+        diagnostics["distance_source"] = 1
+        diagnostics["pose_range_cm"] = solution["range_m"] * 100.0
+        diagnostics["pose_depth_cm"] = solution["depth_m"] * 100.0
+        diagnostics["pose_reprojection_px"] = solution["reprojection_px"]
+        diagnostics["pose_range_refined"] = (
+            1 if solution["pose_refined"] else 0
+        )
+    return True
+
+
 def _aim_solution(pose, laser_origin, laser_direction, target_mm):
     direction = _vec_unit(laser_direction)
     hit = pose.intersection(laser_origin, direction)
@@ -1830,9 +1966,26 @@ def _load_calibration():
     return camera, origin, direction
 
 
-def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
+def _find_laser_spot(
+    gray,
+    corners,
+    width_mm,
+    height_mm,
+    inset_mm,
+    search_center=None,
+    search_radius_px=None,
+    min_peak=None,
+    min_contrast=None,
+    core_drop=None,
+):
     if np is None:
         return None, "spot_disabled"
+    if min_peak is None:
+        min_peak = SPOT_MIN_PEAK
+    if min_contrast is None:
+        min_contrast = SPOT_MIN_CONTRAST
+    if core_drop is None:
+        core_drop = SPOT_CORE_DROP
     if hasattr(gray, "to_numpy_ref"):
         gray = gray.to_numpy_ref()
     height = gray.shape[0]
@@ -1857,6 +2010,18 @@ def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
     x1 = min(width, int(max(point[0] for point in quad)))
     y0 = max(0, int(min(point[1] for point in quad)) + 1)
     y1 = min(height, int(max(point[1] for point in quad)))
+    if (
+        search_center is not None
+        and search_radius_px is not None
+        and search_radius_px > 0
+    ):
+        center_x = int(round(search_center[0]))
+        center_y = int(round(search_center[1]))
+        radius = int(search_radius_px)
+        x0 = max(x0, center_x - radius)
+        x1 = min(x1, center_x + radius + 1)
+        y0 = max(y0, center_y - radius)
+        y1 = min(y1, center_y + radius + 1)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None, "spot_roi_small"
 
@@ -1865,7 +2030,7 @@ def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
     peak_y = peak_index // (x1 - x0)
     peak_x = peak_index % (x1 - x0)
     peak = float(roi[peak_y, peak_x])
-    if peak < SPOT_MIN_PEAK or peak - float(np.mean(roi)) < SPOT_MIN_CONTRAST:
+    if peak < min_peak or peak - float(np.mean(roi)) < min_contrast:
         return None, "spot_dim"
 
     radius = SPOT_WINDOW_PX
@@ -1877,7 +2042,7 @@ def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
         np.array(
             roi[wy0:wy1, wx0:wx1],
             dtype=np.float32,
-        ) - (peak - SPOT_CORE_DROP),
+        ) - (peak - core_drop),
         0,
         255,
     )
@@ -1908,6 +2073,279 @@ def _find_laser_spot(gray, corners, width_mm, height_mm, inset_mm):
         ),
         "spot_ok",
     )
+
+
+def _live_blob_value(blob, name, index):
+    method = getattr(blob, name, None)
+    if method is not None:
+        return int(method())
+    return int(blob[index])
+
+
+def _live_blob_info(blob):
+    width = _live_blob_value(blob, "w", 2)
+    height = _live_blob_value(blob, "h", 3)
+    pixels = _live_blob_value(blob, "pixels", 4)
+    area = width * height
+    return {
+        "x": _live_blob_value(blob, "x", 0),
+        "y": _live_blob_value(blob, "y", 1),
+        "w": width,
+        "h": height,
+        "cx": _live_blob_value(blob, "cx", 5),
+        "cy": _live_blob_value(blob, "cy", 6),
+        "pixels": pixels,
+        "density": pixels / float(area) if area > 0 else 0.0,
+    }
+
+
+def _point_in_convex_quad(point, corners):
+    if len(corners) != 4:
+        return False
+    positive = 0
+    negative = 0
+    for index in range(4):
+        ax, ay = corners[index]
+        bx, by = corners[(index + 1) % 4]
+        cross = (
+            (bx - ax) * (point[1] - ay) -
+            (by - ay) * (point[0] - ax)
+        )
+        if cross > 0:
+            positive += 1
+        elif cross < 0:
+            negative += 1
+    return positive == 4 or negative == 4
+
+
+def _distance_between(first, second):
+    delta_x = first[0] - second[0]
+    delta_y = first[1] - second[1]
+    return math.sqrt(delta_x * delta_x + delta_y * delta_y)
+
+
+def _make_live_laser_roi(target, previous_center=None):
+    corners = target.get("corners")
+    if corners is None or len(corners) != 4:
+        return None
+    left = int(min(point[0] for point in corners)) - LIVE_LASER_ROI_MARGIN_PX
+    top = int(min(point[1] for point in corners)) - LIVE_LASER_ROI_MARGIN_PX
+    right = int(max(point[0] for point in corners)) + LIVE_LASER_ROI_MARGIN_PX
+    bottom = int(max(point[1] for point in corners)) + LIVE_LASER_ROI_MARGIN_PX
+    left = max(0, left)
+    top = max(0, top)
+    right = min(FRAME_WIDTH, right)
+    bottom = min(FRAME_HEIGHT, bottom)
+    if right <= left or bottom <= top:
+        return None
+    if previous_center is not None:
+        track_radius = LIVE_LASER_TRACK_ROI_RADIUS_PX
+        if target.get("distance_m", NEAR_TRACK_DISTANCE_M + 1.0) <= \
+                NEAR_TRACK_DISTANCE_M:
+            track_radius = LIVE_LASER_NEAR_TRACK_ROI_RADIUS_PX
+        tracked_left = max(
+            left,
+            int(previous_center[0]) - track_radius,
+        )
+        tracked_top = max(
+            top,
+            int(previous_center[1]) - track_radius,
+        )
+        tracked_right = min(
+            right,
+            int(previous_center[0]) + track_radius,
+        )
+        tracked_bottom = min(
+            bottom,
+            int(previous_center[1]) + track_radius,
+        )
+        if tracked_right > tracked_left and tracked_bottom > tracked_top:
+            left = tracked_left
+            top = tracked_top
+            right = tracked_right
+            bottom = tracked_bottom
+    return (left, top, right - left, bottom - top)
+
+
+def _select_live_laser_spot(
+    blobs,
+    target_corners,
+    previous_center=None,
+):
+    candidates = []
+    last_reason = "none"
+    target_area = abs(polygon_area(target_corners))
+    for blob in blobs:
+        item = _live_blob_info(blob)
+        last_reason = "ok"
+        if item["pixels"] < LIVE_LASER_WHITE_MIN_PIXELS:
+            last_reason = "pixels"
+            continue
+        if item["pixels"] > LIVE_LASER_WHITE_MAX_PIXELS:
+            last_reason = "pixels_max"
+            continue
+        if (
+            target_area > 0.0
+            and item["pixels"] > LIVE_LASER_WHITE_MAX_AREA_FRACTION * target_area
+        ):
+            last_reason = "area_ratio"
+            continue
+        if (
+            item["w"] <= 0 or item["h"] <= 0 or
+            item["w"] > LIVE_LASER_WHITE_MAX_BOX_SIDE or
+            item["h"] > LIVE_LASER_WHITE_MAX_BOX_SIDE
+        ):
+            last_reason = "size"
+            continue
+        if item["density"] < LIVE_LASER_WHITE_MIN_DENSITY:
+            last_reason = "density"
+            continue
+        aspect = item["w"] / float(item["h"])
+        if (
+            aspect < LIVE_LASER_ASPECT_RATIO_MIN or
+            aspect > LIVE_LASER_ASPECT_RATIO_MAX
+        ):
+            last_reason = "aspect"
+            continue
+        if not _point_in_convex_quad(
+            (item["cx"], item["cy"]),
+            target_corners,
+        ):
+            last_reason = "outside"
+            continue
+
+        if previous_center is not None:
+            distance = _distance_between(
+                (item["cx"], item["cy"]),
+                previous_center,
+            )
+            if distance > LIVE_LASER_TRACK_GATE_PX:
+                last_reason = "jump"
+                continue
+            proximity = 1.0 - distance / LIVE_LASER_TRACK_GATE_PX
+        else:
+            proximity = 0.5
+
+        item["aspect"] = aspect
+        item["score"] = (
+            item["density"] * 0.55 +
+            min(item["pixels"] / 500.0, 1.0) * 0.25 +
+            proximity * 0.20
+        )
+        item["source"] = "white"
+        item["reason"] = "ok"
+        candidates.append(item)
+
+    if not candidates:
+        return None, last_reason
+    candidates.sort(
+        key=lambda item: (item["score"], item["pixels"]),
+        reverse=True,
+    )
+    return candidates[0], "ok"
+
+
+def _find_live_laser_spot(img, target, previous_center=None):
+    roi = _make_live_laser_roi(target, previous_center)
+    if roi is None:
+        return None, "roi"
+    try:
+        blobs = img.find_blobs(
+            [LIVE_LASER_WHITE_THRESHOLD],
+            roi=roi,
+            pixels_threshold=LIVE_LASER_WHITE_MIN_PIXELS,
+            area_threshold=LIVE_LASER_WHITE_MIN_PIXELS,
+            merge=False,
+        )
+    except BaseException:
+        return None, "find_blobs"
+    return _select_live_laser_spot(
+        blobs,
+        target["corners"],
+        previous_center,
+    )
+
+
+def _smooth_live_laser_spot(previous, measured):
+    result = dict(measured)
+    if previous is None:
+        return result
+    delta_x = measured["cx"] - previous["cx"]
+    delta_y = measured["cy"] - previous["cy"]
+    if (
+        abs(delta_x) <= LIVE_LASER_CENTER_DEADBAND_PX
+        and abs(delta_y) <= LIVE_LASER_CENTER_DEADBAND_PX
+    ):
+        result["cx"] = previous["cx"]
+        result["cy"] = previous["cy"]
+        return result
+    movement = math.sqrt(delta_x * delta_x + delta_y * delta_y)
+    if movement <= 2.0:
+        blend = 0.0
+    elif movement >= 10.0:
+        blend = 1.0
+    else:
+        blend = (movement - 2.0) / 8.0
+    alpha = LIVE_LASER_SMOOTHING_ALPHA_STATIC + blend * (
+        LIVE_LASER_SMOOTHING_ALPHA_MOVING -
+        LIVE_LASER_SMOOTHING_ALPHA_STATIC
+    )
+    if movement > LIVE_LASER_MAX_STEP_PX:
+        alpha *= LIVE_LASER_MAX_STEP_PX / movement
+    result["cx"] = previous["cx"] + delta_x * alpha
+    result["cy"] = previous["cy"] + delta_y * alpha
+    return result
+
+
+class LiveLaserSpotTracker(object):
+    """参考 main(1).py 的红色激光连通域检测与跨帧平滑。"""
+
+    def __init__(self):
+        self.last = None
+        self.status = "wait"
+
+    def _as_point(self, spot, target):
+        return {
+            "x": spot["cx"],
+            "y": spot["cy"],
+            "cx": spot["cx"],
+            "cy": spot["cy"],
+            "distance_m": target["distance_m"],
+            "source": spot.get("source", "unknown"),
+        }
+
+    def update(self, img, target):
+        corners = target.get("corners") if target is not None else None
+        if corners is None or len(corners) != 4:
+            self.last = None
+            self.status = "lost:roi"
+            return None, self.status
+
+        previous_center = None
+        if self.last is not None:
+            previous_center = (self.last["cx"], self.last["cy"])
+
+        measured, reason = _find_live_laser_spot(
+            img,
+            target,
+            previous_center,
+        )
+        if measured is not None and not _point_in_convex_quad(
+            (measured["cx"], measured["cy"]),
+            corners,
+        ):
+            measured = None
+            reason = "target_jump"
+
+        if measured is not None:
+            item = _smooth_live_laser_spot(self.last, measured)
+            self.last = item
+            self.status = "live:" + item.get("source", "unknown")
+            return self._as_point(item, target), self.status
+
+        self.last = None
+        self.status = "lost:" + reason
+        return None, self.status
 
 
 def _fit_line_tls(points):
@@ -2251,9 +2689,13 @@ def detect_with_cv_lite(
         # 在开销较大的 build_candidate 之前先按中心距离筛选，
         # 仅用于已经大致知道目标位置的跟踪模式。
         if reference is not None:
-            gate = TRACK_CANDIDATE_GATE_FACTOR * max(
+            reference_long = max(
                 1.0, float(reference["w"]), float(reference["h"])
             )
+            gate_factor = TRACK_CANDIDATE_GATE_FACTOR
+            if reference_long >= NEAR_GEOMETRY_MIN_LONG_PX:
+                gate_factor = NEAR_TRACK_CANDIDATE_GATE_FACTOR
+            gate = gate_factor * reference_long
             quad_cx = (corners[0][0] + corners[2][0]) * 0.5
             quad_cy = (corners[0][1] + corners[2][1]) * 0.5
             if (
@@ -2706,6 +3148,8 @@ class TargetTracker:
 
         area_ratio = candidate["area"] / max(1.0, reference["area"])
         if (
+            not candidate["inner"]
+            and
             CONFIRM_OUTER_AREA_RATIO_MIN
             <= area_ratio
             <= CONFIRM_OUTER_AREA_RATIO_MAX
@@ -2716,7 +3160,9 @@ class TargetTracker:
 
         if 0.65 <= area_ratio < 0.95:
             if candidate["layer"] == "unknown":
+                candidate["inner"] = True
                 candidate["layer"] = "inner"
+                refresh_candidate_distance(candidate)
             return True
 
         if 0.95 <= area_ratio < CONFIRM_OUTER_AREA_RATIO_MIN:
@@ -2751,10 +3197,26 @@ class TargetTracker:
 
         previous = self.output
         smoothed = self.copy_candidate(candidate)
-        smoothed["cx"] = previous["cx"] + SMOOTH_CENTER_ALPHA * (
+        delta_x = candidate["cx"] - previous["cx"]
+        delta_y = candidate["cy"] - previous["cy"]
+        movement = math.sqrt(delta_x * delta_x + delta_y * delta_y)
+        if movement <= SMOOTH_MOTION_SLOW_PX:
+            blend = 0.0
+        elif movement >= SMOOTH_MOTION_FAST_PX:
+            blend = 1.0
+        else:
+            blend = (
+                (movement - SMOOTH_MOTION_SLOW_PX) /
+                (SMOOTH_MOTION_FAST_PX - SMOOTH_MOTION_SLOW_PX)
+            )
+        center_alpha = SMOOTH_CENTER_ALPHA_STATIC + blend * (
+            SMOOTH_CENTER_ALPHA_MOVING -
+            SMOOTH_CENTER_ALPHA_STATIC
+        )
+        smoothed["cx"] = previous["cx"] + center_alpha * (
             candidate["cx"] - previous["cx"]
         )
-        smoothed["cy"] = previous["cy"] + SMOOTH_CENTER_ALPHA * (
+        smoothed["cy"] = previous["cy"] + center_alpha * (
             candidate["cy"] - previous["cy"]
         )
         smoothed["w"] = previous["w"] + SMOOTH_SIZE_ALPHA * (
@@ -2768,7 +3230,10 @@ class TargetTracker:
         smoothed["area"] = smoothed["w"] * smoothed["h"] * smoothed["rect"]
 
         metrics = calculate_distance_metrics(
-            smoothed["w"], smoothed["h"], smoothed["inner"]
+            smoothed.get("corners"),
+            smoothed["w"],
+            smoothed["h"],
+            smoothed["inner"],
         )
         smoothed["distance_m"] = metrics["distance_m"]
         smoothed["distance_width_m"] = metrics["distance_width_m"]
@@ -2788,7 +3253,6 @@ class TargetTracker:
         detection_mode = self.detection_mode()
         if diagnostics is not None:
             diagnostics["selected_mode"] = detection_mode
-            diagnostics["target_held"] = 0
 
         reference = self.predicted_reference(now_ms)
         candidate = select_best_candidate(
@@ -2807,6 +3271,8 @@ class TargetTracker:
                 return self.accept_candidate(candidate, now_ms)
 
             if candidate is not None and candidate.get("alternate_layer"):
+                if diagnostics is not None:
+                    diagnostics["lost_reason"] = "alternate_layer"
                 self.layer_conflict_count += 1
                 if self.layer_conflict_count >= LAYER_SWITCH_VOTES:
                     previous = reference if reference is not None else self.last
@@ -2821,30 +3287,19 @@ class TargetTracker:
                     self.layer_conflict_count = 0
                     self.output = None
                     return self.accept_candidate(candidate, now_ms)
-
-                if self.output is not None:
-                    if diagnostics is not None:
-                        diagnostics["target_held"] = 1
-                    return self.output
-                if self.last is not None:
-                    if diagnostics is not None:
-                        diagnostics["target_held"] = 1
-                    return self.last
+                # 内外框冲突帧不带旧框进入控制链。
+                return None
 
             self.layer_conflict_count = 0
             self.lost_count += 1
-            if self.lost_count > HOLD_LOST_FRAMES:
+            if diagnostics is not None:
+                diagnostics["lost_reason"] = (
+                    "no_candidate" if candidate is None else "association"
+                )
+            # 当前帧没有候选就上报404，不把旧框送入控制；只保留短暂的
+            # 关联状态，避免单帧漏检后重新执行完整三帧确认。
+            if self.lost_count >= NO_CANDIDATE_RECAPTURE_FRAMES:
                 self.begin_recapture()
-                return None
-
-            if self.output is not None:
-                if diagnostics is not None:
-                    diagnostics["target_held"] = 1
-                return self.output
-            if self.last is not None:
-                if diagnostics is not None:
-                    diagnostics["target_held"] = 1
-                return self.last
             return None
 
         if self.state == "SEARCH":
@@ -2931,6 +3386,14 @@ def configure_vision_uart():
     return UART(UART.UART1, UART_BAUDRATE)
 
 
+def _seal_vision_frame(body):
+    """附加 XOR 校验：覆盖 '*' 前的全部 ASCII 字节。"""
+    checksum = 0
+    for byte in body:
+        checksum ^= ord(byte)
+    return body + "*{:02X}\n".format(checksum)
+
+
 def build_vision_frame(
     yaw_deg,
     pitch_deg,
@@ -2945,10 +3408,12 @@ def build_vision_frame(
     target_w=0.0,
     target_h=0.0,
     target_layer=0,
+    pose_range_ms=0.0,
+    distance_source=0,
 ):
-    # 末尾：1=几何成功；2=无新鲜靶框；3~11=几何拒绝；12=固定激光点。
+    # 末尾：1=几何成功；2=无新鲜靶框；3~11=几何拒绝；12=K230直接角度。
     # K230 只在状态 1 时发送本帧，其余状态发送视觉无效帧。
-    return "{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.1f},{:.1f},{:.2f},{},{:.1f},{},{:.1f},{:.1f},{:.2f}\n".format(
+    body = "{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.1f},{:.1f},{:.2f},{},{:.1f},{},{:.1f},{:.1f},{:.2f},{:.1f},{}".format(
         yaw_deg,
         pitch_deg,
         target["cx"],
@@ -2965,37 +3430,37 @@ def build_vision_frame(
         target_w,
         target_h,
         target_layer / 100.0,
+        pose_range_ms,
+        distance_source,
     )
+    return _seal_vision_frame(body)
 
 
-def build_vision_lost_frame():
-    return "{},{},0,0,0,0,0\n".format(
-        VISION_LOST_VALUE, VISION_LOST_VALUE
+def build_vision_lost_frame(reason_code=1, image_age_ms=0.0):
+    body = "{},{},{},{:.2f},0,0,0,0,0,0,0,0,0,0,0,0,0,0".format(
+        VISION_LOST_VALUE,
+        VISION_LOST_VALUE,
+        max(0, min(9, int(reason_code))),
+        max(0.0, min(1.0, image_age_ms / 1000.0)),
     )
-
-
-def calculate_fixed_laser_point(target):
-    """固定激光落点；只从目标复制距离用于现有遥测协议。"""
-    if target is None:
-        return None
-    return {
-        "x": FIXED_LASER_POINT_X_PX,
-        "y": FIXED_LASER_POINT_Y_PX,
-        "distance_m": target["distance_m"],
-    }
+    return _seal_vision_frame(body)
 
 
 def calculate_gimbal_error(target, laser_point):
-    """固定像素点到靶心的角度误差；geometry_state=12 表示直接角度。"""
+    """用当前相机内参把靶心-光斑像素差换算成真实角度。"""
     if target is None or laser_point is None:
         return None
+    fx = CAMERA_CALIBRATION["fx"]
+    fy = CAMERA_CALIBRATION["fy"]
     return {
-        "yaw_deg": (
-            target["cx"] - laser_point["x"]
-        ) * GIMBAL_ANGLE_PER_PIXEL_DEG,
-        "pitch_deg": (
-            target["cy"] - laser_point["y"]
-        ) * GIMBAL_ANGLE_PER_PIXEL_DEG,
+        "yaw_deg": math.degrees(math.atan2(
+            target["cx"] - laser_point["x"],
+            fx,
+        )),
+        "pitch_deg": math.degrees(math.atan2(
+            target["cy"] - laser_point["y"],
+            fy,
+        )),
     }
 
 
@@ -3046,6 +3511,8 @@ def send_vision_frame(
     target_w=0.0,
     target_h=0.0,
     target_layer=0,
+    pose_range_ms=0.0,
+    distance_source=0,
 ):
     """发送一帧串口数据，并返回更新后的丢靶帧时间戳。
 
@@ -3054,7 +3521,7 @@ def send_vision_frame(
     if uart is None:
         return last_lost_send_ms
 
-    # 没有新鲜三维解算时绝不使用固定点、方向投影点或上帧旧点。
+    # 没有实时亮斑或三维解算时绝不使用固定点、方向投影点或上帧旧点。
     # 404 会让 H723 进入已有的安全自稳路径。
     if target is None or gimbal_error is None:
         now_ms = time.ticks_ms()
@@ -3062,7 +3529,15 @@ def send_vision_frame(
             VISION_LOST_SEND_INTERVAL_MS
         ):
             return last_lost_send_ms
-        frame = build_vision_lost_frame()
+        if "pose_range_reject" in diagnostics:
+            lost_reason = 2
+        elif target is not None and gimbal_error is None:
+            lost_reason = 3
+        elif diagnostics.get("lost_reason") == "no_candidate":
+            lost_reason = 1
+        else:
+            lost_reason = 4
+        frame = build_vision_lost_frame(lost_reason, image_age_ms)
         uart.write(frame.encode())
         diagnostics["tx_frame"] = frame.strip()
         return now_ms
@@ -3081,6 +3556,8 @@ def send_vision_frame(
         target_w,
         target_h,
         target_layer,
+        pose_range_ms,
+        distance_source,
     )
     uart.write(frame.encode())
     diagnostics["tx_frame"] = frame.strip()
@@ -3160,7 +3637,6 @@ def new_frame_diagnostics(selected_mode):
         "inner_hold_reject": 0,
         "light_fallback": 0,
         "lost_reason": "-",
-        "target_held": 0,
         "tx_frame": "-",
         "detect_ms": 0.0,
         "display_ms": 0.0,
@@ -3191,6 +3667,8 @@ def new_frame_diagnostics(selected_mode):
         "corner_shift": 0.0,
         "spot_status": "-",
         "spot_correction": (0.0, 0.0),
+        "live_laser_status": "-",
+        "live_laser_ms": 0.0,
     }
 
 
@@ -3242,7 +3720,7 @@ def format_frame_log(
         "hi_res_search={} hi_res_raw={} "
         "hi_res_hit={} hi_res_error={} long_range={}/{} white_low={} trim={:+.1f} "
         "geom={} reproj={:.1f} refine={} corner=({},{:.2f}) "
-        "spot={} corr=({:+.2f},{:+.2f}) "
+        "spot={} corr=({:+.2f},{:+.2f}) live_spot={} spot_ms={:.1f} "
         "geom_reject={}"
     ).format(
         diagnostics["candidate_source"],
@@ -3288,12 +3766,13 @@ def format_frame_log(
         diagnostics["spot_status"],
         diagnostics["spot_correction"][0],
         diagnostics["spot_correction"][1],
+        diagnostics["live_laser_status"],
+        diagnostics["live_laser_ms"],
         diagnostics["geometry_reject"],
     )
 
     if target is None:
-        return common + " target=none held={} gimbal=({}, {})".format(
-            diagnostics["target_held"],
+        return common + " target=none gimbal=({}, {})".format(
             VISION_LOST_VALUE,
             VISION_LOST_VALUE,
         )
@@ -3305,11 +3784,10 @@ def format_frame_log(
     predicted_text = "1" if target.get("predicted") else "0"
 
     return common + (
-        " target_held={} predicted={} layer={} bbox=({},{},{},{}) "
+        " predicted={} layer={} bbox=({},{},{},{}) "
         "center=({:.2f},{:.2f}) vel_px_s={} distance_cm={:.1f} "
         "laser=({:.2f},{:.2f}) gimbal=({:+.2f},{:+.2f})"
     ).format(
-        diagnostics["target_held"],
         predicted_text,
         target["layer"],
         target["x"],
@@ -3511,6 +3989,10 @@ def main():
     display_initialized = False
     tracker = TargetTracker()
     laser_aimer = None
+    pose_range_estimator = None
+    live_laser_tracker = (
+        LiveLaserSpotTracker() if LIVE_LASER_SPOT_ENABLED else None
+    )
     snapshot_key = YbKey() if PRODUCTION_SNAPSHOT_ENABLED else None
     snapshot_last_key = False
     snapshot_dir = None
@@ -3540,6 +4022,11 @@ def main():
                 laser_aimer = PlanarLaserAimer()
             except Exception as exc:
                 print("[GEOM] disabled:", exc)
+        try:
+            pose_range_estimator = TargetRangeEstimator()
+            print("[RANGE] planar pose range ready")
+        except Exception as exc:
+            print("[RANGE] pose range disabled:", exc)
         if logger is not None:
             logger.trace(
                 "aimer-ready={}".format(1 if laser_aimer is not None else 0)
@@ -3563,7 +4050,7 @@ def main():
             height=FRAME_HEIGHT,
             chn=CAM_CHN_ID_0,
         )
-        sensor.set_pixformat(Sensor.GRAYSCALE, chn=CAM_CHN_ID_0)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
         if (
             DISPLAY_ENABLED
             or HIGH_RES_VERIFY_ENABLED
@@ -3630,7 +4117,8 @@ def main():
             image_capture_ms = time.ticks_ms()
             if frame_count == 0 and logger is not None:
                 logger.trace("first-snapshot-begin")
-            img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            color_img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            img = color_img.to_grayscale()
             if frame_count == 0 and logger is not None:
                 logger.trace("first-snapshot-done")
             high_res_img = None
@@ -3696,6 +4184,27 @@ def main():
                 frame_count,
             )
             target = tracker.update(candidates, diagnostics)
+            if target is not None:
+                range_start_ms = time.ticks_ms()
+                if update_target_pose_range(
+                    target,
+                    pose_range_estimator,
+                    diagnostics,
+                ):
+                    tracker.output = target
+                    if tracker.selected_candidate is not None:
+                        tracker.selected_candidate["distance_m"] = (
+                            target["distance_m"]
+                        )
+                    if tracker.last is not None:
+                        tracker.last["distance_m"] = target["distance_m"]
+                else:
+                    # 新策略的有效性只由位姿测距决定。位姿失败时发送 404，
+                    # 不再把旧像素距离或上一帧目标作为控制兜底。
+                    target = None
+                diagnostics["pose_range_ms"] = float(
+                    time.ticks_diff(time.ticks_ms(), range_start_ms)
+                )
             track_ms = time.ticks_diff(time.ticks_ms(), track_start_ms)
             best_candidate = tracker.selected_candidate
 
@@ -3704,11 +4213,15 @@ def main():
             predicted_target = None
             if target is None:
                 predicted_target = tracker.predict_reference(time.ticks_ms())
-            control_target = target if target is not None else predicted_target
+            control_target = target
             geometry_state = 0
             geometry_solution = None
+            laser_point = None
+            gimbal_error = None
+            live_status = "-"
             reprojection_px = 0.0
             pose_refined = 0
+            laser_spot_start_ms = time.ticks_ms()
             if GEOMETRY_LANDING_ENABLED and target is not None:
                 if laser_aimer is not None:
                     try:
@@ -3754,9 +4267,6 @@ def main():
                 else:
                     geometry_state = 11
                     diagnostics["geometry_reject"] = "aimer unavailable"
-            elif not GEOMETRY_LANDING_ENABLED and control_target is not None:
-                geometry_state = 12
-                diagnostics["geometry_reject"] = "fixed laser point"
             elif control_target is not None:
                 geometry_state = 2
                 diagnostics["geometry_reject"] = "predicted target"
@@ -3789,17 +4299,29 @@ def main():
             else:
                 diagnostics["geometry_valid"] = 0
                 diagnostics["geometry_state"] = geometry_state
-                if (
-                    not GEOMETRY_LANDING_ENABLED
-                    and control_target is not None
-                ):
-                    laser_point = calculate_fixed_laser_point(control_target)
-                    gimbal_error = calculate_gimbal_error(
-                        control_target, laser_point
+                if control_target is not None and live_laser_tracker is not None:
+                    laser_point, live_status = live_laser_tracker.update(
+                        color_img, control_target
                     )
-                else:
-                    laser_point = None
-                    gimbal_error = None
+                    diagnostics["live_laser_status"] = live_status
+                    if laser_point is not None:
+                        geometry_state = 12
+                        diagnostics["geometry_state"] = geometry_state
+                        gimbal_error = calculate_gimbal_error(
+                            control_target, laser_point
+                        )
+                        diagnostics["geometry_reject"] = "live laser spot"
+                    else:
+                        geometry_state = 13
+                        diagnostics["geometry_state"] = geometry_state
+                        diagnostics["geometry_reject"] = live_status
+                elif control_target is not None:
+                    geometry_state = 13
+                    diagnostics["geometry_state"] = geometry_state
+                    diagnostics["geometry_reject"] = "live laser disabled"
+            diagnostics["live_laser_ms"] = float(
+                time.ticks_diff(time.ticks_ms(), laser_spot_start_ms)
+            )
             pitch_trim_deg = update_pitch_trim(pitch_trim_deg, gimbal_error, tracker)
             diagnostics["pitch_trim_deg"] = pitch_trim_deg
             sent_error = apply_pitch_trim(gimbal_error, pitch_trim_deg)
@@ -3821,8 +4343,14 @@ def main():
                 tracker.vy,
                 image_age_ms,
                 geometry_state,
-                reprojection_px,
-                pose_refined,
+                (
+                    control_target.get("pose_reprojection_px", 0.0)
+                    if control_target is not None else 0.0
+                ),
+                (
+                    control_target.get("pose_range_refined", 0)
+                    if control_target is not None else 0
+                ),
                 control_target["w"] if control_target is not None else 0.0,
                 control_target["h"] if control_target is not None else 0.0,
                 (
@@ -3833,6 +4361,14 @@ def main():
                         control_target.get("layer") == "outer"
                         else 0
                     )
+                ),
+                (
+                    float(diagnostics.get("pose_range_ms", 0.0))
+                    if control_target is not None else 0.0
+                ),
+                (
+                    int(diagnostics.get("distance_source", 0))
+                    if control_target is not None else 0
                 ),
             )
             diagnostics["tx_ms"] = float(
@@ -3881,7 +4417,11 @@ def main():
                     else (
                         predicted_target
                         if predicted_target is not None
-                        else best_candidate
+                        else (
+                            best_candidate
+                            if best_candidate is not None
+                            else (candidates[0] if candidates else None)
+                        )
                     )
                 )
                 if (
@@ -3925,6 +4465,12 @@ def main():
                     try:
                         if overlay_candidate is None:
                             target_text = "target none"
+                        elif target is None:
+                            target_text = "candidate {} ({:.0f},{:.0f})".format(
+                                overlay_candidate["layer"],
+                                overlay_candidate["cx"],
+                                overlay_candidate["cy"],
+                            )
                         else:
                             target_text = "target {} ({:.0f},{:.0f})".format(
                                 overlay_candidate["layer"],
@@ -4126,6 +4672,9 @@ def run_test_mode():
     display_initialized = False
     key = YbKey()
     tracker = TargetTracker()
+    live_laser_tracker = (
+        LiveLaserSpotTracker() if LIVE_LASER_SPOT_ENABLED else None
+    )
     clock = time.clock()
     frame_count = 0
     mean_brightness = 0
@@ -4160,7 +4709,7 @@ def run_test_mode():
             height=FRAME_HEIGHT,
             chn=CAM_CHN_ID_0,
         )
-        sensor.set_pixformat(Sensor.GRAYSCALE, chn=CAM_CHN_ID_0)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
         sensor.set_framesize(
             width=HIGH_RES_WIDTH,
             height=HIGH_RES_HEIGHT,
@@ -4184,7 +4733,8 @@ def run_test_mode():
         while True:
             os.exitpoint()
             clock.tick()
-            img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            color_img = sensor.snapshot(chn=CAM_CHN_ID_0)
+            img = color_img.to_grayscale()
             gray = img
             high_res_img = None
             if (TEST_DISPLAY_ENABLED or HIGH_RES_VERIFY_ENABLED) and (
@@ -4229,10 +4779,18 @@ def run_test_mode():
             prediction_target = (
                 target if target is not None else best_candidate
             )
-            laser_point = calculate_fixed_laser_point(prediction_target)
-            gimbal_error = calculate_gimbal_error(
-                prediction_target, laser_point
-            )
+            live_status = "-"
+            if prediction_target is not None and live_laser_tracker is not None:
+                laser_point, live_status = live_laser_tracker.update(
+                    color_img, prediction_target
+                )
+                gimbal_error = calculate_gimbal_error(
+                    prediction_target, laser_point
+                )
+            else:
+                laser_point = None
+                gimbal_error = None
+            diagnostics["live_laser_status"] = live_status
             pitch_trim_deg = update_pitch_trim(
                 pitch_trim_deg,
                 gimbal_error if target is not None else None,
@@ -4250,6 +4808,9 @@ def run_test_mode():
                 last_lost_send_ms,
                 tracker.vx,
                 tracker.vy,
+                geometry_state=(
+                    12 if live_laser_tracker is not None else 0
+                ),
             )
 
             key_pressed = key.is_pressed() == 1

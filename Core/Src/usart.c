@@ -81,7 +81,7 @@ void MX_USART10_UART_Init(void)
 }
 
 /* ---------------------------------------------------------------------------
- * UART7 引脚对管理（底盘状态链路用）
+ * UART7 引脚对管理（F103 底盘遥测链路用）
  *
  * 为什么需要这个：板子上 UART7 接插件只标了 "UART7"，
  * 而 STM32H723VGT6(LQFP100) 上 UART7 有两组可用引脚（都是 AF11）：
@@ -119,6 +119,11 @@ void UART7_BindPins(uint8_t pair)
   GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull      = GPIO_PULLUP;
   GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  /*
+   * PE7/PE8 use AF7 on STM32H723.  Older 11.4 code had AF11 here, which
+   * silently prevented F103 chassis telemetry from reaching the UART.
+   * The alternate UART7 pin pairs use AF11.
+   */
   GPIO_InitStruct.Alternate = (pair == UART7_PAIR_PE)
                               ? GPIO_AF7_UART7 : GPIO_AF11_UART7;
 
@@ -192,7 +197,9 @@ void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 921600;
+  /* K230 ASCII vision link: old verified baud rate; 921600 showed heavy
+   * character corruption on the current wiring and left only ~5 good frames/s. */
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;

@@ -7,7 +7,7 @@
 /* ==========================================================================
  *  通信口 (USART1: PA9 = TX, PA10 = RX)
  * --------------------------------------------------------------------------
- *  周期遥测使用 16 字节固定二进制帧, 50 Hz 发送给 H723。
+ *  周期遥测使用 22 字节固定二进制帧, 50 Hz 发送给 H723。
  *  启动阶段仍保留少量文本诊断; 接收端按 AA 55 帧头重同步即可。
  * ========================================================================== */
 
@@ -20,8 +20,8 @@
 /* 1 = 保留 2 秒一次的文本寄存器诊断, 正常联调时关闭 */
 #define LINK_DEBUG_TEXT_TELEMETRY       0
 
-#define LINK_CHASSIS_FRAME_SIZE   16u
-#define LINK_CHASSIS_VERSION      1u
+#define LINK_CHASSIS_FRAME_SIZE   22u
+#define LINK_CHASSIS_VERSION      5u
 #define LINK_CHASSIS_TYPE         0x31u
 
 /* phase 字段 */
@@ -30,6 +30,12 @@
 #define LINK_PHASE_TURNING        2u
 #define LINK_PHASE_TURN_EXIT      3u
 #define LINK_PHASE_FAULT          4u
+
+/* distance_zone 字段 */
+#define LINK_DISTANCE_UNKNOWN      0u
+#define LINK_DISTANCE_NEAR         1u
+#define LINK_DISTANCE_FAR          2u
+#define LINK_DISTANCE_TRANSITION   3u
 
 /* flags 字段 */
 #define LINK_FLAG_CONTROL_VALID   0x01u
@@ -48,12 +54,16 @@ void Link_SendBytes(const uint8_t *data, uint16_t len);
 /* CRC16-CCITT-FALSE: init=0xFFFF, poly=0x1021, refin=false, refout=false */
 uint16_t Link_Crc16CcittFalse(const uint8_t *data, uint16_t len);
 
-/* 组装并发送一帧 16 字节底盘状态 */
+/* 组装并发送一帧 22 字节底盘状态 */
 void Link_SendChassisFrame(uint16_t seq,
                            uint8_t phase,
                            int8_t turn_dir,
                            uint8_t flags,
-                           uint32_t chassis_ms);
+                           uint8_t distance_zone,
+                           int16_t speed_mm_s,
+                           int16_t yaw_rate_deci_dps,
+                           uint8_t corner_count,
+                           uint32_t sample_ms);
 
 /* 格式化输出(只用整数和字符串格式, 不依赖 printf 浮点支持) */
 void Link_Printf(const char *fmt, ...);

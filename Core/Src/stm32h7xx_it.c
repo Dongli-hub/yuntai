@@ -299,13 +299,10 @@ void USART1_IRQHandler(void)
 /**
   * @brief This function handles UART7 global interrupt.
   *
-  * 2026-10-06：K230 链路从 USART1 换到 UART7（K230 IO9/IO10 接的就是 UART7）。
-  * 道理和上面 USART1 那段完全一样：
-  *   gimbal_link_rx_isr() 先用 RDR 清掉 RXNE，再把中断交给 HAL 处理发送。
-  *
-  * 注意：gimbal_link.c 里只 enable 了 UART7 的 RXNE 中断，
-  * TXE 中断是 HAL_UART_Transmit_IT() 自己开的，所以这里必须调用
-  * HAL_UART_IRQHandler()，否则 TXE 会无限重复触发把主循环饿死。
+ * UART7 当前承载 F103 底盘的 22 字节 v5 二进制遥测。接收由
+  * HAL_UARTEx_ReceiveToIdle_IT()/HAL_UART_IRQHandler() 处理；K230 视觉链路
+  * 保持在 USART1。这里仍必须调用 HAL_UART_IRQHandler()，让 HAL 完成
+  * IDLE/RXNE/错误中断的状态机推进。
   */
 void UART7_IRQHandler(void)
 {

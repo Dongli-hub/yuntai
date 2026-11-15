@@ -35,7 +35,6 @@
 #define TRACK_WHEEL_BASE_M          0.115f
 
 #define TRACK_TURN_LAG_SEC          0.20f
-#define TRACK_TURN_STOP_LEAD_SEC    0.08f
 #define TRACK_TURN_FAIL_RAD         (130.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_WRONG_RAD        (-15.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_TIMEOUT_SEC      5.0f
@@ -43,13 +42,13 @@
 
 #define TRACK_HEADING_TRIM_TAU_SEC  0.8f
 #define TRACK_HEADING_TRIM_ERROR_MM (1.0f * TRACK_PROBE_SPACING_MM)
-
-#define TRACK_POST_TURN_RAMP_SEC     0.80f
-#define TRACK_POST_TURN_KP_SCALE     0.60f
-#define TRACK_POST_TURN_KD_SCALE     1.25f
-#define TRACK_POST_TURN_KI_SCALE     0.25f
-#define TRACK_POST_TURN_KH_SCALE     0.50f
-#define TRACK_POST_TURN_W_LIMIT      0.80f
+#define TRACK_START_RAMP_SEC        1.20f
+#define TRACK_POST_TURN_RAMP_SEC    0.80f
+#define TRACK_POST_TURN_KP_SCALE    0.60f
+#define TRACK_POST_TURN_KD_SCALE    1.25f
+#define TRACK_POST_TURN_KI_SCALE    0.25f
+#define TRACK_POST_TURN_KH_SCALE    0.50f
+#define TRACK_POST_TURN_W_LIMIT     0.80f
 
 #define TRACK_LINE_LOST_SPEED_MPS   0.080f
 #define TRACK_LINE_LOST_TIMEOUT_SEC 0.20f
@@ -86,7 +85,6 @@ static float line_error_prev_mm;
 static float line_derivative_mm_s;
 static float line_integral_mm_s;
 static float last_line_error_mm;
-static uint8_t post_turn_ramp_active;
 
 static float body_heading_rad;
 static float line_direction_rad;
@@ -113,6 +111,10 @@ static float turn_target_deg;
 static float turn_angle_rad;
 static float turn_elapsed_s;
 static float turn_arc_m;
+static uint8_t route_corner_count;
+static float initial_ramp_time_s;
+static uint8_t initial_ramp_done;
+static uint8_t post_turn_ramp_active;
 
 static uint8_t last_turn_valid;
 static float last_turn_arc_cm;
@@ -256,6 +258,7 @@ static void track_enter_line(void)
     lost_time_s = 0.0f;
     corner_confirm = 0u;
     line_redetect = 0u;
+    post_turn_ramp_active = 0u;
     track_reset_line_filter();
 }
 
@@ -265,6 +268,8 @@ static void track_enter_pre_turn(int8_t dir)
     state_time_s = 0.0f;
     state_distance_m = 0.0f;
     corner_confirm = 0u;
+    initial_ramp_done = 1u;
+    post_turn_ramp_active = 0u;
     /*
      * track_corner(): 左=-1, 右=+1。
      * v/w 差速约定: 左转 w>0, 右转 w<0。这里转换成角速度符号。
@@ -297,9 +302,14 @@ static void track_enter_lost(void)
 static void track_stop(void)
 {
     state = TRACK_STOP;
+    post_turn_ramp_active = 0u;
     body_v_mps = 0.0f;
     body_w_rad_s = 0.0f;
-    post_turn_ramp_active = 0u;
+    measured_v_mps = 0.0f;
+    left_delta_m = 0.0f;
+    right_delta_m = 0.0f;
+    last_odo_l_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_LEFT);
+    last_odo_r_cm = (uint32_t)Motor_GetDistanceCm(MOTOR_RIGHT);
     Motor_Stop();
 }
 
@@ -325,7 +335,7 @@ static float track_update_odometry(float dt)
 
     last_odo_l_cm = odo_l;
     last_odo_r_cm = odo_r;
-    left_delta_m  = (float)delta_l_cm * 0.01f;
+    left_delta_m = (float)delta_l_cm * 0.01f;
     right_delta_m = (float)delta_r_cm * 0.01f;
 
     raw_v = 0.5f * (left_delta_m + right_delta_m) / dt;
@@ -417,8 +427,24 @@ void Track_Update(void)
     w_accel = TRACK_LINE_W_ACCEL_RAD2;
     state_time_s += dt;
 
+    if ((state == TRACK_LINE) && (normal != 0u) &&
+        (initial_ramp_done == 0u)) {
+        float x;
+        float smooth;
+
+        initial_ramp_time_s += dt;
+        x = initial_ramp_time_s / TRACK_START_RAMP_SEC;
+        if (x >= 1.0f) {
+            x = 1.0f;
+            initial_ramp_done = 1u;
+        }
+        smooth = x * x * (3.0f - 2.0f * x);
+        target_v = TRACK_STRAIGHT_MPS * smooth;
+    }
+
     if ((state == TRACK_LINE) && (post_turn_ramp_active != 0u)) {
         float ramp = state_time_s / TRACK_POST_TURN_RAMP_SEC;
+
         if (ramp >= 1.0f) {
             ramp = 1.0f;
             post_turn_ramp_active = 0u;
@@ -559,11 +585,12 @@ void Track_Update(void)
             return;
         }
 
-        if ((turn_angle_rad +
-             fmaxf(signed_gyro, 0.0f) * TRACK_TURN_STOP_LEAD_SEC) >=
-            (TRACK_PI * 0.5f)) {
+        if (turn_angle_rad >= (TRACK_PI * 0.5f)) {
             line_direction_rad += (float)turn_dir * TRACK_PI * 0.5f;
             track_record_turn();
+            if (route_corner_count < 255u) {
+                route_corner_count++;
+            }
             track_enter_line();
             post_turn_ramp_active = 1u;
             target_v = TRACK_TURN_MPS;
@@ -622,7 +649,6 @@ void Track_Init(void)
     line_derivative_mm_s = 0.0f;
     line_integral_mm_s = 0.0f;
     last_line_error_mm = 0.0f;
-    post_turn_ramp_active = 0u;
     body_heading_rad = 0.0f;
     line_direction_rad = 0.0f;
     heading_trim_rad = 0.0f;
@@ -644,6 +670,10 @@ void Track_Init(void)
     turn_angle_rad = 0.0f;
     turn_elapsed_s = 0.0f;
     turn_arc_m = 0.0f;
+    route_corner_count = 0u;
+    initial_ramp_time_s = 0.0f;
+    initial_ramp_done = 0u;
+    post_turn_ramp_active = 0u;
     last_turn_valid = 0u;
     last_turn_arc_cm = 0.0f;
     last_turn_yaw_deg = 0.0f;
@@ -708,6 +738,23 @@ float Track_GetRightTargetMps(void)
 uint8_t Track_IsTurnExitActive(void)
 {
     return post_turn_ramp_active;
+}
+
+uint8_t Track_GetRouteCornerCount(void)
+{
+    return route_corner_count;
+}
+
+uint8_t Track_GetDistanceZone(void)
+{
+    switch (route_corner_count & 3u) {
+    case 0u:
+        return LINK_DISTANCE_NEAR;
+    case 2u:
+        return LINK_DISTANCE_FAR;
+    default:
+        return LINK_DISTANCE_TRANSITION;
+    }
 }
 
 void Track_PrintLastTurn(void)
