@@ -35,6 +35,10 @@
 #define TRACK_WHEEL_BASE_M          0.115f
 
 #define TRACK_TURN_LAG_SEC          0.20f
+/* Field calibration: both left and right turns finished about 20 mm outside
+ * the new line.  Advance the turn entry by the same distance; steady-state
+ * radius and wheel speed remain unchanged. */
+#define TRACK_TURN_LEAD_EXTRA_M     0.020f
 #define TRACK_TURN_FAIL_RAD         (130.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_WRONG_RAD        (-15.0f * TRACK_DEG_TO_RAD)
 #define TRACK_TURN_TIMEOUT_SEC      5.0f
@@ -541,6 +545,7 @@ void Track_Update(void)
         target_v = TRACK_TURN_MPS;
         target_w = 0.0f;
         remaining = TRACK_SENSOR_AHEAD_M - TRACK_RADIUS_M -
+                    TRACK_TURN_LEAD_EXTRA_M -
                     turn_lead - state_distance_m;
 
         if ((remaining <= 0.0f) &&
