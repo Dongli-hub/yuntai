@@ -109,7 +109,6 @@ DISPLAY_DRAW_RAW_RECTANGLES = False
 DISPLAY_DRAW_FINAL_TARGET = False
 DISPLAY_DRAW_LASER_PREDICTION = False
 DISPLAY_DRAW_TARGET_TEXT = False
-DISPLAY_USE_GRAYSCALE_PREVIEW = False
 
 # 这版使用旧仓库验证过的 115200；当前线束在 921600 下校验错误率过高。
 UART_BAUDRATE = 115200
@@ -4125,7 +4124,7 @@ def main():
             # 通道 1 只用于屏幕预览，且高分辨率复核已关闭，
             # 因此每帧取该通道是纯开销；每隔 N 帧取一次
             # 已足够提供人眼可读的预览。
-            if HIGH_RES_VERIFY_ENABLED and (
+            if (DISPLAY_ENABLED or HIGH_RES_VERIFY_ENABLED) and (
                 frame_count % DISPLAY_EVERY_N_FRAMES == 0
             ):
                 high_res_img = sensor.snapshot(chn=CAM_CHN_ID_1)
@@ -4396,18 +4395,11 @@ def main():
                     snapshot_index += 1
                 snapshot_last_key = snapshot_pressed
 
-            # 角点调试图直接使用检测通道的灰度帧，避免依赖通道 1 预览。
-            if DISPLAY_ENABLED:
+            # 只有本帧实际获取了通道 1 图像时才绘制，
+            # 否则 high_res_img 为空，没有可绘制的画面。
+            if DISPLAY_ENABLED and high_res_img is not None:
                 stage_ms = time.ticks_ms()
-                if DISPLAY_USE_GRAYSCALE_PREVIEW:
-                    display_img = img
-                    display_scale = 1.0
-                elif high_res_img is not None:
-                    display_img = high_res_img
-                    display_scale = HIGH_RES_WIDTH / FRAME_WIDTH
-                else:
-                    display_img = None
-                    display_scale = 1.0
+                display_scale = HIGH_RES_WIDTH / FRAME_WIDTH
                 # 绘制用于计算瞄准点的同一目标，使屏幕上的框中心
                 # 与瞄准点完全重合；当激光位于靶心时，
                 # 两者也应对应。
@@ -4424,22 +4416,14 @@ def main():
                         )
                     )
                 )
-                if (
-                    display_img is not None
-                    and DISPLAY_DRAW_RAW_RECTANGLES
-                    and raw_rectangles
-                ):
+                if DISPLAY_DRAW_RAW_RECTANGLES and raw_rectangles:
                     for corners in raw_rectangles:
                         draw_raw_rectangle(
-                            display_img,
+                            high_res_img,
                             corners,
                             display_scale,
                         )
-                if (
-                    display_img is not None
-                    and DISPLAY_DRAW_FINAL_TARGET
-                    and overlay_candidate is not None
-                ):
+                if DISPLAY_DRAW_FINAL_TARGET and overlay_candidate is not None:
                     if target is not None:
                         outline_color = (0, 255, 0)      # 已锁定
                     elif predicted_target is not None or tracker.state in (
@@ -4451,17 +4435,17 @@ def main():
                     else:
                         outline_color = (255, 0, 0)      # 无候选
                     draw_candidate(
-                        display_img,
+                        high_res_img,
                         overlay_candidate,
                         target is not None,
                         display_scale,
                         color=outline_color,
                     )
-                if display_img is not None and DISPLAY_DRAW_LASER_PREDICTION:
+                if DISPLAY_DRAW_LASER_PREDICTION:
                     draw_laser_prediction(
-                        display_img, laser_point, display_scale
+                        high_res_img, laser_point, display_scale
                     )
-                if display_img is not None and DISPLAY_DRAW_TARGET_TEXT:
+                if DISPLAY_DRAW_TARGET_TEXT:
                     try:
                         if overlay_candidate is None:
                             target_text = "target none"
@@ -4477,7 +4461,7 @@ def main():
                                 overlay_candidate["cx"],
                                 overlay_candidate["cy"],
                             )
-                        display_img.draw_string(
+                        high_res_img.draw_string(
                             8,
                             8,
                             target_text,
@@ -4485,8 +4469,7 @@ def main():
                         )
                     except Exception:
                         pass
-                if display_img is not None:
-                    Display.show_image(display_img)
+                Display.show_image(high_res_img)
                 diagnostics["display_ms"] = float(
                     time.ticks_diff(time.ticks_ms(), stage_ms)
                 )

@@ -135,7 +135,6 @@ int main(void)
    * 顺序不能反：链路的 UART7 接收中断/发送通道要先就绪，
    * 否则云台启动日志发不出去（表现为上位机一直收不到 GIMBAL_STATE）。 */
   gimbal_link_init();
-  chassis_link_init();
   yuntai_init();
   Board_IwdgStart();
   /* USER CODE END 2 */

@@ -194,18 +194,20 @@
  *       pid + (-1)×(damp×(gyro-off_rate) + match×off_rate)
  *     = pid - damp×gyro + (damp-match)×off_rate
  *   ⇒ 要复刻 bf3bf46：damp=66.85、match=0（上面的 off_rate 系数正好=66.85）。*/
-/* Legacy one-loop gains are retained only for the compile-time rollback path. */
+/* ⚠ 2026-10-13（52 号日志后）：200 → **300**。"转底盘时电机跟不上"是刚度不够：
+ *   刚度 = 角度环KP × 速率环Kp = 300×25 = 7.5 A/rad（原来 5.0，参考代码 5.0）。
+ *   注意**抬 KP 只加"位置刚度"、不加"速率反馈"**（速率反馈 = kp_rate×(damp+9.549)），
+ *   所以它不会把刚压下去的高频抖重新引回来 —— 这正是现在最该动的那一个旋钮。
+ *   0x18 在线可改（30000 = 300）。*/
 #define YAW_KP                 300.0f   /* rpm/rad（0x18 可在线改） */
 #define YAW_KI                  15.0f   /* rpm/(rad*s)（0x19；2026-10-25 30->15） */
 #define YAW_KD                  10.0f   /* rpm/(rad/s)（0x1A；微分已加 5ms 低通） */
-#define YAW_OUT_RPM              50.0f  /* 参考工程安全速度上限，约 300°/s */
-#define YAW_TWO_LOOP_KPOS         8.0f  /* °/s per ° */
-#define YAW_TWO_LOOP_KRATE        7.0f
-#define YAW_TWO_LOOP_POS_RATE_MAX 40.0f
-#define YAW_TWO_LOOP_RATE_KI      40.0f
-#define YAW_TWO_LOOP_RATE_I_MAX   60.0f
-#define YAW_TWO_LOOP_RATE_I_ZONE  3.0f
-#define YAW_TWO_LOOP_CHASSIS_FF   1.0f
+/* ⚠ 2026-10-11 深夜(31)：50 -> 80 rpm（约 480°/s）。不改这个数的话，前馈
+ *   (66.85 rpm/(rad/s)) 在底盘转速 >43°/s 时**自己就把指令顶到限幅**，环路
+ *   退化成 bang-bang —— 掠射位姿下这种"一顿一顿"最要命。抬到 80 之后，
+ *   前馈保持线性到 ~69°/s 的底盘转速；真需要更快时电机自己会先饱和。
+ *   限幅同时是"跑飞保护"的一环，所以别超过电机实际能跟上的量级。*/
+#define YAW_OUT_RPM             120.0f  /* 输出限幅；约 720°/s 的补偿能力 */
 /* ⚠ 2026-09-30 现场事故：这里原来是 1.0，而 ki=30 -> 积分单独就能给出 30rpm，
  *   是"能推动轴的最小转速"（≈10rpm）的 3 倍。后果：只要有一点点残余误差
  *   （陀螺零偏残留、基准误差），积分就会顶到限幅、**把轴慢慢推着匀速转** ——
@@ -303,13 +305,7 @@
  *       (0x12, 955)  = 反符号试试（若陀螺/编码器方向约定与上面不符）*/
 #define YAW_BASE_FF_RPM_PER_RADS (-9.55f)
 #define YAW_FF_SIGN            (-1.0f)
-/* The chassis turn is V/R = 0.14/0.062 = 2.26 rad/s. Keep enough
- * range for the local gyro/encoder estimate to represent that motion
- * without flattening the feed-forward for most of the turn. */
-#define YAW_BASE_RATE_LIMIT_RADS  3.00f
-#define YAW_BASE_RATE_FILTER_ALPHA_NORMAL 0.02f
-#define YAW_BASE_RATE_FILTER_ALPHA_TURN   0.10f
-#define YAW_BASE_FF_LIMIT_MA      1200.0f
+#define YAW_BASE_RATE_LIMIT_RADS  0.60f
 
 /* ---- 偏航静摩擦补偿（2026-09-30 新增）----
  * 现场逐帧实测：视觉环给出 1.5° 的目标变化时，平台 0.7 秒只走了 0.34° ——
@@ -683,8 +679,9 @@ static float g_yaw_rate_damp  = YAW_RATE_DAMP_RPM_PER_RADS;  /* 可在线改 0x1
  *   有延迟，两者相减就冒出一个假的"底盘转速"，前馈于是**变成正反馈**，越喂越振。
  *   ⇒ 想再启用必须把估计器做得更慢（现在 τ≈50ms）并现场验证 wb= 静止时不翻。
  *   默认 0 = 关；想试 (0x12, 50)；符号反了就发负值。*/
-/* Chassis feed-forward gain in A/(rad/s). It is proportional to the
- * locally estimated base rate and has a separate final current limit. */
+/* 2026-10-27: small chassis feedforward for the near->far start transient.
+ * Keep it conservative because the base estimate still contains some
+ * platform self-motion. */
 static float g_yaw_base_ff    = 0.4f;
 static float g_yaw_base_rate  = 0.0f;            /* 估计的底盘角速度（rad/s，给日志看）*/
 static float   g_mot_rate_f;                     /* 电机相对转速估计（rad/s，位置差分+低通）*/
@@ -1265,18 +1262,6 @@ static uint8_t ref_chassis_phase_is_turning(int8_t phase)
     );
 }
 
-/* Chassis turn handling: keep the normal visual position loop and preserve
- * the target's world-bearing rate as feed-forward while the car advances
- * around the corner. */
-#define VIS_TURN_YAW_SCALE          1.00f
-#define VIS_TURN_EXIT_SETTLE_MS     300u
-#define VIS_TURN_TRACK_BETA             0.05f
-#define VIS_TURN_TARGET_RATE_LIMIT_DPS  25.0f
-#define VIS_TURN_TARGET_RATE_TAU_S       0.070f
-#define VIS_TURN_TARGET_RATE_SLEW_DPS    3.0f
-#define VIS_TURN_TARGET_RATE_RECOVERY_MS 400u
-#define VIS_DIRECT_TARGET_SLEW_DPS       180.0f
-
 typedef struct
 {
     uint32_t ms;
@@ -1314,9 +1299,6 @@ static float   g_vis_yaw_applied_rate_dps;        /* 内环角速度前馈 */
 static float   g_vis_latency_ms;
 static float   g_vis_yaw_angle_deg;               /* 累计视觉偏置角 */
 static float   g_vis_pitch_angle_deg;
-static float   g_vis_pitch_target_motor_deg;
-static float   g_vis_pitch_applied_rate_dps;
-static uint8_t g_vis_pitch_target_valid;
 static float   g_vis_jump_yaw_deg;
 static float   g_vis_jump_pitch_deg;
 static uint8_t g_vis_jump_pending;
@@ -1779,7 +1761,7 @@ static uint8_t vis_track_update(VisAlphaBeta_t *tracker, float measured,
         rate_residual = clampf(residual,
                                -VIS_TRACK_RATE_CLIP_DEG,
                                VIS_TRACK_RATE_CLIP_DEG);
-        tracker->rate += beta * rate_residual / dt;
+        tracker->rate += VIS_TRACK_BETA * rate_residual / dt;
         tracker->rate = clampf(tracker->rate,
                                -VIS_TRACK_MAX_RATE_DPS,
                                VIS_TRACK_MAX_RATE_DPS);
@@ -1787,80 +1769,6 @@ static uint8_t vis_track_update(VisAlphaBeta_t *tracker, float measured,
         tracker->ms = capture_ms;
     }
     return 0u;
-}
-
-static float vis_turn_target_rate(float raw_rate_dps, float frame_dt,
-                                  uint32_t now)
-{
-    float alpha;
-    float next;
-    float step;
-
-    frame_dt = clampf(frame_dt, 0.001f, 0.100f);
-    if (g_vis_turn_active != 0u)
-    {
-        /* The position tracker remains unchanged; only the velocity learned
-         * from a fast-rotating corner is made conservative. */
-        if (g_vis_turn_rate_filter_valid == 0u)
-        {
-            g_vis_turn_target_rate_dps = clampf(
-                g_vis_yaw_applied_rate_dps,
-                -VIS_TURN_TARGET_RATE_LIMIT_DPS,
-                VIS_TURN_TARGET_RATE_LIMIT_DPS
-            );
-            g_vis_turn_rate_filter_valid = 1u;
-            return g_vis_turn_target_rate_dps;
-        }
-        alpha = frame_dt / (VIS_TURN_TARGET_RATE_TAU_S + frame_dt);
-        next = g_vis_turn_target_rate_dps +
-               alpha * (raw_rate_dps - g_vis_turn_target_rate_dps);
-        step = clampf(next - g_vis_turn_target_rate_dps,
-                      -VIS_TURN_TARGET_RATE_SLEW_DPS,
-                      VIS_TURN_TARGET_RATE_SLEW_DPS);
-        g_vis_turn_target_rate_dps = clampf(
-            g_vis_turn_target_rate_dps + step,
-            -VIS_TURN_TARGET_RATE_LIMIT_DPS,
-            VIS_TURN_TARGET_RATE_LIMIT_DPS
-        );
-        return g_vis_turn_target_rate_dps;
-    }
-
-    if (g_vis_turn_rate_filter_valid != 0u)
-    {
-        uint32_t elapsed = now - g_vis_turn_rate_recover_ms;
-        if (elapsed < VIS_TURN_TARGET_RATE_RECOVERY_MS)
-        {
-            float blend = (float)elapsed /
-                          (float)VIS_TURN_TARGET_RATE_RECOVERY_MS;
-            alpha = frame_dt / (0.050f + frame_dt);
-            g_vis_turn_target_rate_dps +=
-                alpha * (raw_rate_dps - g_vis_turn_target_rate_dps);
-            return g_vis_turn_target_rate_dps +
-                   blend * (raw_rate_dps - g_vis_turn_target_rate_dps);
-        }
-        g_vis_turn_rate_filter_valid = 0u;
-    }
-    return raw_rate_dps;
-}
-
-static void vis_direct_yaw_target_step(float target_offset_deg,
-                                       float frame_dt)
-{
-    float max_step = VIS_DIRECT_TARGET_SLEW_DPS * frame_dt;
-    float target_delta = vis_wrap_pm180_deg(
-        target_offset_deg - g_vis_yaw_angle_deg
-    );
-    float target_step = clampf(target_delta, -max_step, max_step);
-
-    if (fabsf(target_step) < 0.01f)
-    {
-        target_step = 0.0f;
-    }
-    g_vis_yaw_angle_deg = clampf(
-        g_vis_yaw_angle_deg + target_step,
-        -g_vis_limyaw_deg, g_vis_limyaw_deg
-    );
-    g_vis_yaw_rate_dps = target_step / frame_dt;
 }
 
 static float vis_k_px_deg(const GimbalCmd_t *cmd)
@@ -1899,13 +1807,6 @@ static void vis_outer_reset(void)
     g_vis_yaw_error_deg = 0.0f;
     g_vis_pitch_error_deg = 0.0f;
     g_vis_yaw_applied_rate_dps = 0.0f;
-    g_vis_pitch_applied_rate_dps = 0.0f;
-    g_vis_pitch_target_motor_deg = 0.0f;
-    g_vis_pitch_target_valid = 0u;
-    g_vis_turn_target_rate_dps = 0.0f;
-    g_vis_turn_rate_filter_valid = 0u;
-    g_vis_turn_rate_prev_active = 0u;
-    g_vis_turn_rate_recover_ms = 0u;
     g_vis_latency_ms = 0.0f;
     g_vis_yaw_angle_deg = 0.0f;
     g_vis_pitch_angle_deg = 0.0f;
@@ -2401,8 +2302,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
     {
         float raw_yaw_deg;
         float raw_pitch_deg;
-        float raw_yaw_error_deg;
-        float predicted_target_offset_deg;
         float yaw_deg;
         float pitch_deg;
         float yaw_measure_deg;
@@ -2518,7 +2417,6 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             }
         }
         {
-            float raw_yaw_rate_dps;
             float predicted_yaw = vis_track_predict(
                 yaw_tracker, now, g_vehicle_yaw_cum_deg,
                 &g_vis_yaw_applied_rate_dps
@@ -2531,16 +2429,9 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
             float target_motor_pitch =
                 predicted_elevation - imuAngle[1] * 57.29578f;
 
-            raw_yaw_error_deg = vis_wrap_pm180_deg(
+            yaw_deg = vis_wrap_pm180_deg(
                 predicted_yaw - imuAngle[0] * 57.29578f
             );
-            predicted_target_offset_deg = angle_diff_rad(
-                predicted_yaw / 57.29578f, g_yaw_lock_rad
-            ) * 57.29578f;
-            yaw_deg = raw_yaw_error_deg;
-            g_vis_pitch_target_motor_deg = target_motor_pitch;
-            g_vis_pitch_applied_rate_dps = predicted_pitch_rate;
-            g_vis_pitch_target_valid = (uint8_t)(mode == GP_MODE_AIM);
             pitch_deg = vis_wrap_pm180_deg(
                 target_motor_pitch - g_pitch_fb.cont
             );
@@ -2585,22 +2476,10 @@ static void vis_outer_step(const GimbalCmd_t *cmd, uint8_t mode,
                 &g_vis_track_pitch, now, g_vehicle_yaw_cum_deg,
                 &ignored_rate
             );
-            vis_direct_yaw_target_step(
-                angle_diff_rad(
-                    predicted_yaw / 57.29578f, g_yaw_lock_rad
-                ) * 57.29578f,
-                (float)g_ctrl_period_ms * 0.001f
-            );
-            g_vis_pitch_target_motor_deg =
-                predicted_elevation - imuAngle[1] * 57.29578f;
-            g_vis_pitch_applied_rate_dps = predicted_pitch_rate;
-            g_vis_pitch_target_valid = (uint8_t)(mode == GP_MODE_AIM);
         }
         else
         {
             g_vis_yaw_applied_rate_dps = 0.0f;
-            g_vis_pitch_applied_rate_dps = 0.0f;
-            g_vis_pitch_target_valid = 0u;
         }
     }
 }
@@ -3092,8 +2971,6 @@ static void yuntai_lock_reference(void)
     g_mot_rate_f = 0.0f;
     g_yaw_base_rate = 0.0f;
     g_yaw_pos_ms = 0u;
-    g_yaw_rate_i_dps = 0.0f;
-    g_yaw_out_saturated = 0;
 
     g_yaw_fb.zero       = g_yaw_fb.cont;     /* 相对偏航角从这里开始算 0 */
     g_pitch_fb.zero     = g_pitch_fb.cont;
@@ -3373,17 +3250,14 @@ static void yuntai_control(uint32_t now)
         {
             vis_outer_reset();
         }
-        g_yaw_rate_i_dps = 0.0f;
-        g_yaw_out_saturated = 0;
     }
 
-    /* ---- 主动查一次俯仰位置（10ms = 100Hz）----
+    /* ---- 主动查一次俯仰位置（1ms = 1kHz）----
      * 为什么不能只靠驱动器"主动上报"：上报周期由驱动器决定、我们看不见也改不了。
      * 一旦它偏慢（比如 50ms），位置环就等于多了 25~50ms 的纯延迟 ——
      * 位置环的自激（掰一下开始抖、手扶就稳）几乎都是这么来的。
-     * 恢复首次延迟补偿版本的 100Hz 查询，避免 1kHz 位置量化噪声经
-     * 速度模式 PID 的 D 项放大成高频颤动。 */
-    if ((now - g_last_read_ms) >= 10u)
+     * 主动查询把反馈延迟钉死在 1ms 以内，并与位置环同频。 */
+    if ((now - g_last_read_ms) >= 1u)
     {
         g_last_read_ms = now;
         jc_read_position(&hfdcan2, YUNTAI_MOTOR_PITCH_ID);
@@ -3429,7 +3303,6 @@ static void yuntai_control(uint32_t now)
 
     /* ---- 视觉外环：角度误差 -> 视觉目标角 ---- */
     yuntai_mark_stage(32u);
-    vis_turn_state_update(now);
     vis_outer_step(cmd, mode, now);
 
     /* ======================================================================
@@ -3438,8 +3311,6 @@ static void yuntai_control(uint32_t now)
     yuntai_mark_stage(33u);
     if ((mode == GP_MODE_UNWIND) && (g_yaw_fb.seen != 0u))
     {
-        g_yaw_rate_i_dps = 0.0f;
-        g_yaw_out_saturated = 0;
         /* 解绕：暂时不用 IMU，改用电机自己的编码器，把相对角慢慢转回 0。
          * 此时激光已关、也没有瞄准要求，所以绝对指向漂掉没关系。 */
         float rel_deg = g_yaw_fb.cont - g_yaw_fb.zero;
@@ -3475,8 +3346,6 @@ static void yuntai_control(uint32_t now)
     else if (mode == GP_MODE_ESTOP)
     {
         PID_Reset(&g_yaw_pid);
-        g_yaw_rate_i_dps = 0.0f;
-        g_yaw_out_saturated = 0;
         yaw_rpm = 0.0f;
     }
     else
@@ -3504,16 +3373,16 @@ static void yuntai_control(uint32_t now)
             float visual_rate_dps =
                 (mode == GP_MODE_AIM) ? g_vis_yaw_applied_rate_dps : 0.0f;
             g_yaw_off_rate = visual_rate_dps / rad2deg;  /* deg/s -> rad/s */
-            yaw_rpm = 0.0f;
+            yaw_rpm = g_yaw_pid.out
+                    + g_yaw_ff_sign * g_yaw_rate_damp *
+                      (gyro_c[2] - g_yaw_off_rate);
             /* ---- 底盘转速估计（2026-10-13 晚；给"速度前馈"用）----
              * 恒等式：底盘转速 = 平台陀螺 − 电机相对转速。
              * ⚠ 驱动器自报的 spd 字段在偏航上恒为 0（不可信），所以改用**电机位置
              * 差分**：位置一直是真实数据、随 0x2A 回复 1kHz 更新、0.01° 分辨率。
              * 两道保护：
              *   ① 单帧速率 >±10rad/s（573°/s）= 位置跳变/毛刺，整帧丢弃；
-             *   ② 一阶低通：普通状态 τ≈50ms（1kHz 下 a=0.02）；
-             *      phase 2 和出弯前 300ms 临时使用 τ≈10ms（a=0.10），
-             *      让转弯起始阶段的本地前馈跟得上底盘角速度。
+             *   ② 一阶低通 **τ≈50ms**（1kHz 下 a=0.02）。
              *      ⚠ 54 号日志教训：a=0.15（τ=7ms）时，环路自身的 10~25Hz 抖动
              *      会从"陀螺与位置差分的相位差"里冒出来，被误当成底盘转速 ——
              *      所以必须慢到只跟得上手转底盘那种 1~2Hz 的运动。
@@ -3534,19 +3403,9 @@ static void yuntai_control(uint32_t now)
                     float d_deg = g_yaw_fb.cont - g_yaw_pos_last;
                     float rate  = (d_deg / 57.29578f) /
                                   ((float)(now - g_yaw_pos_ms) * 0.001f);
-                    float mot_alpha =
-                        YAW_BASE_RATE_FILTER_ALPHA_NORMAL;
-                    if ((g_chassis_link_valid != 0u) &&
-                        ((g_chassis_turn_phase == 2u) ||
-                         ((g_chassis_turn_phase == 3u) &&
-                          ((uint32_t)(now - g_chassis_turn_exit_ms) <
-                           VIS_TURN_EXIT_SETTLE_MS))))
-                    {
-                        mot_alpha = YAW_BASE_RATE_FILTER_ALPHA_TURN;
-                    }
                     if (fabsf(rate) < 10.0f)
                     {
-                        g_mot_rate_f += mot_alpha * (rate - g_mot_rate_f);
+                        g_mot_rate_f += 0.02f * (rate - g_mot_rate_f);
                     }
                     g_yaw_pos_last = g_yaw_fb.cont;
                 }
@@ -3559,75 +3418,6 @@ static void yuntai_control(uint32_t now)
                 {
                     g_yaw_base_rate = 0.0f;
                 }
-                /* PRE_TURN has zero commanded chassis yaw rate. The indirect
-                 * gyro-minus-motor estimate is therefore noise there, not a
-                 * useful feed-forward. */
-                if ((g_chassis_link_valid != 0u) &&
-                    (g_chassis_turn_phase == 1u))
-                {
-                    g_yaw_base_rate = 0.0f;
-                }
-                /* During actual turn / post-turn recovery the chassis
-                 * direction is known. The indirect estimate can briefly
-                 * reverse; never let a wrong-sign term drive yaw feed-forward
-                 * in the opposite direction. */
-                else if ((g_chassis_link_valid != 0u) &&
-                         ((g_chassis_flags & 0x02u) != 0u) &&
-                         (g_chassis_turn_dir != 0) &&
-                         ((g_chassis_turn_phase == 2u) ||
-                          (g_chassis_turn_phase == 3u)) &&
-                         ((g_yaw_base_rate *
-                           (float)g_chassis_turn_dir) < 0.0f))
-                {
-                    g_yaw_base_rate = 0.0f;
-                }
-            }
-
-            if (g_yaw_torque == 0u)
-            {
-                float error_deg = err * rad2deg;
-                float gyro_dps = gyro_c[2] * rad2deg;
-                float pos_rate = clampf(
-                    YAW_TWO_LOOP_KPOS * error_deg,
-                    -YAW_TWO_LOOP_POS_RATE_MAX,
-                    YAW_TWO_LOOP_POS_RATE_MAX
-                );
-                float target_rate_dps = visual_rate_dps + pos_rate;
-                float rate_error_dps = target_rate_dps - gyro_dps;
-                uint8_t in_zone =
-                    (uint8_t)(fabsf(error_deg) <
-                              YAW_TWO_LOOP_RATE_I_ZONE);
-
-                if ((in_zone != 0u) &&
-                    !((g_yaw_out_saturated > 0) &&
-                      (rate_error_dps > 0.0f)) &&
-                    !((g_yaw_out_saturated < 0) &&
-                      (rate_error_dps < 0.0f)))
-                {
-                    g_yaw_rate_i_dps +=
-                        YAW_TWO_LOOP_RATE_KI * rate_error_dps * dt;
-                    g_yaw_rate_i_dps = clampf(
-                        g_yaw_rate_i_dps,
-                        -YAW_TWO_LOOP_RATE_I_MAX,
-                        YAW_TWO_LOOP_RATE_I_MAX
-                    );
-                }
-
-                yaw_rpm = (
-                    target_rate_dps
-                    - YAW_TWO_LOOP_CHASSIS_FF *
-                      (g_yaw_base_rate * rad2deg)
-                    + YAW_TWO_LOOP_KRATE * rate_error_dps
-                    + g_yaw_rate_i_dps
-                ) / 6.0f;
-            }
-            else
-            {
-                /* Legacy torque-mode fallback. The default configuration uses
-                 * the reference speed-mode path above. */
-                yaw_rpm = g_yaw_pid.out
-                        + g_yaw_ff_sign * g_yaw_rate_damp *
-                          (gyro_c[2] - g_yaw_off_rate);
             }
         }
 
@@ -3660,18 +3450,6 @@ static void yuntai_control(uint32_t now)
         }
     }
     g_yaw_cmd_rpm = clampf(yaw_rpm, -g_yaw_out_rpm, g_yaw_out_rpm);
-    if (yaw_rpm >= g_yaw_out_rpm)
-    {
-        g_yaw_out_saturated = 1;
-    }
-    else if (yaw_rpm <= -g_yaw_out_rpm)
-    {
-        g_yaw_out_saturated = -1;
-    }
-    else
-    {
-        g_yaw_out_saturated = 0;
-    }
     /* ---- 偏航"指令不跟"监视（2026-10-12 新增，治 38 号日志那种"卡住不响"）----
      * 38 号日志实测：指令 -16 → -33rpm 连续 2~3 秒，电机自报转速 ≈0、位置一动
      * 不动；随后突然甩成 ±330°/s 的大摆。不管根因在驱动器的哪种保护上，这种
@@ -3926,12 +3704,9 @@ static void yuntai_control(uint32_t now)
         if ((g_yaw_base_ff != 0.0f) &&
             (mode == GP_MODE_AIM) && (cmd->aim_valid != 0u))
         {
-            float base_ff_ma =
-                -g_yaw_base_ff * 1000.0f * g_yaw_base_rate;
-            base_ff_ma = clampf(base_ff_ma,
-                                -YAW_BASE_FF_LIMIT_MA,
-                                YAW_BASE_FF_LIMIT_MA);
-            g_rate_iq_ma += base_ff_ma;
+            float e = g_yaw_base_rate / 0.3f;
+            e = clampf(e, -1.0f, 1.0f);
+            g_rate_iq_ma -= g_yaw_base_ff * 1000.0f * e;
             g_rate_iq_ma = clampf(g_rate_iq_ma, -ilim_ma, ilim_ma);
         }
 
@@ -4006,37 +3781,25 @@ static void yuntai_control(uint32_t now)
     {
         float platform_deg = 0.0f;
         float visual_deg = 0.0f;
-        float tgt;
 
-        if ((mode == GP_MODE_AIM) &&
-            (g_vis_pitch_target_valid != 0u))
+        /* 电机编码器目标 = 锁定编码器角 - IMU 平台俯仰变化。
+         * 符号可由 0x0A 在线取反；这里不再给 IMU 目标额外串滤波或斜坡。 */
+        if (g_pitch_plat_sign != 0.0f && g_imu_ok)
         {
-            /* Reference structure: the AlphaBeta prediction is the target
-             * itself, not an error that is integrated into another target. */
-            tgt = g_vis_pitch_target_motor_deg;
+            platform_deg = clampf(g_plat_dtheta * rad2deg * g_pitch_plat_sign,
+                                  -PITCH_TRAVEL_LIMIT_DEG,
+                                  PITCH_TRAVEL_LIMIT_DEG);
+            g_plat_comp = platform_deg;
         }
-        else
+        else if (g_pitch_plat_sign == 0.0f)
         {
-            /* Auto-stabilise/hold: motor target compensates platform pitch. */
-            if (g_pitch_plat_sign != 0.0f && g_imu_ok)
-            {
-                platform_deg = clampf(
-                    g_plat_dtheta * rad2deg * g_pitch_plat_sign,
-                    -PITCH_TRAVEL_LIMIT_DEG,
-                    PITCH_TRAVEL_LIMIT_DEG
-                );
-                g_plat_comp = platform_deg;
-            }
-            else if (g_pitch_plat_sign == 0.0f)
-            {
-                g_plat_comp = 0.0f;
-            }
-            if (mode == GP_MODE_AIM)
-            {
-                visual_deg = g_vis_pitch_angle_deg;
-            }
-            tgt = g_pitch_motor_lock + platform_deg + visual_deg;
+            g_plat_comp = 0.0f;
         }
+        if (mode == GP_MODE_AIM)
+        {
+            visual_deg = g_vis_pitch_angle_deg;
+        }
+        float tgt = g_pitch_motor_lock + platform_deg + visual_deg;
         /* 行程软限位：别撞机构、别把线扯断 */
         tgt = clampf(tgt, g_pitch_motor_lock - PITCH_TRAVEL_LIMIT_DEG,
                           g_pitch_motor_lock + PITCH_TRAVEL_LIMIT_DEG);
@@ -4046,12 +3809,6 @@ static void yuntai_control(uint32_t now)
         float err = tgt - g_pitch_fb.cont;
         PID_Update(&g_pitch_pid, err, 0.0f, dt);
         pitch_rpm = g_pitch_pid.out;
-        pitch_rpm += -1.5f * (gyro_c[1] * rad2deg) / 6.0f;
-        if ((mode == GP_MODE_AIM) &&
-            (g_vis_pitch_target_valid != 0u))
-        {
-            pitch_rpm += g_vis_pitch_applied_rate_dps / 6.0f;
-        }
         pitch_rpm = clampf(pitch_rpm, -g_pitch_out_rpm, g_pitch_out_rpm);
 
         /* ---- 失控保护 ---- */
